@@ -2,6 +2,7 @@ import json
 import re
 import sys
 import datetime
+import shutil
 import termios
 import tty
 import unicodedata
@@ -520,8 +521,26 @@ def generate_review_summary(answer: str, model_cfg: ModelDict) -> str:
         return f"得到了相关回答。"
 
 
+def _char_width(ch: str) -> int:
+    """CJK 字符占 2 列，其余占 1 列。"""
+    eaw = unicodedata.east_asian_width(ch)
+    return 2 if eaw in ('W', 'F') else 1
+
+
+def _redraw_line(prompt: str, chars: list[str]) -> None:
+    """退格时整行重绘，确保换行场景下光标位置正确。"""
+    cols = shutil.get_terminal_size().columns
+    sys.stdout.write('\r')
+    sys.stdout.write(' ' * cols)
+    sys.stdout.write('\r')
+    sys.stdout.write(prompt)
+    for ch in chars:
+        sys.stdout.write(ch)
+    sys.stdout.flush()
+
+
 def safe_input(prompt: str = "") -> str:
-    """多字节安全的输入函数，按字符而非字节处理退格。"""
+    """多字节安全输入，支持换行退格。"""
     sys.stdout.write(prompt)
     sys.stdout.flush()
 
@@ -530,7 +549,7 @@ def safe_input(prompt: str = "") -> str:
 
     try:
         tty.setraw(fd)
-        chars = []
+        chars: list[str] = []
 
         while True:
             b = sys.stdin.buffer.read(1)
@@ -543,10 +562,8 @@ def safe_input(prompt: str = "") -> str:
                 break
             elif b in (b'\x7f', b'\x08'):
                 if chars:
-                    last = chars.pop()
-                    w = 2 if unicodedata.east_asian_width(last) in ('W', 'F') else 1
-                    sys.stdout.write('\b' * w + ' ' * w + '\b' * w)
-                    sys.stdout.flush()
+                    chars.pop()
+                    _redraw_line(prompt, chars)
             elif b == b'\x03':
                 sys.stdout.write('^C\r\n')
                 sys.stdout.flush()
