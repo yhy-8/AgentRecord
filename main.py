@@ -10,6 +10,12 @@ import requests
 import yaml
 from pathlib import Path
 
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+
+console = Console()
+
 # ================= 加载配置文件 =================
 ModelDict = dict[str, Any]
 
@@ -83,6 +89,56 @@ class ModelConfig:
 # ================= 基础配置 =================
 DIARY_DIR = Path(_config.get("diary_dir", "./AgentRecords"))
 DIARY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def resolve_date(arg: str) -> str:
+    """解析日期参数，支持：
+    - 空 → 今天
+    - -N → N天前（-1 = 昨天）
+    - today/yesterday/今天/昨天
+    - last/prev/上一个 → 最近一个存在的记录
+    - YYYY-MM-DD / YYYYMMDD → 完整日期
+    - MM-DD / MMDD → 缩写（假定今年）
+    """
+    today = datetime.date.today()
+    arg = arg.strip()
+
+    if not arg:
+        return today.strftime("%Y-%m-%d")
+
+    if re.match(r'^-\d+$', arg):
+        days = int(arg[1:])
+        d = today - datetime.timedelta(days=days)
+        return d.strftime("%Y-%m-%d")
+
+    aliases = {'today': 0, '今天': 0, 'yesterday': 1, '昨天': 1}
+    if arg.lower() in aliases:
+        d = today - datetime.timedelta(days=aliases[arg.lower()])
+        return d.strftime("%Y-%m-%d")
+
+    if arg.lower() in ('last', 'prev', '上一个', '最近'):
+        files = sorted(DIARY_DIR.glob("*.md"), reverse=True)
+        today_str = today.strftime("%Y-%m-%d")
+        for f in files:
+            if f.stem < today_str:
+                return f.stem
+        return ""
+
+    for fmt in ['%Y-%m-%d', '%Y%m%d']:
+        try:
+            return datetime.datetime.strptime(arg, fmt).strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+
+    for fmt in ['%m-%d', '%m%d']:
+        try:
+            d = datetime.datetime.strptime(arg, fmt)
+            return d.replace(year=today.year).strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+
+    return ""
+
 
 def _build_system_prompt() -> str:
     today = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -536,15 +592,18 @@ def main():
     current_cfg = ModelConfig.get_model()
     current_mode = "记录"
 
-    print("==================================================")
-    print(" Agent 日记系统")
-    print(" 可用模型:\n  ", "\n   ".join(m["name"] for m in ModelConfig.models()))
-    print(" 命令手册：")
-    print("   /model          -> 切换到下一个模型")
-    print("   /mode           -> 切换 记录/查阅 模式")
-    print("   /retry          -> 重试今日最后一个未回答的 @提问（从日志读取，重启不丢失）")
-    print("   @[内容]          -> 呼叫AI解答或执行任务（如 @总结今日内容）")
-    print("==================================================\n")
+    console.print(Panel.fit(
+        "[bold]Agent 日记系统[/bold]",
+        subtitle=f"可用模型: {', '.join(m['name'] for m in ModelConfig.models())}",
+        border_style="cyan"
+    ))
+    console.print(" 命令手册：")
+    console.print("   [cyan]/model[/cyan]          -> 切换到下一个模型")
+    console.print("   [cyan]/mode[/cyan]           -> 切换 记录/查阅 模式")
+    console.print("   [cyan]/view [日期][/cyan]     -> 查看历史日记（空=今天, -1/昨天/yesterday, 5-7/0507）")
+    console.print("   [cyan]/retry[/cyan]          -> 重试今日最后一个未回答的 @提问（从日志读取，重启不丢失）")
+    console.print("   [cyan]@[内容][/cyan]          -> 呼叫AI解答或执行任务（如 @总结今日内容）")
+    console.print()
 
     while True:
         try:
@@ -552,7 +611,7 @@ def main():
             prompt_prefix = f"[{current_cfg['name']}{srch} | {current_mode}] >> "
             user_input = safe_input(prompt_prefix).strip()
         except (KeyboardInterrupt, EOFError):
-            print("\n系统退出。")
+            console.print("[dim]系统退出。[/dim]")
             break
 
         if not user_input:
@@ -561,50 +620,71 @@ def main():
         # --- /model 命令 ---
         if user_input == "/model":
             current_cfg = ModelConfig.next_after(current_cfg["name"])
-            print(f"[*] 模型已切换为: {current_cfg['name']}")
+            console.print(f"[cyan][*][/cyan] 模型已切换为: {current_cfg['name']}")
             continue
 
         # --- /mode 命令 ---
         if user_input == "/mode":
             current_mode = "查阅" if current_mode == "记录" else "记录"
-            print(f"[*] 模式已切换为: {current_mode}模式")
+            console.print(f"[cyan][*][/cyan] 模式已切换为: {current_mode}模式")
+            continue
+
+        # --- /view 命令 ---
+        if user_input.startswith("/view"):
+            arg = user_input[len("/view"):].strip()
+            date_str = resolve_date(arg)
+            if not date_str:
+                console.print(f"[yellow][!][/yellow] 无法解析日期: {arg}")
+                continue
+            file_path = DIARY_DIR / f"{date_str}.md"
+            if not file_path.exists():
+                console.print(f"[yellow][!][/yellow] 找不到 {date_str} 的记录。")
+                continue
+            content = file_path.read_text(encoding="utf-8")
+            # 移除 <summary> 标签，保留内容
+            content = re.sub(r'</?summary>', '', content)
+            console.print(Panel(
+                Markdown(content),
+                title=f"[bold]{date_str}[/bold]",
+                border_style="cyan"
+            ))
             continue
 
         # --- /retry 命令 ---
         if user_input == "/retry":
             last_query, answered, prev_ans = read_last_at_query()
             if not last_query:
-                print("[!] 今日日志中没有 @AI 提问。")
+                console.print("[yellow][!][/yellow] 今日日志中没有 @AI 提问。")
                 continue
             if answered:
-                print(f"[*] 最后一个 @AI 提问已被回答：\n\n{prev_ans}\n")
+                console.print(f"[cyan][*][/cyan] 最后一个 @AI 提问已被回答：\n\n{prev_ans}\n")
                 continue
-            print(f"[*] 重试提问: {last_query[:80]}{'...' if len(last_query) > 80 else ''}")
-            print("[*] AI 思考/检索中...")
+            console.print(f"[cyan][*][/cyan] 重试提问: {last_query[:80]}{'...' if len(last_query) > 80 else ''}")
+            console.print("[cyan][*][/cyan] AI 思考/检索中...")
             init_file_if_not_exists()
             today_log = get_today_file().read_text(encoding="utf-8")
             retry_prompt = f"【今日记录（{datetime.datetime.now().strftime('%Y-%m-%d')}）】\n{today_log}\n\n【用户提问】\n{last_query}"
             ans, success, web_n, tool_dict = call_ai(retry_prompt, current_cfg, read_only=(current_mode == "查阅"))
 
             if success:
-                print(f"\nAI 输出: \n{ans}\n")
+                console.print(Panel(f"{ans}", title="[bold]AI 输出[/bold]", border_style="green"))
                 stats = format_stats(web_n, tool_dict)
                 if stats:
-                    print(stats)
+                    console.print(f"[dim]{stats}[/dim]")
                 tag = f"[AI回复] {current_cfg['name']}"
                 append_log(ans, tag)
             else:
-                print(f"\n[!] 重试失败: {ans}\n")
+                console.print(f"[red][!][/red] 重试失败: {ans}")
             continue
 
         # --- @AI 提问 ---
         if user_input.startswith("@"):
             query = user_input[1:].strip()
             if not query:
-                print("[!] 请输入提问内容。")
+                console.print("[yellow][!][/yellow] 请输入提问内容。")
                 continue
 
-            print("[*] AI 思考/检索中...")
+            console.print("[cyan][*][/cyan] AI 思考/检索中...")
 
             # 记录用户提问（查阅模式用独立标签，保证 /retry 可读取）
             user_tag = "@AI查阅" if current_mode == "查阅" else "@AI"
@@ -618,27 +698,27 @@ def main():
             ans, success, web_n, tool_dict = call_ai(prompt, current_cfg, read_only=(current_mode == "查阅"))
 
             if success:
-                print(f"\nAI 输出: \n{ans}\n")
+                console.print(Panel(f"{ans}", title="[bold]AI 输出[/bold]", border_style="green"))
                 stats = format_stats(web_n, tool_dict)
                 if stats:
-                    print(stats)
+                    console.print(f"[dim]{stats}[/dim]")
 
                 if current_mode == "查阅":
                     # 查阅模式：AI 生成一句话总结后记录
-                    print("[*] 查阅模式，正在生成轻记录...")
+                    console.print("[cyan][*][/cyan] 查阅模式，正在生成轻记录...")
                     review_summary = generate_review_summary(ans, current_cfg)
                     append_log(review_summary, f"[AI查阅] {current_cfg['name']}")
                 else:
                     append_log(ans, f"[AI回复] {current_cfg['name']}")
             else:
-                print(f"\n[!] 请求失败: {ans}\n")
+                console.print(f"[red][!][/red] 请求失败: {ans}")
             continue
 
         # --- 普通文本输入 ---
         if current_mode == "记录":
             append_log(user_input)
         else:
-            print("[!] 查阅模式下普通文本不会被记录。请使用 @ 提问，或输入 /mode 切换回记录模式。")
+            console.print("[yellow][!][/yellow] 查阅模式下普通文本不会被记录。请使用 @ 提问，或输入 /mode 切换回记录模式。")
 
 
 if __name__ == "__main__":
