@@ -22,9 +22,12 @@ jobs:
         run: |
           pyinstaller \
             --onefile \
+            --clean \
             --name AgentRecord \
+            --hidden-import=yaml \
             --add-data "config.yaml:." \
             main.py
+          ls -lh dist/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -48,7 +51,8 @@ jobs:
 
       - name: Build executable
         run: |
-          pyinstaller --onefile --name AgentRecord --add-data "config.yaml;." main.py
+          pyinstaller --onefile --clean --name AgentRecord --hidden-import=yaml --add-data "config.yaml;." main.py
+          dir dist\
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
