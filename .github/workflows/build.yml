@@ -4,41 +4,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-ubuntu:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Debug - list files
-        run: ls -la
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install pyinstaller
-
-      - name: Build executable
-        run: |
-          pyinstaller \
-            --onefile \
-            --clean \
-            --name AgentRecord \
-            --hidden-import=yaml \
-            --add-data "config.yaml:." \
-            --exclude-module readline \
-            main.py
-          ls -lh dist/
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: AgentRecord-ubuntu
-          path: dist/AgentRecord
-
   build-windows:
     runs-on: windows-latest
     steps:
