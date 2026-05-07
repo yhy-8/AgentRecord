@@ -2,6 +2,9 @@ import json
 import re
 import sys
 import datetime
+import termios
+import tty
+import unicodedata
 from typing import Any
 import requests
 import yaml
@@ -461,6 +464,73 @@ def generate_review_summary(answer: str, model_cfg: ModelDict) -> str:
         return f"得到了相关回答。"
 
 
+def safe_input(prompt: str = "") -> str:
+    """多字节安全的输入函数，按字符而非字节处理退格。"""
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+
+    try:
+        tty.setraw(fd)
+        chars = []
+
+        while True:
+            b = sys.stdin.buffer.read(1)
+            if not b:
+                break
+
+            if b == b'\r':
+                sys.stdout.write('\r\n')
+                sys.stdout.flush()
+                break
+            elif b in (b'\x7f', b'\x08'):
+                if chars:
+                    last = chars.pop()
+                    w = 2 if unicodedata.east_asian_width(last) in ('W', 'F') else 1
+                    sys.stdout.write('\b' * w + ' ' * w + '\b' * w)
+                    sys.stdout.flush()
+            elif b == b'\x03':
+                sys.stdout.write('^C\r\n')
+                sys.stdout.flush()
+                raise KeyboardInterrupt()
+            elif b == b'\x04':
+                if not chars:
+                    sys.stdout.write('\r\n')
+                    sys.stdout.flush()
+                    raise EOFError()
+            elif b[0] < 0x20 or b[0] == 0x7f:
+                pass
+            else:
+                if b[0] & 0x80 == 0:
+                    trail = 0
+                elif b[0] & 0xE0 == 0xC0:
+                    trail = 1
+                elif b[0] & 0xF0 == 0xE0:
+                    trail = 2
+                elif b[0] & 0xF8 == 0xF0:
+                    trail = 3
+                else:
+                    continue
+
+                char_bytes = b
+                for _ in range(trail):
+                    char_bytes += sys.stdin.buffer.read(1)
+
+                try:
+                    char = char_bytes.decode('utf-8')
+                    chars.append(char)
+                    sys.stdout.write(char)
+                    sys.stdout.flush()
+                except UnicodeDecodeError:
+                    pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    return ''.join(chars)
+
+
 # ================= 主循环 =================
 def main():
     current_cfg = ModelConfig.get_model()
@@ -480,7 +550,7 @@ def main():
         try:
             srch = " SRCH" if current_cfg.get("search") else ""
             prompt_prefix = f"[{current_cfg['name']}{srch} | {current_mode}] >> "
-            user_input = input(prompt_prefix).strip()
+            user_input = safe_input(prompt_prefix).strip()
         except (KeyboardInterrupt, EOFError):
             print("\n系统退出。")
             break
