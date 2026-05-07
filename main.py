@@ -2,10 +2,8 @@ import json
 import re
 import sys
 import datetime
-import shutil
 import termios
 import tty
-import unicodedata
 from typing import Any
 import requests
 import yaml
@@ -521,18 +519,10 @@ def generate_review_summary(answer: str, model_cfg: ModelDict) -> str:
         return f"得到了相关回答。"
 
 
-def _char_width(ch: str) -> int:
-    """CJK 字符占 2 列，其余占 1 列。"""
-    eaw = unicodedata.east_asian_width(ch)
-    return 2 if eaw in ('W', 'F') else 1
-
-
 def _redraw_line(prompt: str, chars: list[str]) -> None:
-    """退格时整行重绘，确保换行场景下光标位置正确。"""
-    cols = shutil.get_terminal_size().columns
-    sys.stdout.write('\r')
-    sys.stdout.write(' ' * cols)
-    sys.stdout.write('\r')
+    """回到输入起点，清空至屏幕末尾，重绘整行。"""
+    sys.stdout.write('\x1b[u')      # 恢复光标到输入起始位置
+    sys.stdout.write('\x1b[0J')     # 清除光标到屏幕末尾
     sys.stdout.write(prompt)
     for ch in chars:
         sys.stdout.write(ch)
@@ -541,6 +531,7 @@ def _redraw_line(prompt: str, chars: list[str]) -> None:
 
 def safe_input(prompt: str = "") -> str:
     """多字节安全输入，支持换行退格。"""
+    sys.stdout.write('\x1b[s')      # 先记录光标位置（输入起点）
     sys.stdout.write(prompt)
     sys.stdout.flush()
 
@@ -610,7 +601,7 @@ def show_help():
         "  [cyan]/model[/cyan]          -> 切换到下一个模型\n"
         "  [cyan]/mode[/cyan]           -> 切换 记录/查阅 模式\n"
         "  [cyan]/view [日期][/cyan]     -> 查看历史日记（空=今天, [cyan]/view help[/cyan] 查看所有用法）\n"
-        "  [cyan]/retry[/cyan]          -> 重试今日最后一个未回答的 @提问（从日志读取，重启不丢失）\n"
+        "  [cyan]/retry[/cyan]          -> 重试今日最后一个未回答的 @提问\n"
         "  [cyan]@[内容][/cyan]          -> 呼叫AI解答或执行任务（如 @总结今日内容）",
         title="[bold]命令手册[/bold]",
         border_style="cyan"
