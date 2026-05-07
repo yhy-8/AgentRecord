@@ -1,70 +1,84 @@
 import json
 import re
+import sys
 import datetime
 from typing import Any
 import requests
+import yaml
 from pathlib import Path
 
-# ================= 统一模型配置 =================
+# ================= 加载配置文件 =================
 ModelDict = dict[str, Any]
 
+
+def _get_config_path() -> Path:
+    """获取 config.yaml 路径，兼容 PyInstaller 打包后的路径。"""
+    if getattr(sys, "frozen", False):
+        base = Path(sys.executable).parent
+    else:
+        base = Path(__file__).parent
+    return base / "config.yaml"
+
+
+def _load_config() -> dict:
+    cp = _get_config_path()
+    if cp.exists():
+        with open(cp, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+_config = _load_config()
+
+
+def _save_config():
+    cp = _get_config_path()
+    with open(cp, "w", encoding="utf-8") as f:
+        yaml.safe_dump(_config, f, allow_unicode=True, default_flow_style=False)
+
+
+# ================= 统一模型配置 =================
 class ModelConfig:
     """统一管理所有可用模型及其 API 配置"""
 
-    MODELS: list[ModelDict] = [
-        {
-            "name": "deepseek-v4-pro",
-            "type": "openai",        # 请求格式
-            "search": False,         # 是否有搜索能力
-            "api_url": "https://api.deepseek.com/chat/completions",
-            "api_key": "",
-        },
-        {
-            "name": "gemini-3-flash-preview",
-            "type": "gemini",
-            "search": True,
-            "api_url": "https://xxxxxx/v1beta/models",
-            "api_key": "",
-        },
-        {
-            "name": "gemini-3.1-pro-preview",
-            "type": "gemini",
-            "search": True,
-            "api_url": "https://xxxxxx/v1beta/models",
-            "api_key": "",
-        },
-    ]
+    @classmethod
+    def _models(cls) -> list[ModelDict]:
+        return _config.get("models", [])
 
     @classmethod
     def get_model(cls, name_or_index: str | int | None = None) -> ModelDict:
+        models = cls._models()
+        if not models:
+            raise RuntimeError("config.yaml 中未配置任何模型")
         if name_or_index is None:
-            return cls.MODELS[0]
+            return models[0]
         if isinstance(name_or_index, int):
-            return cls.MODELS[name_or_index % len(cls.MODELS)]
+            return models[name_or_index % len(models)]
         name_lower = name_or_index.lower()
-        for m in cls.MODELS:
+        for m in models:
             if m["name"].lower() == name_lower:
                 return m
-        for m in cls.MODELS:
+        for m in models:
             if name_lower in m["name"].lower():
                 return m
         raise KeyError(f"未找到匹配模型 '{name_or_index}'")
 
     @classmethod
     def index_of(cls, name: str) -> int:
-        for i, m in enumerate(cls.MODELS):
+        for i, m in enumerate(cls._models()):
             if m["name"] == name:
                 return i
         return 0
 
     @classmethod
     def next_after(cls, name: str) -> ModelDict:
+        models = cls._models()
         idx = cls.index_of(name)
-        return cls.MODELS[(idx + 1) % len(cls.MODELS)]
+        return models[(idx + 1) % len(models)]
 
 
 # ================= 基础配置 =================
-DIARY_DIR = Path("./AgentRecords")
+DIARY_DIR = Path(_config.get("diary_dir", "./AgentRecords"))
 DIARY_DIR.mkdir(parents=True, exist_ok=True)
 
 def _build_system_prompt() -> str:
@@ -454,7 +468,7 @@ def main():
 
     print("==================================================")
     print(" Agent 日记系统")
-    print(" 可用模型:\n  ", "\n   ".join(m["name"] for m in ModelConfig.MODELS))
+    print(" 可用模型:\n  ", "\n   ".join(m["name"] for m in ModelConfig._models()))
     print(" 命令手册：")
     print("   /model          -> 切换到下一个模型")
     print("   /mode           -> 切换 记录/查阅 模式")
