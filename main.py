@@ -45,12 +45,12 @@ class ModelConfig:
     """统一管理所有可用模型及其 API 配置"""
 
     @classmethod
-    def _models(cls) -> list[ModelDict]:
+    def models(cls) -> list[ModelDict]:
         return _config.get("models", [])
 
     @classmethod
     def get_model(cls, name_or_index: str | int | None = None) -> ModelDict:
-        models = cls._models()
+        models = cls.models()
         if not models:
             raise RuntimeError("config.yaml 中未配置任何模型")
         if name_or_index is None:
@@ -68,14 +68,14 @@ class ModelConfig:
 
     @classmethod
     def index_of(cls, name: str) -> int:
-        for i, m in enumerate(cls._models()):
+        for i, m in enumerate(cls.models()):
             if m["name"] == name:
                 return i
         return 0
 
     @classmethod
     def next_after(cls, name: str) -> ModelDict:
-        models = cls._models()
+        models = cls.models()
         idx = cls.index_of(name)
         return models[(idx + 1) % len(models)]
 
@@ -538,7 +538,7 @@ def main():
 
     print("==================================================")
     print(" Agent 日记系统")
-    print(" 可用模型:\n  ", "\n   ".join(m["name"] for m in ModelConfig._models()))
+    print(" 可用模型:\n  ", "\n   ".join(m["name"] for m in ModelConfig.models()))
     print(" 命令手册：")
     print("   /model          -> 切换到下一个模型")
     print("   /mode           -> 切换 记录/查阅 模式")
