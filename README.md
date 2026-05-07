@@ -1,5 +1,5 @@
 # AgentRecord
-简易的agent日记系统
+简易的Agent日记系统
 
 每天的信息保存为一个独立的markdown文件
 

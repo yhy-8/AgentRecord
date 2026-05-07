@@ -1,0 +1,23 @@
+# ================= AgentRecord 配置文件 =================
+# 模型列表
+models:
+  - name: deepseek-v4-pro
+    type: openai          # 请求格式: openai / gemini
+    search: false         # 是否有搜索能力
+    api_url: https://api.deepseek.com/chat/completions
+    api_key: ""
+
+  - name: gemini-3-flash-preview
+    type: gemini
+    search: true
+    api_url: https://xxxxxx/v1beta/models
+    api_key: ""
+
+  - name: gemini-3.1-pro-preview
+    type: gemini
+    search: true
+    api_url: https://xxxxxx/v1beta/models
+    api_key: ""
+
+# 日记存储目录
+diary_dir: "./Records"
