@@ -592,15 +592,12 @@ def main():
     current_cfg = ModelConfig.get_model()
     current_mode = "记录"
 
-    console.print(Panel.fit(
-        "[bold]Agent 日记系统[/bold]",
-        subtitle=f"可用模型: {', '.join(m['name'] for m in ModelConfig.models())}",
-        border_style="cyan"
-    ))
+    console.print(Panel.fit("[bold]Agent 日记系统[/bold]", border_style="cyan"))
+    console.print(f"  可用模型: [dim]{', '.join(m['name'] for m in ModelConfig.models())}[/dim]")
     console.print(" 命令手册：")
     console.print("   [cyan]/model[/cyan]          -> 切换到下一个模型")
     console.print("   [cyan]/mode[/cyan]           -> 切换 记录/查阅 模式")
-    console.print("   [cyan]/view [日期][/cyan]     -> 查看历史日记（空=今天, -1/昨天/yesterday, 5-7/0507）")
+    console.print("   [cyan]/view [日期][/cyan]     -> 查看历史日记（空=今天, [cyan]/view help[/cyan] 查看所有用法）")
     console.print("   [cyan]/retry[/cyan]          -> 重试今日最后一个未回答的 @提问（从日志读取，重启不丢失）")
     console.print("   [cyan]@[内容][/cyan]          -> 呼叫AI解答或执行任务（如 @总结今日内容）")
     console.print()
@@ -632,6 +629,17 @@ def main():
         # --- /view 命令 ---
         if user_input.startswith("/view"):
             arg = user_input[len("/view"):].strip()
+            if arg.lower() == "help":
+                console.print(Panel(
+                    "  [cyan]/view[/cyan]              → 今天（同: [dim]today, 今天[/dim]）\n"
+                    "  [cyan]/view -1[/cyan]            → 昨天（[dim]-N = N天前[/dim]；同: [dim]yesterday, 昨天[/dim]）\n"
+                    "  [cyan]/view last[/cyan]          → 最近一个有记录的日期\n"
+                    "  [cyan]/view 5-8[/cyan]           → 今年5月8日（MM-DD 或 MMDD）\n"
+                    "  [cyan]/view 2026-05-03[/cyan]    → 完整日期（YYYY-MM-DD 或 YYYYMMDD）",
+                    title="[bold]/view 用法[/bold]",
+                    border_style="cyan"
+                ))
+                continue
             date_str = resolve_date(arg)
             if not date_str:
                 console.print(f"[yellow][!][/yellow] 无法解析日期: {arg}")
