@@ -587,6 +587,19 @@ def safe_input(prompt: str = "") -> str:
     return ''.join(chars)
 
 
+def show_help():
+    console.print(Panel(
+        "  [cyan]/help[/cyan]            -> 显示此帮助\n"
+        "  [cyan]/model[/cyan]          -> 切换到下一个模型\n"
+        "  [cyan]/mode[/cyan]           -> 切换 记录/查阅 模式\n"
+        "  [cyan]/view [日期][/cyan]     -> 查看历史日记（空=今天, [cyan]/view help[/cyan] 查看所有用法）\n"
+        "  [cyan]/retry[/cyan]          -> 重试今日最后一个未回答的 @提问（从日志读取，重启不丢失）\n"
+        "  [cyan]@[内容][/cyan]          -> 呼叫AI解答或执行任务（如 @总结今日内容）",
+        title="[bold]命令手册[/bold]",
+        border_style="cyan"
+    ))
+
+
 # ================= 主循环 =================
 def main():
     current_cfg = ModelConfig.get_model()
@@ -594,12 +607,7 @@ def main():
 
     console.print(Panel.fit("[bold]Agent 日记系统[/bold]", border_style="cyan"))
     console.print(f"  可用模型: [dim]{', '.join(m['name'] for m in ModelConfig.models())}[/dim]")
-    console.print(" 命令手册：")
-    console.print("   [cyan]/model[/cyan]          -> 切换到下一个模型")
-    console.print("   [cyan]/mode[/cyan]           -> 切换 记录/查阅 模式")
-    console.print("   [cyan]/view [日期][/cyan]     -> 查看历史日记（空=今天, [cyan]/view help[/cyan] 查看所有用法）")
-    console.print("   [cyan]/retry[/cyan]          -> 重试今日最后一个未回答的 @提问（从日志读取，重启不丢失）")
-    console.print("   [cyan]@[内容][/cyan]          -> 呼叫AI解答或执行任务（如 @总结今日内容）")
+    show_help()
     console.print()
 
     while True:
@@ -612,6 +620,11 @@ def main():
             break
 
         if not user_input:
+            continue
+
+        # --- /help 命令 ---
+        if user_input == "/help":
+            show_help()
             continue
 
         # --- /model 命令 ---
