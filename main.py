@@ -7,10 +7,19 @@ import requests
 import yaml
 from pathlib import Path
 import select
+import os
+import time
 
 try:
     import msvcrt
     IS_WINDOWS = True
+    # Enable ANSI escape sequence processing on Windows 10+ for cursor control
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+    mode = ctypes.c_ulong()
+    if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+        kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
 except ImportError:
     import termios
     import tty
@@ -548,7 +557,7 @@ def _safe_input_unix(prompt: str) -> str:
         chars: list[str] = []
 
         while True:
-            b = sys.stdin.buffer.read(1)
+            b = os.read(fd, 1)
             if not b:
                 break
 
@@ -570,13 +579,9 @@ def _safe_input_unix(prompt: str) -> str:
                     sys.stdout.flush()
                     raise EOFError()
             elif b == b'\x1b':
-                # 拦截 ESC 序列（如方向键发送的 \x1b[A）
-                # 使用 select 等待 0.05 秒，如果有后续输入就读出来吃掉
-                if select.select([sys.stdin], [], [], 0.05)[0]:
-                    b2 = sys.stdin.buffer.read(1)
-                    if b2 in (b'[', b'O'):
-                        if select.select([sys.stdin], [], [], 0.05)[0]:
-                            sys.stdin.buffer.read(1)  # 吞掉 A/B/C/D 等字符
+                # Drain escape sequence via raw fd (no Python buffering)
+                while select.select([fd], [], [], 0.05)[0]:
+                    os.read(fd, 16)
                 continue
             elif b[0] < 0x20 or b[0] == 0x7f:
                 pass
@@ -594,7 +599,7 @@ def _safe_input_unix(prompt: str) -> str:
 
                 char_bytes = b
                 for _ in range(trail):
-                    char_bytes += sys.stdin.buffer.read(1)
+                    char_bytes += os.read(fd, 1)
 
                 try:
                     char = char_bytes.decode('utf-8')
@@ -636,9 +641,17 @@ def _safe_input_windows(prompt: str) -> str:
                 sys.stdout.write('^Z\r\n')
                 sys.stdout.flush()
                 raise EOFError()
-        elif ch in ('\x00', '\xe0'):
-            # 特殊按键会返回两个字符，消耗掉多余的那一个
-            msvcrt.getwch()
+        elif ch == '\x1b':
+            # ANSI escape sequence — drain remaining bytes
+            time.sleep(0.03)
+            while msvcrt.kbhit():
+                msvcrt.getwch()
+            continue
+        elif ord(ch) < 0x20 or ord(ch) == 0x7f:
+            # Other control character or DEL
+            # For extended key prefixes (\x00, \xe0), consume the scan code
+            if ch in ('\x00', '\xe0'):
+                msvcrt.getwch()
             continue
         else:
             chars.append(ch)
