@@ -1,5 +1,4 @@
 import json
-import os
 import re
 import sys
 import datetime
@@ -7,6 +6,7 @@ from typing import Any
 import requests
 import yaml
 from pathlib import Path
+import select
 
 try:
     import msvcrt
@@ -569,6 +569,15 @@ def _safe_input_unix(prompt: str) -> str:
                     sys.stdout.write('\r\n')
                     sys.stdout.flush()
                     raise EOFError()
+            elif b == b'\x1b':
+                # 拦截 ESC 序列（如方向键发送的 \x1b[A）
+                # 使用 select 等待 0.05 秒，如果有后续输入就读出来吃掉
+                if select.select([sys.stdin], [], [], 0.05)[0]:
+                    b2 = sys.stdin.buffer.read(1)
+                    if b2 in (b'[', b'O'):
+                        if select.select([sys.stdin], [], [], 0.05)[0]:
+                            sys.stdin.buffer.read(1)  # 吞掉 A/B/C/D 等字符
+                continue
             elif b[0] < 0x20 or b[0] == 0x7f:
                 pass
             else:
@@ -601,6 +610,8 @@ def _safe_input_unix(prompt: str) -> str:
 
 
 def _safe_input_windows(prompt: str) -> str:
+    # 1. 像 Linux 一样，在开头保存光标位置
+    sys.stdout.write('\x1b[s')
     sys.stdout.write(prompt)
     sys.stdout.flush()
     chars: list[str] = []
@@ -614,8 +625,8 @@ def _safe_input_windows(prompt: str) -> str:
         elif ch == '\x08':
             if chars:
                 chars.pop()
-                sys.stdout.write('\b \b')
-                sys.stdout.flush()
+                # 2. 放弃传统的 '\b \b'，改用跨平台兼容的整行重绘
+                _redraw_line(prompt, chars)
         elif ch == '\x03':
             sys.stdout.write('^C\r\n')
             sys.stdout.flush()
@@ -625,6 +636,10 @@ def _safe_input_windows(prompt: str) -> str:
                 sys.stdout.write('^Z\r\n')
                 sys.stdout.flush()
                 raise EOFError()
+        elif ch in ('\x00', '\xe0'):
+            # 特殊按键会返回两个字符，消耗掉多余的那一个
+            msvcrt.getwch()
+            continue
         else:
             chars.append(ch)
             sys.stdout.write(ch)
