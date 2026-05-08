@@ -668,17 +668,50 @@ def safe_input(prompt: str = "") -> str:
         return _safe_input_unix(prompt)
 
 
+def show_view_help():
+    console.print(Panel(
+        "  [cyan]/v[/cyan]              → 今天（同: [dim]today, 今天[/dim]）\n"
+        "  [cyan]/v -1[/cyan]           → 昨天（[dim]-N = N天前[/dim]；同: [dim]yesterday, 昨天[/dim]）\n"
+        "  [cyan]/v last[/cyan]         → 最近一个有记录的日期\n"
+        "  [cyan]/v 5-8[/cyan]          → 今年5月8日（MM-DD 或 MMDD）\n"
+        "  [cyan]/v 2026-05-03[/cyan]   → 完整日期（YYYY-MM-DD 或 YYYYMMDD）",
+        title="[bold]/v 用法[/bold]",
+        border_style="cyan"
+    ))
+
+
 def show_help():
     console.print(Panel(
-        "  [cyan]/help[/cyan]            -> 显示此帮助\n"
-        "  [cyan]/model[/cyan]          -> 切换到下一个模型\n"
-        "  [cyan]/mode[/cyan]           -> 切换 记录/查阅 模式\n"
-        "  [cyan]/view [日期][/cyan]     -> 查看历史日记（空=今天, [cyan]/view help[/cyan] 查看所有用法）\n"
-        "  [cyan]/retry[/cyan]          -> 重试今日最后一个未回答的 @提问\n"
-        "  [cyan]@[内容][/cyan]          -> 呼叫AI解答或执行任务（如 @总结今日内容）",
+        "  [cyan]/h[/cyan]        → 显示此帮助\n"
+        "  [cyan]/m[/cyan]        → 切换到下一个模型\n"
+        "  [cyan]/o[/cyan]        → 切换 记录/查阅 模式\n"
+        "  [cyan]/v [日期][/cyan] → 查看历史日记（空=今天, [cyan]/v help[/cyan] 查看所有用法）\n"
+        "  [cyan]/r[/cyan]        → 重试今日最后一个未回答的 @提问\n"
+        "  [cyan]/c[/cyan]        → 清空当前窗口\n"
+        "  [cyan]/d[/cyan]        → 删除今日最后一条记录\n"
+        "  [cyan]@[内容][/cyan]   → 呼叫AI解答或执行任务（如 @总结今日内容）",
         title="[bold]命令手册[/bold]",
         border_style="cyan"
     ))
+
+
+def delete_last_record() -> bool:
+    """删除今日日志中最后一条记录。返回是否成功删除。"""
+    tf = get_today_file()
+    if not tf.exists():
+        return False
+    content = tf.read_text(encoding="utf-8")
+    pattern = re.compile(r"^\*\*\d{2}:\d{2}", re.MULTILINE)
+    matches = list(pattern.finditer(content))
+    if not matches:
+        return False
+    last_match = matches[-1]
+    start = last_match.start()
+    if start > 0 and content[start - 1] == '\n':
+        start -= 1
+    new_content = content[:start].rstrip() + "\n\n"
+    tf.write_text(new_content, encoding="utf-8")
+    return True
 
 
 # ================= 主循环 =================
@@ -703,36 +736,41 @@ def main():
         if not user_input:
             continue
 
-        # --- /help 命令 ---
-        if user_input == "/help":
+        # --- /h 命令 ---
+        if user_input == "/h":
             show_help()
             continue
 
-        # --- /model 命令 ---
-        if user_input == "/model":
+        # --- /m 命令（切换模型） ---
+        if user_input == "/m":
             current_cfg = ModelConfig.next_after(current_cfg["name"])
             console.print(f"[cyan][*][/cyan] 模型已切换为: {current_cfg['name']}")
             continue
 
-        # --- /mode 命令 ---
-        if user_input == "/mode":
+        # --- /o 命令（切换模式） ---
+        if user_input == "/o":
             current_mode = "查阅" if current_mode == "记录" else "记录"
             console.print(f"[cyan][*][/cyan] 模式已切换为: {current_mode}模式")
             continue
 
-        # --- /view 命令 ---
-        if user_input.startswith("/view"):
-            arg = user_input[len("/view"):].strip()
+        # --- /c 命令（清屏） ---
+        if user_input == "/c":
+            console.clear()
+            continue
+
+        # --- /d 命令（删除最后一条记录） ---
+        if user_input == "/d":
+            if delete_last_record():
+                console.print("[cyan][*][/cyan] 已删除今日最后一条记录。")
+            else:
+                console.print("[yellow][!][/yellow] 今日无记录可删除。")
+            continue
+
+        # --- /v 命令 ---
+        if user_input == "/v" or user_input.startswith("/v "):
+            arg = user_input[3:].strip() if user_input.startswith("/v ") else ""
             if arg.lower() == "help":
-                console.print(Panel(
-                    "  [cyan]/view[/cyan]              → 今天（同: [dim]today, 今天[/dim]）\n"
-                    "  [cyan]/view -1[/cyan]            → 昨天（[dim]-N = N天前[/dim]；同: [dim]yesterday, 昨天[/dim]）\n"
-                    "  [cyan]/view last[/cyan]          → 最近一个有记录的日期\n"
-                    "  [cyan]/view 5-8[/cyan]           → 今年5月8日（MM-DD 或 MMDD）\n"
-                    "  [cyan]/view 2026-05-03[/cyan]    → 完整日期（YYYY-MM-DD 或 YYYYMMDD）",
-                    title="[bold]/view 用法[/bold]",
-                    border_style="cyan"
-                ))
+                show_view_help()
                 continue
             date_str = resolve_date(arg)
             if not date_str:
@@ -743,7 +781,6 @@ def main():
                 console.print(f"[yellow][!][/yellow] 找不到 {date_str} 的记录。")
                 continue
             content = file_path.read_text(encoding="utf-8")
-            # 移除 <summary> 标签，保留内容
             content = re.sub(r'</?summary>', '', content)
             console.print(Panel(
                 Markdown(content),
@@ -752,8 +789,8 @@ def main():
             ))
             continue
 
-        # --- /retry 命令 ---
-        if user_input == "/retry":
+        # --- /r 命令 ---
+        if user_input == "/r":
             last_query, answered, prev_ans = read_last_at_query()
             if not last_query:
                 console.print("[yellow][!][/yellow] 今日日志中没有 @AI 提问。")
@@ -788,7 +825,7 @@ def main():
 
             console.print("[cyan][*][/cyan] AI 思考/检索中...")
 
-            # 记录用户提问（查阅模式用独立标签，保证 /retry 可读取）
+            # 记录用户提问（查阅模式用独立标签，保证 /r 可读取）
             user_tag = "@AI查阅" if current_mode == "查阅" else "@AI"
             append_log(query, user_tag)
 
@@ -820,7 +857,7 @@ def main():
         if current_mode == "记录":
             append_log(user_input)
         else:
-            console.print("[yellow][!][/yellow] 查阅模式下普通文本不会被记录。请使用 @ 提问，或输入 /mode 切换回记录模式。")
+            console.print("[yellow][!][/yellow] 查阅模式下普通文本不会被记录。请使用 @ 提问，或输入 /o 切换回记录模式。")
 
 
 if __name__ == "__main__":
