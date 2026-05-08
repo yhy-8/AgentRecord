@@ -1,13 +1,18 @@
 import json
+import os
 import re
 import sys
 import datetime
-import termios
-import tty
 from typing import Any
 import requests
 import yaml
 from pathlib import Path
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import termios
+    import tty
 
 from rich.console import Console
 from rich.markdown import Markdown
@@ -520,18 +525,16 @@ def generate_review_summary(answer: str, model_cfg: ModelDict) -> str:
 
 
 def _redraw_line(prompt: str, chars: list[str]) -> None:
-    """回到输入起点，清空至屏幕末尾，重绘整行。"""
-    sys.stdout.write('\x1b[u')      # 恢复光标到输入起始位置
-    sys.stdout.write('\x1b[0J')     # 清除光标到屏幕末尾
+    sys.stdout.write('\x1b[u')
+    sys.stdout.write('\x1b[0J')
     sys.stdout.write(prompt)
     for ch in chars:
         sys.stdout.write(ch)
     sys.stdout.flush()
 
 
-def safe_input(prompt: str = "") -> str:
-    """多字节安全输入，支持换行退格。"""
-    sys.stdout.write('\x1b[s')      # 先记录光标位置（输入起点）
+def _safe_input_unix(prompt: str) -> str:
+    sys.stdout.write('\x1b[s')
     sys.stdout.write(prompt)
     sys.stdout.flush()
 
@@ -593,6 +596,46 @@ def safe_input(prompt: str = "") -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
     return ''.join(chars)
+
+
+def _safe_input_windows(prompt: str) -> str:
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    chars: list[str] = []
+
+    while True:
+        ch = msvcrt.getwch()
+        if ch == '\r' or ch == '\n':
+            sys.stdout.write('\r\n')
+            sys.stdout.flush()
+            break
+        elif ch == '\x08':
+            if chars:
+                chars.pop()
+                sys.stdout.write('\b \b')
+                sys.stdout.flush()
+        elif ch == '\x03':
+            sys.stdout.write('^C\r\n')
+            sys.stdout.flush()
+            raise KeyboardInterrupt()
+        elif ch == '\x1a':
+            if not chars:
+                sys.stdout.write('^Z\r\n')
+                sys.stdout.flush()
+                raise EOFError()
+        else:
+            chars.append(ch)
+            sys.stdout.write(ch)
+            sys.stdout.flush()
+
+    return ''.join(chars)
+
+
+def safe_input(prompt: str = "") -> str:
+    if os.name == "nt":
+        return _safe_input_windows(prompt)
+    else:
+        return _safe_input_unix(prompt)
 
 
 def show_help():
