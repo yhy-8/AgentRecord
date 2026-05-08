@@ -536,8 +536,8 @@ def generate_review_summary(answer: str, model_cfg: ModelDict) -> str:
 
 
 def _redraw_line(prompt: str, chars: list[str]) -> None:
-    sys.stdout.write('\x1b[u')
-    sys.stdout.write('\x1b[0J')
+    sys.stdout.buffer.write(b'\x1b[u')
+    sys.stdout.buffer.write(b'\x1b[0J')
     sys.stdout.write(prompt)
     for ch in chars:
         sys.stdout.write(ch)
@@ -545,7 +545,7 @@ def _redraw_line(prompt: str, chars: list[str]) -> None:
 
 
 def _safe_input_unix(prompt: str) -> str:
-    sys.stdout.write('\x1b[s')
+    sys.stdout.buffer.write(b'\x1b[s')
     sys.stdout.write(prompt)
     sys.stdout.flush()
 
@@ -615,8 +615,7 @@ def _safe_input_unix(prompt: str) -> str:
 
 
 def _safe_input_windows(prompt: str) -> str:
-    # 1. 像 Linux 一样，在开头保存光标位置
-    sys.stdout.write('\x1b[s')
+    sys.stdout.buffer.write(b'\x1b[s')
     sys.stdout.write(prompt)
     sys.stdout.flush()
     chars: list[str] = []
@@ -641,6 +640,10 @@ def _safe_input_windows(prompt: str) -> str:
                 sys.stdout.write('^Z\r\n')
                 sys.stdout.flush()
                 raise EOFError()
+        elif ch in ('\x00', '\xe0'):
+            # Extended key prefix — consume the scan code and ignore
+            msvcrt.getwch()
+            continue
         elif ch == '\x1b':
             # ANSI escape sequence — drain remaining bytes
             time.sleep(0.03)
@@ -648,10 +651,7 @@ def _safe_input_windows(prompt: str) -> str:
                 msvcrt.getwch()
             continue
         elif ord(ch) < 0x20 or ord(ch) == 0x7f:
-            # Other control character or DEL
-            # For extended key prefixes (\x00, \xe0), consume the scan code
-            if ch in ('\x00', '\xe0'):
-                msvcrt.getwch()
+            # Other control character or DEL — silently ignore
             continue
         else:
             chars.append(ch)
