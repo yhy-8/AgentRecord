@@ -23,7 +23,7 @@ jobs:
 
       - name: Build executable
         run: |
-          pyinstaller --onefile --clean --name AgentRecord --hidden-import=yaml --add-data "config.yaml;." main.py
+          pyinstaller --onefile --clean --name AgentRecord --hidden-import=yaml --add-data "config.yaml;." --exclude-module termios --exclude-module tty main.py
           dir dist\
 
       - name: Upload artifact

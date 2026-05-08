@@ -8,11 +8,13 @@ import requests
 import yaml
 from pathlib import Path
 
-if os.name == "nt":
+try:
     import msvcrt
-else:
+    IS_WINDOWS = True
+except ImportError:
     import termios
     import tty
+    IS_WINDOWS = False
 
 from rich.console import Console
 from rich.markdown import Markdown
@@ -632,7 +634,7 @@ def _safe_input_windows(prompt: str) -> str:
 
 
 def safe_input(prompt: str = "") -> str:
-    if os.name == "nt":
+    if IS_WINDOWS:
         return _safe_input_windows(prompt)
     else:
         return _safe_input_unix(prompt)
