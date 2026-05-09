@@ -1,6 +1,8 @@
 import json
 import re
+import shutil
 import sys
+import unicodedata
 import datetime
 from typing import Any
 import requests
@@ -544,17 +546,37 @@ def generate_review_summary(answer: str, model_cfg: ModelDict) -> str:
         return f"得到了相关回答。"
 
 
-def _redraw_line(prompt: str, chars: list[str]) -> None:
-    sys.stdout.buffer.write(b'\x1b[u')
+def _display_width(text: str) -> int:
+    """Terminal display columns for *text* (CJK chars occupy 2 columns)."""
+    w = 0
+    for ch in text:
+        ea = unicodedata.east_asian_width(ch)
+        w += 2 if ea in ('W', 'F') else 1
+    return w
+
+
+def _redraw_line(prompt: str, chars: list[str], popped: str = '') -> None:
+    """Redraw input from the start, handling wrapped lines and CJK correctly.
+
+    Called right after ``chars.pop()`` — *popped* is the character that was
+    removed.  The cursor is still at the end of the *old* (longer) display.
+    """
+    new_text = prompt + ''.join(chars)
+    term_width = shutil.get_terminal_size().columns or 80
+
+    new_width = _display_width(prompt) + sum(_display_width(ch) for ch in chars)
+    old_width = new_width + (_display_width(popped) if popped else 1)
+    old_rows = max(1, (old_width + term_width - 1) // term_width)
+
+    if old_rows > 1:
+        sys.stdout.write(f'\x1b[{old_rows - 1}A')
+    sys.stdout.write('\r')
     sys.stdout.buffer.write(b'\x1b[0J')
-    sys.stdout.write(prompt)
-    for ch in chars:
-        sys.stdout.write(ch)
+    sys.stdout.write(new_text)
     sys.stdout.flush()
 
 
 def _safe_input_unix(prompt: str) -> str:
-    sys.stdout.buffer.write(b'\x1b[s')
     sys.stdout.write(prompt)
     sys.stdout.flush()
 
@@ -576,8 +598,8 @@ def _safe_input_unix(prompt: str) -> str:
                 break
             elif b in (b'\x7f', b'\x08'):
                 if chars:
-                    chars.pop()
-                    _redraw_line(prompt, chars)
+                    popped = chars.pop()
+                    _redraw_line(prompt, chars, popped)
             elif b == b'\x03':
                 sys.stdout.write('^C\r\n')
                 sys.stdout.flush()
@@ -624,7 +646,6 @@ def _safe_input_unix(prompt: str) -> str:
 
 
 def _safe_input_windows(prompt: str) -> str:
-    sys.stdout.buffer.write(b'\x1b[s')
     sys.stdout.write(prompt)
     sys.stdout.flush()
     chars: list[str] = []
@@ -637,9 +658,8 @@ def _safe_input_windows(prompt: str) -> str:
             break
         elif ch == '\x08':
             if chars:
-                chars.pop()
-                # 2. 放弃传统的 '\b \b'，改用跨平台兼容的整行重绘
-                _redraw_line(prompt, chars)
+                popped = chars.pop()
+                _redraw_line(prompt, chars, popped)
         elif ch == '\x03':
             sys.stdout.write('^C\r\n')
             sys.stdout.flush()
