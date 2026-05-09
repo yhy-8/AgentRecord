@@ -5,6 +5,7 @@
 #   search:   是否有搜索能力（有则在 UI 和日志中标注 SRCH）
 models:
   - name: deepseek-v4-pro
+    model_id: deepseek-v4-pro
     type: openai          # 请求格式: openai / gemini
     search: false         # 是否有搜索能力
     api_url: https://api.deepseek.com/chat/completions
