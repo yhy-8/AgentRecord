@@ -364,7 +364,7 @@ def execute_tool(func_name: str, args: dict) -> str:
 def call_gemini_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = False, read_only: bool = False) -> tuple[str, bool, int, dict[str, int]]:
     api_url = model_cfg["api_url"]
     api_key = model_cfg["api_key"]
-    model_name = model_cfg["name"]
+    model_name = model_cfg.get("model_id") or model_cfg["name"]
 
     url = f"{api_url}/{model_name}:generateContent?key={api_key}"
     active_tools = [t for t in TOOLS if not (read_only and t["function"]["name"] == "update_summary")]
@@ -440,14 +440,14 @@ def call_openai_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = Fa
     ]
     active_tools = [t for t in TOOLS if not (read_only and t["function"]["name"] == "update_summary")]
     payload: dict[str, Any] = {
-        "model": model_cfg["name"],
+        "model": model_cfg.get("model_id") or model_cfg["name"],
         "messages": messages,
         "tools": active_tools,
         "tool_choice": "auto"
     }
 
     if search_enabled:
-        model_lower = model_cfg["name"].lower()
+        model_lower = (model_cfg.get("model_id") or model_cfg["name"]).lower()
         if "glm" in model_lower:
             payload["tools"] = payload["tools"] + [{"type": "web_search", "web_search": {"enable": True}}]
         elif "moonshot" in model_lower or "kimi" in model_lower:
@@ -520,6 +520,14 @@ def format_stats(web_n: int, tool_dict: dict[str, int]) -> str:
         detail = ", ".join(f"{name} {n}次" for name, n in tool_dict.items())
         parts.append(f"本地工具调用: {detail}")
     return f"[*] {'; '.join(parts)}" if parts else ""
+
+
+def _model_tag(model_cfg: ModelDict) -> str:
+    """构建日志标签用的模型标识：name + SRCH（如有搜索能力）"""
+    tag = model_cfg['name']
+    if model_cfg.get('search'):
+        tag += ' SRCH'
+    return tag
 
 
 def generate_review_summary(answer: str, model_cfg: ModelDict) -> str:
@@ -810,7 +818,7 @@ def main():
                 stats = format_stats(web_n, tool_dict)
                 if stats:
                     console.print(f"[dim]{stats}[/dim]")
-                tag = f"[AI回复] {current_cfg['name']}"
+                tag = f"[AI回复] {_model_tag(current_cfg)}"
                 append_log(ans, tag)
             else:
                 console.print(f"[red][!][/red] 重试失败: {ans}")
@@ -846,9 +854,9 @@ def main():
                     # 查阅模式：AI 生成一句话总结后记录
                     console.print("[cyan][*][/cyan] 查阅模式，正在生成轻记录...")
                     review_summary = generate_review_summary(ans, current_cfg)
-                    append_log(review_summary, f"[AI查阅] {current_cfg['name']}")
+                    append_log(review_summary, f"[AI查阅] {_model_tag(current_cfg)}")
                 else:
-                    append_log(ans, f"[AI回复] {current_cfg['name']}")
+                    append_log(ans, f"[AI回复] {_model_tag(current_cfg)}")
             else:
                 console.print(f"[red][!][/red] 请求失败: {ans}")
             continue
