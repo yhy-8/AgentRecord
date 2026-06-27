@@ -523,8 +523,15 @@ def call_gemini_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = Fa
                     for t in payload["tools"]:
                         if "functionDeclarations" in t:
                             t["functionDeclarations"] = [f for f in t["functionDeclarations"] if f["name"] != "web_search"]
+                    payload["contents"].append({"role": "user", "parts": [{"text": "[系统提示] 网络搜索次数已用完，请基于已有的搜索结果直接回答用户的问题，不要再尝试搜索。"}]})
 
-        return "接口异常: 函数调用超过最大轮次", False, web_searches, tool_calls, search_results
+        # 超过最大迭代轮次，移除工具强制 AI 基于已有结果回答
+        payload["tools"] = []
+        response = requests.post(url, json=payload, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        text = data["candidates"][0]["content"]["parts"][-1].get("text", "").strip()
+        return text, True, web_searches, tool_calls, search_results
     except requests.RequestException as e:
         error_msg = str(e)
         if e.response is not None:
@@ -611,8 +618,15 @@ def call_openai_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = Fa
                 search_rounds += 1
                 if search_rounds >= max_search_rounds:
                     payload["tools"] = [t for t in payload.get("tools", []) if t["function"]["name"] != "web_search"]
+                    messages.append({"role": "user", "content": "[系统提示] 网络搜索次数已用完，请基于已有的搜索结果直接回答用户的问题，不要再尝试搜索。"})
+                    payload["messages"] = messages
 
-        return "接口异常: 工具调用超过最大轮次", False, web_searches, tool_calls, search_results
+        # 超过最大迭代轮次，移除工具强制 AI 基于已有结果回答
+        payload["tools"] = []
+        resp = requests.post(model_cfg["api_url"], headers=headers, json=payload, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"].strip(), True, web_searches, tool_calls, search_results
     except Exception as e:
         return f"接口异常: {e}", False, web_searches, tool_calls, search_results
 
