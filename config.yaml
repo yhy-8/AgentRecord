@@ -25,5 +25,14 @@ models:
     api_url: https://xxxxxx/v1beta/models
     api_key:
 
+# 第三方搜索配置（仅当模型无原生搜索能力时生效）
+third_search:
+  enabled: false               # 全局开关
+  api_url: "https://api.bocha.cn/v1/web-search"
+  api_key: ""
+  count: 25                    # 单次搜索返回条数
+  timeout: 30                  # 请求超时时间（秒）
+  max_rounds: 3                # 最大搜索轮数（AI 可多次修正搜索词）
+
 # 日记存储目录
 diary_dir: "./Records"

@@ -220,6 +220,22 @@ TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "搜索互联网获取实时信息，当你不确定或需要最新信息时使用",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词"},
+                    "include": {"type": "string", "description": "限定搜索的网站范围，多个域名用|或,分隔（如 qq.com|163.com）"},
+                    "exclude": {"type": "string", "description": "排除搜索的网站范围，多个域名用|或,分隔（如 zhihu.com|weibo.com）"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
 ]
 
 
@@ -303,28 +319,29 @@ def append_log(content: str, tag: str = ""):
             f.write(f"**{now}:** {content}\n\n")
 
 
-def read_last_at_query() -> tuple[str, bool, str]:
+def read_last_at_query() -> tuple[str, bool, str, bool]:
     """读取今日日志中最后一个 @AI 提问。
-    返回 (query_text, is_answered, answer_or_empty)。
+    返回 (query_text, is_answered, answer_or_empty, is_review)。
     """
     tf = get_today_file()
     if not tf.exists():
-        return "", False, ""
+        return "", False, "", False
     content = tf.read_text(encoding="utf-8")
-    at_pattern = re.compile(r"\*\*(\d{2}:\d{2}) @AI(?:查阅)?:\*\* (.+?)(?=\n\*\*|\Z)", re.DOTALL)
+    at_pattern = re.compile(r"\*\*(\d{2}:\d{2}) (@AI(?:查阅)?):\*\* (.+?)(?=\n\*\*|\Z)", re.DOTALL)
     matches = list(at_pattern.finditer(content))
     if not matches:
-        return "", False, ""
+        return "", False, "", False
     last_match = matches[-1]
-    query_text = last_match.group(2).strip()
+    is_review = last_match.group(2) == "@AI查阅"
+    query_text = last_match.group(3).strip()
     after_query = content[last_match.end():]
     reply_pattern = re.compile(
         r"\*\*\d{2}:\d{2} (?:\[AI回复]|\[AI查阅]) .+?:\*\* (.+?)(?=\n\*\*|\Z)", re.DOTALL
     )
     rm = reply_pattern.search(after_query)
     if rm:
-        return query_text, True, rm.group(1).strip()
-    return query_text, False, ""
+        return query_text, True, rm.group(1).strip(), is_review
+    return query_text, False, "", is_review
 
 
 def update_summary(summary_text: str) -> str:
@@ -359,8 +376,72 @@ def execute_tool(func_name: str, args: dict) -> str:
         )
     elif func_name == "update_summary":
         return update_summary(args.get("summary_text", ""))
+    elif func_name == "web_search":
+        query = args.get("query", "")
+        include = args.get("include", "")
+        exclude = args.get("exclude", "")
+        result, _ = bocha_search(query, include, exclude)
+        return result if result else "搜索无结果"
     else:
         return f"未知工具: {func_name}"
+
+
+def bocha_search(query: str, include: str = "", exclude: str = "") -> tuple[str, int]:
+    """调用博查AI搜索API，返回 (格式化搜索文本, 结果数量)。"""
+    ts = _config.get("third_search", {})
+    if not ts.get("enabled") or not ts.get("api_key") or not query:
+        return "", 0
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {ts['api_key']}"
+    }
+    body: dict[str, Any] = {
+        "query": query,
+        "freshness": "noLimit",
+        "summary": True,
+        "count": ts.get("count", 25)
+    }
+    if include:
+        body["include"] = include
+    if exclude:
+        body["exclude"] = exclude
+
+    try:
+        resp = requests.post(ts["api_url"], headers=headers, json=body, timeout=ts.get("timeout", 30))
+        if resp.status_code != 200:
+            return "", 0
+        data = resp.json()
+        if data.get("code") != 200:
+            return "", 0
+
+        web_pages = data.get("data", {}).get("webPages", {})
+        results = web_pages.get("value", [])
+        if not results:
+            return "", 0
+
+        lines = ["[网络搜索结果]"]
+        for i, item in enumerate(results, 1):
+            title = item.get("name", "").strip()
+            url = item.get("url", "").strip()
+            snippet = item.get("snippet", "").strip()
+            summary = item.get("summary", "").strip()
+            site_name = item.get("siteName", "").strip()
+            date_pub = item.get("datePublished", "").strip()
+            lines.append(f"{i}. 标题：{title}")
+            lines.append(f"   链接：{url}")
+            if site_name:
+                lines.append(f"   来源：{site_name}")
+            if date_pub:
+                lines.append(f"   时间：{date_pub}")
+            if snippet:
+                lines.append(f"   摘要：{snippet}")
+            if summary and summary != snippet:
+                lines.append(f"   全文概要：{summary}")
+
+        return "\n".join(lines), len(results)
+    except Exception:
+        return "", 0
 
 
 # ================= API 请求 =================
@@ -371,6 +452,11 @@ def call_gemini_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = Fa
 
     url = f"{api_url}/{model_name}:generateContent?key={api_key}"
     active_tools = [t for t in TOOLS if not (read_only and t["function"]["name"] == "update_summary")]
+    ts_cfg = _config.get("third_search", {})
+    use_third_search = (not search_enabled) and ts_cfg.get("enabled", False) and ts_cfg.get("api_key", "")
+    max_search_rounds = ts_cfg.get("max_rounds", 3)
+    if not use_third_search:
+        active_tools = [t for t in active_tools if t["function"]["name"] != "web_search"]
     function_declarations = [t["function"] for t in active_tools]
     tools: list[dict] = [{"functionDeclarations": function_declarations}]
     if search_enabled:
@@ -384,6 +470,7 @@ def call_gemini_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = Fa
 
     web_searches = 0
     tool_calls: dict[str, int] = {}
+    search_rounds = 0
     try:
         for _ in range(5):
             response = requests.post(url, json=payload, timeout=60)
@@ -426,6 +513,14 @@ def call_gemini_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = Fa
             payload["contents"].append({"role": "model", "parts": parts})
             payload["contents"].append({"role": "user", "parts": func_responses})
 
+            # 第三方搜索轮数控制
+            if use_third_search and any(p["functionCall"]["name"] == "web_search" for p in func_parts):
+                search_rounds += 1
+                if search_rounds >= max_search_rounds:
+                    for t in payload["tools"]:
+                        if "functionDeclarations" in t:
+                            t["functionDeclarations"] = [f for f in t["functionDeclarations"] if f["name"] != "web_search"]
+
         return "接口异常: 函数调用超过最大轮次", False, web_searches, tool_calls
     except requests.RequestException as e:
         error_msg = str(e)
@@ -442,6 +537,11 @@ def call_openai_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = Fa
         {"role": "user", "content": prompt}
     ]
     active_tools = [t for t in TOOLS if not (read_only and t["function"]["name"] == "update_summary")]
+    ts_cfg = _config.get("third_search", {})
+    use_third_search = (not search_enabled) and ts_cfg.get("enabled", False) and ts_cfg.get("api_key", "")
+    max_search_rounds = ts_cfg.get("max_rounds", 3)
+    if not use_third_search:
+        active_tools = [t for t in active_tools if t["function"]["name"] != "web_search"]
     payload: dict[str, Any] = {
         "model": model_cfg.get("model_id") or model_cfg["name"],
         "messages": messages,
@@ -465,6 +565,7 @@ def call_openai_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = Fa
 
     web_searches = 0
     tool_calls: dict[str, int] = {}
+    search_rounds = 0
     try:
         for _ in range(5):
             resp = requests.post(model_cfg["api_url"], headers=headers, json=payload, timeout=60)
@@ -498,7 +599,12 @@ def call_openai_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = Fa
                 })
 
             payload["messages"] = messages
-            # 保留 tools 定义：DeepSeek 等模型需要每轮请求都带上 tools 才能继续调用
+
+            # 第三方搜索轮数控制
+            if use_third_search and any(t["function"]["name"] == "web_search" for t in tc):
+                search_rounds += 1
+                if search_rounds >= max_search_rounds:
+                    payload["tools"] = [t for t in payload.get("tools", []) if t["function"]["name"] != "web_search"]
 
         return "接口异常: 工具调用超过最大轮次", False, web_searches, tool_calls
     except Exception as e:
@@ -713,12 +819,12 @@ def show_help():
     console.print(Panel(
         "  [cyan]/h[/cyan]        → 显示此帮助\n"
         "  [cyan]/m[/cyan]        → 切换到下一个模型\n"
-        "  [cyan]/o[/cyan]        → 切换 记录/查阅 模式\n"
         "  [cyan]/v [日期][/cyan] → 查看历史日记（空=今天, [cyan]/v help[/cyan] 查看所有用法）\n"
-        "  [cyan]/r[/cyan]        → 重试今日最后一个未回答的 @提问\n"
+        "  [cyan]/r[/cyan]        → 重试今日最后一个未回答的提问（保持原类型）\n"
         "  [cyan]/c[/cyan]        → 清空当前窗口\n"
         "  [cyan]/d[/cyan]        → 删除今日最后一条记录\n"
-        "  [cyan]@[内容][/cyan]   → 呼叫AI解答或执行任务（如 @总结今日内容）",
+        "  [cyan]/q [问题][/cyan] → 查阅提问（只读，生成轻记录）\n"
+        "  [cyan]@[内容][/cyan]   → 呼叫AI解答或执行任务（完整记录）",
         title="[bold]命令手册[/bold]",
         border_style="cyan"
     ))
@@ -746,7 +852,6 @@ def delete_last_record() -> bool:
 # ================= 主循环 =================
 def main():
     current_cfg = ModelConfig.get_model()
-    current_mode = "记录"
 
     console.print(Panel.fit("[bold]Agent 日记系统[/bold]", border_style="cyan"))
     console.print(f"  可用模型: [dim]{', '.join(m['name'] for m in ModelConfig.models())}[/dim]")
@@ -756,7 +861,7 @@ def main():
     while True:
         try:
             srch = " SRCH" if current_cfg.get("search") else ""
-            prompt_prefix = f"[{current_cfg['name']}{srch} | {current_mode}] >> "
+            prompt_prefix = f"[{current_cfg['name']}{srch}] >> "
             user_input = safe_input(prompt_prefix).strip()
         except (KeyboardInterrupt, EOFError):
             console.print("[dim]系统退出。[/dim]")
@@ -774,12 +879,6 @@ def main():
         if user_input == "/m":
             current_cfg = ModelConfig.next_after(current_cfg["name"])
             console.print(f"[cyan][*][/cyan] 模型已切换为: {current_cfg['name']}")
-            continue
-
-        # --- /o 命令（切换模式） ---
-        if user_input == "/o":
-            current_mode = "查阅" if current_mode == "记录" else "记录"
-            console.print(f"[cyan][*][/cyan] 模式已切换为: {current_mode}模式")
             continue
 
         # --- /c 命令（清屏） ---
@@ -820,29 +919,62 @@ def main():
 
         # --- /r 命令 ---
         if user_input == "/r":
-            last_query, answered, prev_ans = read_last_at_query()
+            last_query, answered, prev_ans, is_review = read_last_at_query()
             if not last_query:
                 console.print("[yellow][!][/yellow] 今日日志中没有 @AI 提问。")
                 continue
             if answered:
                 console.print(f"[cyan][*][/cyan] 最后一个 @AI 提问已被回答：\n\n{prev_ans}\n")
                 continue
-            console.print(f"[cyan][*][/cyan] 重试提问: {last_query[:80]}{'...' if len(last_query) > 80 else ''}")
+            mode_label = "查阅" if is_review else "提问"
+            console.print(f"[cyan][*][/cyan] 重试{mode_label}: {last_query[:80]}{'...' if len(last_query) > 80 else ''}")
             console.print("[cyan][*][/cyan] AI 思考/检索中...")
             init_file_if_not_exists()
             today_log = get_today_file().read_text(encoding="utf-8")
             retry_prompt = f"【今日记录（{datetime.datetime.now().strftime('%Y-%m-%d')}）】\n{today_log}\n\n【用户提问】\n{last_query}"
-            ans, success, web_n, tool_dict = call_ai(retry_prompt, current_cfg, read_only=(current_mode == "查阅"))
+            ans, success, web_n, tool_dict = call_ai(retry_prompt, current_cfg, read_only=is_review)
 
             if success:
                 console.print(Panel(f"{ans}", title="[bold]AI 输出[/bold]", border_style="green"))
                 stats = format_stats(web_n, tool_dict)
                 if stats:
                     console.print(f"[dim]{stats}[/dim]")
-                tag = f"[AI回复] {_model_tag(current_cfg)}"
-                append_log(ans, tag)
+                if is_review:
+                    console.print("[cyan][*][/cyan] 查阅模式，正在生成轻记录...")
+                    review_summary = generate_review_summary(ans, current_cfg)
+                    append_log(review_summary, f"[AI查阅] {_model_tag(current_cfg)}")
+                else:
+                    append_log(ans, f"[AI回复] {_model_tag(current_cfg)}")
             else:
                 console.print(f"[red][!][/red] 重试失败: {ans}")
+            continue
+
+        # --- /q 命令（查阅） ---
+        if user_input == "/q" or user_input.startswith("/q "):
+            query = user_input[3:].strip() if user_input.startswith("/q ") else ""
+            if not query:
+                console.print("[yellow][!][/yellow] 请输入查阅内容。用法: /q <问题>")
+                continue
+
+            console.print("[cyan][*][/cyan] AI 查阅/检索中...")
+            append_log(query, "@AI查阅")
+
+            init_file_if_not_exists()
+            today_log = get_today_file().read_text(encoding="utf-8")
+            prompt = f"【今日记录（{datetime.datetime.now().strftime('%Y-%m-%d')}）】\n{today_log}\n\n【用户提问】\n{query}"
+
+            ans, success, web_n, tool_dict = call_ai(prompt, current_cfg, read_only=True)
+
+            if success:
+                console.print(Panel(f"{ans}", title="[bold]AI 输出[/bold]", border_style="green"))
+                stats = format_stats(web_n, tool_dict)
+                if stats:
+                    console.print(f"[dim]{stats}[/dim]")
+                console.print("[cyan][*][/cyan] 查阅模式，正在生成轻记录...")
+                review_summary = generate_review_summary(ans, current_cfg)
+                append_log(review_summary, f"[AI查阅] {_model_tag(current_cfg)}")
+            else:
+                console.print(f"[red][!][/red] 请求失败: {ans}")
             continue
 
         # --- @AI 提问 ---
@@ -853,40 +985,26 @@ def main():
                 continue
 
             console.print("[cyan][*][/cyan] AI 思考/检索中...")
+            append_log(query, "@AI")
 
-            # 记录用户提问（查阅模式用独立标签，保证 /r 可读取）
-            user_tag = "@AI查阅" if current_mode == "查阅" else "@AI"
-            append_log(query, user_tag)
-
-            # 自动附带今日记录
             init_file_if_not_exists()
             today_log = get_today_file().read_text(encoding="utf-8")
             prompt = f"【今日记录（{datetime.datetime.now().strftime('%Y-%m-%d')}）】\n{today_log}\n\n【用户提问】\n{query}"
 
-            ans, success, web_n, tool_dict = call_ai(prompt, current_cfg, read_only=(current_mode == "查阅"))
+            ans, success, web_n, tool_dict = call_ai(prompt, current_cfg, read_only=False)
 
             if success:
                 console.print(Panel(f"{ans}", title="[bold]AI 输出[/bold]", border_style="green"))
                 stats = format_stats(web_n, tool_dict)
                 if stats:
                     console.print(f"[dim]{stats}[/dim]")
-
-                if current_mode == "查阅":
-                    # 查阅模式：AI 生成一句话总结后记录
-                    console.print("[cyan][*][/cyan] 查阅模式，正在生成轻记录...")
-                    review_summary = generate_review_summary(ans, current_cfg)
-                    append_log(review_summary, f"[AI查阅] {_model_tag(current_cfg)}")
-                else:
-                    append_log(ans, f"[AI回复] {_model_tag(current_cfg)}")
+                append_log(ans, f"[AI回复] {_model_tag(current_cfg)}")
             else:
                 console.print(f"[red][!][/red] 请求失败: {ans}")
             continue
 
         # --- 普通文本输入 ---
-        if current_mode == "记录":
-            append_log(user_input)
-        else:
-            console.print("[yellow][!][/yellow] 查阅模式下普通文本不会被记录。请使用 @ 提问，或输入 /o 切换回记录模式。")
+        append_log(user_input)
 
 
 if __name__ == "__main__":
