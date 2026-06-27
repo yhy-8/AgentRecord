@@ -360,30 +360,30 @@ def update_summary(summary_text: str) -> str:
 
 
 # ================= 工具调用分发 =================
-def execute_tool(func_name: str, args: dict) -> str:
+def execute_tool(func_name: str, args: dict) -> tuple[str, int]:
     if func_name == "read_daily_log":
         return read_daily_log(
             date=args.get("date", ""),
             start_date=args.get("start_date", ""),
             end_date=args.get("end_date", ""),
             summary_only=args.get("summary_only", False)
-        )
+        ), 0
     elif func_name == "search_history":
         return search_history(
             args.get("keyword", ""),
             args.get("days_limit", 0),
             args.get("summary_only", False)
-        )
+        ), 0
     elif func_name == "update_summary":
-        return update_summary(args.get("summary_text", ""))
+        return update_summary(args.get("summary_text", "")), 0
     elif func_name == "web_search":
         query = args.get("query", "")
         include = args.get("include", "")
         exclude = args.get("exclude", "")
-        result, _ = bocha_search(query, include, exclude)
-        return result if result else "搜索无结果"
+        result, count = bocha_search(query, include, exclude)
+        return (result if result else "搜索无结果"), count
     else:
-        return f"未知工具: {func_name}"
+        return f"未知工具: {func_name}", 0
 
 
 def bocha_search(query: str, include: str = "", exclude: str = "") -> tuple[str, int]:
@@ -445,7 +445,7 @@ def bocha_search(query: str, include: str = "", exclude: str = "") -> tuple[str,
 
 
 # ================= API 请求 =================
-def call_gemini_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = False, read_only: bool = False) -> tuple[str, bool, int, dict[str, int]]:
+def call_gemini_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = False, read_only: bool = False) -> tuple[str, bool, int, dict[str, int], int]:
     api_url = model_cfg["api_url"]
     api_key = model_cfg["api_key"]
     model_name = model_cfg.get("model_id") or model_cfg["name"]
@@ -469,6 +469,7 @@ def call_gemini_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = Fa
     }
 
     web_searches = 0
+    search_results = 0
     tool_calls: dict[str, int] = {}
     search_rounds = 0
     try:
@@ -493,7 +494,7 @@ def call_gemini_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = Fa
             func_parts = [p for p in parts if "functionCall" in p]
             if not func_parts:
                 text = parts[-1].get("text", "").strip()
-                return text, True, web_searches, tool_calls
+                return text, True, web_searches, tool_calls, search_results
 
             # 执行函数调用
             func_responses = []
@@ -502,7 +503,9 @@ def call_gemini_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = Fa
                 func_name = fc["name"]
                 tool_calls[func_name] = tool_calls.get(func_name, 0) + 1
                 args = fc.get("args", {})
-                result = execute_tool(func_name, args)
+                result, sr_cnt = execute_tool(func_name, args)
+                if sr_cnt:
+                    search_results += sr_cnt
                 func_responses.append({
                     "functionResponse": {
                         "name": func_name,
@@ -521,17 +524,17 @@ def call_gemini_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = Fa
                         if "functionDeclarations" in t:
                             t["functionDeclarations"] = [f for f in t["functionDeclarations"] if f["name"] != "web_search"]
 
-        return "接口异常: 函数调用超过最大轮次", False, web_searches, tool_calls
+        return "接口异常: 函数调用超过最大轮次", False, web_searches, tool_calls, search_results
     except requests.RequestException as e:
         error_msg = str(e)
         if e.response is not None:
             error_msg += f" | {e.response.text}"
-        return f"接口异常: {error_msg}", False, web_searches, tool_calls
+        return f"接口异常: {error_msg}", False, web_searches, tool_calls, search_results
     except Exception as e:
-        return f"接口异常: {e}", False, web_searches, tool_calls
+        return f"接口异常: {e}", False, web_searches, tool_calls, search_results
 
 
-def call_openai_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = False, read_only: bool = False) -> tuple[str, bool, int, dict[str, int]]:
+def call_openai_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = False, read_only: bool = False) -> tuple[str, bool, int, dict[str, int], int]:
     messages = [
         {"role": "system", "content": _build_system_prompt()},
         {"role": "user", "content": prompt}
@@ -564,6 +567,7 @@ def call_openai_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = Fa
     }
 
     web_searches = 0
+    search_results = 0
     tool_calls: dict[str, int] = {}
     search_rounds = 0
     try:
@@ -580,7 +584,7 @@ def call_openai_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = Fa
 
             tc = msg.get("tool_calls", [])
             if not tc:
-                return msg["content"].strip(), True, web_searches, tool_calls
+                return msg["content"].strip(), True, web_searches, tool_calls, search_results
 
             for tool_call in tc:
                 func_name = tool_call["function"]["name"]
@@ -590,7 +594,9 @@ def call_openai_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = Fa
             for tool_call in tc:
                 func_name = tool_call["function"]["name"]
                 args = json.loads(tool_call["function"]["arguments"])
-                res = execute_tool(func_name, args)
+                res, sr_cnt = execute_tool(func_name, args)
+                if sr_cnt:
+                    search_results += sr_cnt
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
@@ -606,12 +612,12 @@ def call_openai_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = Fa
                 if search_rounds >= max_search_rounds:
                     payload["tools"] = [t for t in payload.get("tools", []) if t["function"]["name"] != "web_search"]
 
-        return "接口异常: 工具调用超过最大轮次", False, web_searches, tool_calls
+        return "接口异常: 工具调用超过最大轮次", False, web_searches, tool_calls, search_results
     except Exception as e:
-        return f"接口异常: {e}", False, web_searches, tool_calls
+        return f"接口异常: {e}", False, web_searches, tool_calls, search_results
 
 
-def call_ai(prompt: str, model_cfg: ModelDict, read_only: bool = False) -> tuple[str, bool, int, dict[str, int]]:
+def call_ai(prompt: str, model_cfg: ModelDict, read_only: bool = False) -> tuple[str, bool, int, dict[str, int], int]:
     search_enabled = model_cfg.get("search", False)
     if model_cfg["type"] == "gemini":
         return call_gemini_api(prompt, model_cfg, search_enabled, read_only)
@@ -620,11 +626,13 @@ def call_ai(prompt: str, model_cfg: ModelDict, read_only: bool = False) -> tuple
 
 
 # ================= 查阅模式轻记录 =================
-def format_stats(web_n: int, tool_dict: dict[str, int]) -> str:
+def format_stats(web_n: int, tool_dict: dict[str, int], sr_cnt: int = 0) -> str:
     """格式化统计信息。无搜索能力的模型不显示搜索次数；工具调用显示具体名称和次数。"""
     parts = []
     if web_n:
         parts.append(f"网络搜索 {web_n} 次")
+    if sr_cnt:
+        parts.append(f"搜索到 {sr_cnt} 条结果")
     if tool_dict:
         detail = ", ".join(f"{name} {n}次" for name, n in tool_dict.items())
         parts.append(f"本地工具调用: {detail}")
@@ -646,7 +654,7 @@ def generate_review_summary(answer: str, model_cfg: ModelDict) -> str:
         "请用一句话总结这次查阅得到的结论。直接说结论，不要重复用户的问题，不要以\"查阅了\"开头。只输出结论本身。"
     )
     try:
-        summary, ok, _, _ = call_ai(summary_prompt, model_cfg, read_only=True)
+        summary, ok, _, _, _ = call_ai(summary_prompt, model_cfg, read_only=True)
         return summary if ok else f"得到了相关回答。"
     except requests.RequestException:
         return f"得到了相关回答。"
@@ -932,11 +940,11 @@ def main():
             init_file_if_not_exists()
             today_log = get_today_file().read_text(encoding="utf-8")
             retry_prompt = f"【今日记录（{datetime.datetime.now().strftime('%Y-%m-%d')}）】\n{today_log}\n\n【用户提问】\n{last_query}"
-            ans, success, web_n, tool_dict = call_ai(retry_prompt, current_cfg, read_only=is_review)
+            ans, success, web_n, tool_dict, sr_cnt = call_ai(retry_prompt, current_cfg, read_only=is_review)
 
             if success:
                 console.print(Panel(f"{ans}", title="[bold]AI 输出[/bold]", border_style="green"))
-                stats = format_stats(web_n, tool_dict)
+                stats = format_stats(web_n, tool_dict, sr_cnt)
                 if stats:
                     console.print(f"[dim]{stats}[/dim]")
                 if is_review:
@@ -963,11 +971,11 @@ def main():
             today_log = get_today_file().read_text(encoding="utf-8")
             prompt = f"【今日记录（{datetime.datetime.now().strftime('%Y-%m-%d')}）】\n{today_log}\n\n【用户提问】\n{query}"
 
-            ans, success, web_n, tool_dict = call_ai(prompt, current_cfg, read_only=True)
+            ans, success, web_n, tool_dict, sr_cnt = call_ai(prompt, current_cfg, read_only=True)
 
             if success:
                 console.print(Panel(f"{ans}", title="[bold]AI 输出[/bold]", border_style="green"))
-                stats = format_stats(web_n, tool_dict)
+                stats = format_stats(web_n, tool_dict, sr_cnt)
                 if stats:
                     console.print(f"[dim]{stats}[/dim]")
                 console.print("[cyan][*][/cyan] 查阅模式，正在生成轻记录...")
@@ -991,11 +999,11 @@ def main():
             today_log = get_today_file().read_text(encoding="utf-8")
             prompt = f"【今日记录（{datetime.datetime.now().strftime('%Y-%m-%d')}）】\n{today_log}\n\n【用户提问】\n{query}"
 
-            ans, success, web_n, tool_dict = call_ai(prompt, current_cfg, read_only=False)
+            ans, success, web_n, tool_dict, sr_cnt = call_ai(prompt, current_cfg, read_only=False)
 
             if success:
                 console.print(Panel(f"{ans}", title="[bold]AI 输出[/bold]", border_style="green"))
-                stats = format_stats(web_n, tool_dict)
+                stats = format_stats(web_n, tool_dict, sr_cnt)
                 if stats:
                     console.print(f"[dim]{stats}[/dim]")
                 append_log(ans, f"[AI回复] {_model_tag(current_cfg)}")
