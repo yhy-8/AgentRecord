@@ -36,3 +36,16 @@ third_search:
 
 # 日记存储目录
 diary_dir: "./Records"
+
+# AI 分析报告目录（与原始日记分开保存）
+analysis_dir: "./AnalysisReports"
+
+# 自动任务
+# 程序启动后会在后台检查一次，此后跨过零点时处理前一天；
+# 若程序中断数日，下次启动会从上次成功日期继续补做。
+automation:
+  enabled: true
+  model: deepseek-v4-pro     # 留空则使用模型列表中的第一个模型
+  daily_summary: true       # 自动写入前一日日记顶部 <summary>
+  daily_report: true        # 自动生成前一日分析日报
+  weekly_report: true       # 每周生成上一完整自然周的分析周报

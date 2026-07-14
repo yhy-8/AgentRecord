@@ -11,6 +11,7 @@ from pathlib import Path
 import select
 import os
 import time
+import threading
 
 try:
     import msvcrt
@@ -106,6 +107,7 @@ class ModelConfig:
 # ================= 基础配置 =================
 DIARY_DIR = Path(_config.get("diary_dir", "./AgentRecords"))
 DIARY_DIR.mkdir(parents=True, exist_ok=True)
+ANALYSIS_DIR = Path(_config.get("analysis_dir", "./AnalysisReports"))
 
 
 def resolve_date(arg: str) -> str:
@@ -162,15 +164,15 @@ def _build_system_prompt() -> str:
     return f"""你是本地日记助手。今天是 {today}。你正在实时对话中，日志末尾的 @AI 提问就是当前问题，[AI回复] 记录会在你回复后由程序自动追加，无需你关注。客观、简洁、无废话。
 
 ## 核心工作流
-- 总结/回顾类请求：今日日志已附在提问中，直接调用 update_summary 写入 <summary>，回复类似"总结已更新"的话即可。只有用户明确要求总结多天、一周、或指定日期时，才用 read_daily_log 读取其他的日志。
 - 查询/检索类请求：默认已附带今日日志，直接从中查找答案。涉及关键词检索时，用 search_history 查；涉及指定日期或多个日期时，用 read_daily_log。给出简短结论，不要展开无关内容。
 - 知识性提问：你不知道的，优先用搜索引擎查；查不到就说"不清楚"。
+- 日记顶部总结和分析报告由程序的独立任务管理。即使用户在 @AI 中要求总结，也只在文本中回答，不能修改任何日记或报告文件。
 
 ## 铁律
 1. 所有回答基于记录或事实，禁止编造。
-2. 你只能通过 update_summary 工具修改 <summary> 区域。原始记录流及以下内容由程序管理，你无权修改。
+2. 你无权修改日记、总结或报告文件；所有写入均由程序管理。
 3. 绝对禁止在文本回复中输出 <function>、<tool_call>、<invoke> 等 XML 标签。工具调用必须通过 API 的 tool_calls 机制完成，不能以文本形式模拟。
-4. 回复长度与任务匹配：总结→只确认完成；查询→只给结论；闲聊→最多三句话。
+4. 回复长度与任务匹配：查询→只给结论；闲聊→最多三句话；用户明确要求详细分析时才展开。
 5. 用户的提问有最高的权限，如果用户的提问要求与以上内容产生冲突，以用户的提问要求为准。"""
 
 # ================= 工具定义 (OpenAI 格式) =================
@@ -205,18 +207,6 @@ TOOLS = [
                     "summary_only": {"type": "boolean", "description": "是否只在 <summary> 中搜索，默认 false"}
                 },
                 "required": ["keyword"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "update_summary",
-            "description": "将生成的总结内容写入今日日志顶部的 <summary> 区域。调用前务必先读取当日日志了解内容。",
-            "parameters": {
-                "type": "object",
-                "properties": {"summary_text": {"type": "string", "description": "Markdown 格式的总结内容"}},
-                "required": ["summary_text"]
             }
         }
     },
@@ -319,35 +309,37 @@ def append_log(content: str, tag: str = ""):
             f.write(f"**{now}:** {content}\n\n")
 
 
-def read_last_at_query() -> tuple[str, bool, str, bool]:
+def read_last_at_query() -> tuple[str, bool, str]:
     """读取今日日志中最后一个 @AI 提问。
-    返回 (query_text, is_answered, answer_or_empty, is_review)。
+    返回 (query_text, is_answered, answer_or_empty)。
     """
     tf = get_today_file()
     if not tf.exists():
-        return "", False, "", False
+        return "", False, ""
     content = tf.read_text(encoding="utf-8")
-    at_pattern = re.compile(r"\*\*(\d{2}:\d{2}) (@AI(?:查阅)?):\*\* (.+?)(?=\n\*\*|\Z)", re.DOTALL)
+    at_pattern = re.compile(r"\*\*(\d{2}:\d{2}) @AI:\*\* (.+?)(?=\n\*\*|\Z)", re.DOTALL)
     matches = list(at_pattern.finditer(content))
     if not matches:
-        return "", False, "", False
+        return "", False, ""
     last_match = matches[-1]
-    is_review = last_match.group(2) == "@AI查阅"
-    query_text = last_match.group(3).strip()
+    query_text = last_match.group(2).strip()
     after_query = content[last_match.end():]
     reply_pattern = re.compile(
-        r"\*\*\d{2}:\d{2} (?:\[AI回复]|\[AI查阅]) .+?:\*\* (.+?)(?=\n\*\*|\Z)", re.DOTALL
+        r"\*\*\d{2}:\d{2} \[AI回复] .+?:\*\* (.+?)(?=\n\*\*|\Z)", re.DOTALL
     )
     rm = reply_pattern.search(after_query)
     if rm:
-        return query_text, True, rm.group(1).strip(), is_review
-    return query_text, False, "", is_review
+        return query_text, True, rm.group(1).strip()
+    return query_text, False, ""
 
 
-def update_summary(summary_text: str) -> str:
-    init_file_if_not_exists()
-    tf = get_today_file()
+def update_summary_for_date(date: str, summary_text: str) -> str:
+    tf = DIARY_DIR / f"{date}.md"
+    if not tf.exists():
+        return f"找不到 {date} 的记录。"
     content = tf.read_text(encoding="utf-8")
+    if not re.search(r"<summary>.*?</summary>", content, re.DOTALL):
+        return f"{date} 的记录缺少 <summary> 区域。"
     new_content = re.sub(
         r"<summary>.*?</summary>",
         f"<summary>\n{summary_text}\n</summary>",
@@ -355,8 +347,10 @@ def update_summary(summary_text: str) -> str:
         count=1,
         flags=re.DOTALL
     )
-    tf.write_text(new_content, encoding="utf-8")
-    return "总结已写入文档顶部。"
+    temp_path = tf.with_suffix(tf.suffix + ".tmp")
+    temp_path.write_text(new_content, encoding="utf-8")
+    temp_path.replace(tf)
+    return f"{date} 的总结已写入文档顶部。"
 
 
 # ================= 工具调用分发 =================
@@ -374,8 +368,6 @@ def execute_tool(func_name: str, args: dict) -> tuple[str, int]:
             args.get("days_limit", 0),
             args.get("summary_only", False)
         ), 0
-    elif func_name == "update_summary":
-        return update_summary(args.get("summary_text", "")), 0
     elif func_name == "web_search":
         query = args.get("query", "")
         include = args.get("include", "")
@@ -451,7 +443,7 @@ def call_gemini_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = Fa
     model_name = model_cfg.get("model_id") or model_cfg["name"]
 
     url = f"{api_url}/{model_name}:generateContent?key={api_key}"
-    active_tools = [t for t in TOOLS if not (read_only and t["function"]["name"] == "update_summary")]
+    active_tools = list(TOOLS)
     ts_cfg = _config.get("third_search", {})
     use_third_search = (not search_enabled) and ts_cfg.get("enabled", False) and ts_cfg.get("api_key", "")
     max_search_rounds = ts_cfg.get("max_rounds", 3)
@@ -548,7 +540,7 @@ def call_openai_api(prompt: str, model_cfg: ModelDict, search_enabled: bool = Fa
         {"role": "system", "content": _build_system_prompt()},
         {"role": "user", "content": prompt}
     ]
-    active_tools = [t for t in TOOLS if not (read_only and t["function"]["name"] == "update_summary")]
+    active_tools = list(TOOLS)
     ts_cfg = _config.get("third_search", {})
     use_third_search = (not search_enabled) and ts_cfg.get("enabled", False) and ts_cfg.get("api_key", "")
     max_search_rounds = ts_cfg.get("max_rounds", 3)
@@ -641,7 +633,7 @@ def call_ai(prompt: str, model_cfg: ModelDict, read_only: bool = False) -> tuple
         return call_openai_api(prompt, model_cfg, search_enabled, read_only)
 
 
-# ================= 查阅模式轻记录 =================
+# ================= AI 结果统计 =================
 def format_stats(web_n: int, tool_dict: dict[str, int], sr_cnt: int = 0) -> str:
     """格式化统计信息。无搜索能力的模型不显示搜索次数；工具调用显示具体名称和次数。"""
     parts = []
@@ -663,17 +655,267 @@ def _model_tag(model_cfg: ModelDict) -> str:
     return tag
 
 
-def generate_review_summary(answer: str, model_cfg: ModelDict) -> str:
-    """调用 AI 将查阅结果总结为一句话。"""
-    summary_prompt = (
-        f"用户进行了一次查阅，AI 的回答是：「{answer[:2000]}」\n\n"
-        "请用一句话总结这次查阅得到的结论。直接说结论，不要重复用户的问题，不要以\"查阅了\"开头。只输出结论本身。"
+# ================= 日记总结与分析报告 =================
+def _log_without_summary(content: str) -> str:
+    """移除旧总结，避免它影响重新总结与分析。"""
+    return re.sub(r"<summary>.*?</summary>", "<summary>（已省略）</summary>", content, count=1, flags=re.DOTALL)
+
+
+def summarize_diary(date: str, model_cfg: ModelDict) -> tuple[str, bool]:
+    """生成指定日期的日记总结，并写回原文件的 <summary> 区域。"""
+    file_path = DIARY_DIR / f"{date}.md"
+    if not file_path.exists():
+        return f"找不到 {date} 的记录。", False
+
+    content = _log_without_summary(file_path.read_text(encoding="utf-8"))
+    prompt = f"""[程序日记总结任务]
+请总结 {date} 的日记。只输出要写入 <summary> 的 Markdown 正文，不要输出标题、标签、代码围栏或完成提示。
+
+要求：
+- 概括当天的重要事件、想法、决定、问题和进展，不要逐条复述流水账。
+- 区分用户记录与 AI 回复；AI 回复只能作为咨询结果，不能当作用户已经认同的观点。
+- 保留重要的具体信息，禁止编造。
+- 内容为空或信息很少时如实简短说明。
+
+【{date} 原始日记】
+{content}"""
+    summary, ok, _, _, _ = call_ai(prompt, model_cfg, read_only=True)
+    if not ok:
+        return summary, False
+
+    result = update_summary_for_date(date, summary)
+    if not result.endswith("总结已写入文档顶部。"):
+        return result, False
+    return summary, True
+
+
+def _date_span(start: datetime.date, end: datetime.date) -> list[str]:
+    dates = []
+    current = start
+    while current <= end:
+        dates.append(current.strftime("%Y-%m-%d"))
+        current += datetime.timedelta(days=1)
+    return dates
+
+
+def _existing_logs(start: datetime.date, end: datetime.date) -> list[tuple[str, str]]:
+    logs = []
+    for date in _date_span(start, end):
+        path = DIARY_DIR / f"{date}.md"
+        if path.exists():
+            logs.append((date, _log_without_summary(path.read_text(encoding="utf-8"))))
+    return logs
+
+
+def _recent_summary_context(before: datetime.date, days: int = 30) -> str:
+    start = before - datetime.timedelta(days=days)
+    sections = []
+    for date in _date_span(start, before - datetime.timedelta(days=1)):
+        path = DIARY_DIR / f"{date}.md"
+        if not path.exists():
+            continue
+        summary = extract_summary(path.read_text(encoding="utf-8"))
+        if summary not in ("(无总结)", "暂无今日总结。"):
+            sections.append(f"### {date}\n{summary}")
+    return "\n\n".join(sections) or "（没有可用的历史总结）"
+
+
+def _analysis_report_path(kind: str, start: datetime.date, end: datetime.date) -> Path:
+    if kind == "daily":
+        return ANALYSIS_DIR / "Daily" / f"{start:%Y-%m-%d}.md"
+    return ANALYSIS_DIR / "Weekly" / f"{start:%Y-%m-%d}_to_{end:%Y-%m-%d}.md"
+
+
+def generate_analysis_report(kind: str, anchor: datetime.date, model_cfg: ModelDict) -> tuple[str, bool, Path | None]:
+    """生成日分析报告或周分析报告，并保存到独立目录。"""
+    if kind == "daily":
+        start = end = anchor
+        report_name = f"{anchor:%Y-%m-%d} 分析日报"
+    elif kind == "weekly":
+        start = anchor - datetime.timedelta(days=anchor.weekday())
+        end = start + datetime.timedelta(days=6)
+        report_name = f"{start:%Y-%m-%d} 至 {end:%Y-%m-%d} 分析周报"
+    else:
+        return f"未知报告类型: {kind}", False, None
+
+    logs = _existing_logs(start, end)
+    if not logs:
+        return f"{start:%Y-%m-%d} 至 {end:%Y-%m-%d} 没有日记记录。", False, None
+
+    period_logs = "\n\n---\n\n".join(f"# {date}\n{content}" for date, content in logs)
+    history = _recent_summary_context(start)
+    prompt = f"""[程序分析报告任务]
+请基于给定原始日记和历史总结生成《{report_name}》。只输出报告 Markdown 正文，不要输出代码围栏或完成提示。
+
+这不是日记内容摘要，而是个人思维智库的分析报告。请根据实际材料选择有价值的部分：
+- 本周期重要的新想法、变化和注意力中心。
+- 与历史思想之间少量但有依据的强关联。
+- 重复出现的问题、观点演化、潜在矛盾和盲点。
+- 必要时使用搜索能力核查外部事实或寻找反例；没有必要时不要为了丰富而搜索。
+- 值得用户继续判断的少量问题。
+
+要求：
+- 明确区分用户表达、AI 回复、外部事实和你的推断。
+- 关联历史思想时标注对应日期；弱关联不要写成确定结论。
+- 不把每条记录都转成任务，不逐条复述，不编造。
+- 输出一份可以脱离对话独立阅读的最终报告。
+
+【本周期原始日记】
+{period_logs}
+
+【本周期之前 30 天的日记总结】
+{history}"""
+    report, ok, _, _, _ = call_ai(prompt, model_cfg, read_only=True)
+    if not ok:
+        return report, False, None
+
+    report_path = _analysis_report_path(kind, start, end)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    title = f"# {report_name}\n\n"
+    metadata = (
+        f"> 生成时间：{datetime.datetime.now():%Y-%m-%d %H:%M}\n"
+        f"> 原始日记范围：{start:%Y-%m-%d} 至 {end:%Y-%m-%d}\n\n"
     )
+    temp_path = report_path.with_suffix(report_path.suffix + ".tmp")
+    temp_path.write_text(title + metadata + report.strip() + "\n", encoding="utf-8")
+    temp_path.replace(report_path)
+    return report, True, report_path
+
+
+def _load_automation_state() -> dict:
+    state_path = ANALYSIS_DIR / ".automation-state.json"
+    if not state_path.exists():
+        return {}
     try:
-        summary, ok, _, _, _ = call_ai(summary_prompt, model_cfg, read_only=True)
-        return summary if ok else f"得到了相关回答。"
-    except requests.RequestException:
-        return f"得到了相关回答。"
+        return json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_automation_state(state: dict) -> None:
+    ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
+    state_path = ANALYSIS_DIR / ".automation-state.json"
+    temp_path = ANALYSIS_DIR / ".automation-state.tmp"
+    temp_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(state_path)
+
+
+_AUTOMATION_LOCK = threading.Lock()
+
+
+def _automation_model() -> ModelDict:
+    cfg = _config.get("automation", {})
+    return ModelConfig.get_model(cfg.get("model")) if cfg.get("model") else ModelConfig.get_model()
+
+
+def run_due_automatic_tasks() -> None:
+    """补做截至昨天的自动总结/日报，并在新一周生成上一周周报。"""
+    automation = _config.get("automation", {})
+    if not automation.get("enabled", True):
+        return
+    if not _AUTOMATION_LOCK.acquire(blocking=False):
+        return
+
+    try:
+        model_cfg = _automation_model()
+        state = _load_automation_state()
+        today = datetime.date.today()
+        yesterday = today - datetime.timedelta(days=1)
+
+        last_daily_text = state.get("last_daily_date", "")
+        if last_daily_text:
+            try:
+                current = datetime.datetime.strptime(last_daily_text, "%Y-%m-%d").date() + datetime.timedelta(days=1)
+            except ValueError:
+                current = yesterday
+        else:
+            # 第一次启用时只处理昨天，避免一次性消耗模型处理全部旧日记。
+            current = yesterday
+
+        while current <= yesterday:
+            date_text = current.strftime("%Y-%m-%d")
+            path = DIARY_DIR / f"{date_text}.md"
+            progress = state.setdefault("daily_progress", {}).setdefault(date_text, {})
+            task_ok = True
+
+            if path.exists() and automation.get("daily_summary", True) and not progress.get("summary"):
+                _, ok = summarize_diary(date_text, model_cfg)
+                task_ok = task_ok and ok
+                if ok:
+                    progress["summary"] = True
+                    _save_automation_state(state)
+
+            if path.exists() and automation.get("daily_report", True) and not progress.get("report"):
+                _, ok, _ = generate_analysis_report("daily", current, model_cfg)
+                task_ok = task_ok and ok
+                if ok:
+                    progress["report"] = True
+                    _save_automation_state(state)
+
+            summary_done = not path.exists() or not automation.get("daily_summary", True) or progress.get("summary")
+            report_done = not path.exists() or not automation.get("daily_report", True) or progress.get("report")
+            if task_ok and summary_done and report_done:
+                state["last_daily_date"] = date_text
+                state.get("daily_progress", {}).pop(date_text, None)
+                state.pop("last_error", None)
+                _save_automation_state(state)
+                current += datetime.timedelta(days=1)
+            else:
+                state["last_error"] = f"{datetime.datetime.now():%Y-%m-%d %H:%M} 自动处理 {date_text} 失败"
+                _save_automation_state(state)
+                break
+
+        if automation.get("weekly_report", True):
+            last_week_end = today - datetime.timedelta(days=today.weekday() + 1)
+            state_week = state.get("last_week_end", "")
+            if state_week:
+                try:
+                    current_week_end = datetime.datetime.strptime(state_week, "%Y-%m-%d").date() + datetime.timedelta(days=7)
+                except ValueError:
+                    current_week_end = last_week_end
+            else:
+                # 第一次启用时只处理最近一个完整自然周。
+                current_week_end = last_week_end
+
+            while current_week_end <= last_week_end:
+                current_week_start = current_week_end - datetime.timedelta(days=6)
+                logs = _existing_logs(current_week_start, current_week_end)
+                if logs:
+                    _, ok, _ = generate_analysis_report("weekly", current_week_start, model_cfg)
+                else:
+                    ok = True
+                if ok:
+                    state["last_week_end"] = current_week_end.strftime("%Y-%m-%d")
+                    state.pop("last_error", None)
+                    _save_automation_state(state)
+                    current_week_end += datetime.timedelta(days=7)
+                else:
+                    state["last_error"] = (
+                        f"{datetime.datetime.now():%Y-%m-%d %H:%M} "
+                        f"自动生成截至 {current_week_end:%Y-%m-%d} 的周报失败"
+                    )
+                    _save_automation_state(state)
+                    break
+    except Exception as exc:
+        state = _load_automation_state()
+        state["last_error"] = f"{datetime.datetime.now():%Y-%m-%d %H:%M} 自动任务异常: {exc}"
+        _save_automation_state(state)
+    finally:
+        _AUTOMATION_LOCK.release()
+
+
+def _automation_worker() -> None:
+    while True:
+        run_due_automatic_tasks()
+        now = datetime.datetime.now()
+        next_midnight = datetime.datetime.combine(now.date() + datetime.timedelta(days=1), datetime.time.min)
+        seconds_to_midnight = max(60, (next_midnight - now).total_seconds() + 5)
+        time.sleep(min(3600, seconds_to_midnight))
+
+
+def start_automation_worker() -> None:
+    if _config.get("automation", {}).get("enabled", True):
+        threading.Thread(target=_automation_worker, name="agentrecord-automation", daemon=True).start()
 
 
 def _display_width(text: str) -> int:
@@ -844,10 +1086,11 @@ def show_help():
         "  [cyan]/h[/cyan]        → 显示此帮助\n"
         "  [cyan]/m[/cyan]        → 切换到下一个模型\n"
         "  [cyan]/v [日期][/cyan] → 查看历史日记（空=今天, [cyan]/v help[/cyan] 查看所有用法）\n"
-        "  [cyan]/r[/cyan]        → 重试今日最后一个未回答的提问（保持原类型）\n"
+        "  [cyan]/s [日期][/cyan] → 生成日记顶部总结（空=今天）\n"
+        "  [cyan]/a [类型] [日期][/cyan] → 生成分析报告（类型: daily/weekly，默认 daily）\n"
+        "  [cyan]/r[/cyan]        → 重试今日最后一个未回答的 @AI 提问\n"
         "  [cyan]/c[/cyan]        → 清空当前窗口\n"
         "  [cyan]/d[/cyan]        → 删除今日最后一条记录\n"
-        "  [cyan]/q [问题][/cyan] → 查阅提问（只读，生成轻记录）\n"
         "  [cyan]@[内容][/cyan]   → 呼叫AI解答或执行任务（完整记录）",
         title="[bold]命令手册[/bold]",
         border_style="cyan"
@@ -881,6 +1124,7 @@ def main():
     console.print(f"  可用模型: [dim]{', '.join(m['name'] for m in ModelConfig.models())}[/dim]")
     show_help()
     console.print()
+    start_automation_worker()
 
     while True:
         try:
@@ -941,64 +1185,75 @@ def main():
             ))
             continue
 
+        # --- /s 命令（日记顶部总结） ---
+        if user_input == "/s" or user_input.startswith("/s "):
+            arg = user_input[3:].strip() if user_input.startswith("/s ") else ""
+            date_str = resolve_date(arg)
+            if not date_str:
+                console.print(f"[yellow][!][/yellow] 无法解析日期: {arg}")
+                continue
+            console.print(f"[cyan][*][/cyan] 正在生成 {date_str} 的日记总结...")
+            summary, success = summarize_diary(date_str, current_cfg)
+            if success:
+                console.print(Panel(summary, title=f"[bold]{date_str} 日记总结[/bold]", border_style="green"))
+            else:
+                console.print(f"[red][!][/red] 总结失败: {summary}")
+            continue
+
+        # --- /a 命令（独立分析报告） ---
+        if user_input == "/a" or user_input.startswith("/a "):
+            args = user_input.split()[1:]
+            kind = "daily"
+            date_arg = ""
+            if args:
+                first = args[0].lower()
+                if first in ("daily", "day", "日报"):
+                    kind = "daily"
+                    date_arg = args[1] if len(args) > 1 else ""
+                elif first in ("weekly", "week", "周报"):
+                    kind = "weekly"
+                    date_arg = args[1] if len(args) > 1 else ""
+                else:
+                    date_arg = args[0]
+            date_str = resolve_date(date_arg)
+            if not date_str:
+                console.print(f"[yellow][!][/yellow] 无法解析日期: {date_arg}")
+                continue
+            anchor = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+            label = "日报" if kind == "daily" else "周报"
+            console.print(f"[cyan][*][/cyan] 正在生成分析{label}...")
+            report, success, report_path = generate_analysis_report(kind, anchor, current_cfg)
+            if success:
+                console.print(Panel(report, title=f"[bold]分析{label}[/bold]", border_style="green"))
+                console.print(f"[dim]报告已保存: {report_path}[/dim]")
+            else:
+                console.print(f"[red][!][/red] 报告生成失败: {report}")
+            continue
+
         # --- /r 命令 ---
         if user_input == "/r":
-            last_query, answered, prev_ans, is_review = read_last_at_query()
+            last_query, answered, prev_ans = read_last_at_query()
             if not last_query:
                 console.print("[yellow][!][/yellow] 今日日志中没有 @AI 提问。")
                 continue
             if answered:
                 console.print(f"[cyan][*][/cyan] 最后一个 @AI 提问已被回答：\n\n{prev_ans}\n")
                 continue
-            mode_label = "查阅" if is_review else "提问"
-            console.print(f"[cyan][*][/cyan] 重试{mode_label}: {last_query[:80]}{'...' if len(last_query) > 80 else ''}")
+            console.print(f"[cyan][*][/cyan] 重试提问: {last_query[:80]}{'...' if len(last_query) > 80 else ''}")
             console.print("[cyan][*][/cyan] AI 思考/检索中...")
             init_file_if_not_exists()
             today_log = get_today_file().read_text(encoding="utf-8")
             retry_prompt = f"【今日记录（{datetime.datetime.now().strftime('%Y-%m-%d')}）】\n{today_log}\n\n【用户提问】\n{last_query}"
-            ans, success, web_n, tool_dict, sr_cnt = call_ai(retry_prompt, current_cfg, read_only=is_review)
+            ans, success, web_n, tool_dict, sr_cnt = call_ai(retry_prompt, current_cfg, read_only=False)
 
             if success:
                 console.print(Panel(f"{ans}", title="[bold]AI 输出[/bold]", border_style="green"))
                 stats = format_stats(web_n, tool_dict, sr_cnt)
                 if stats:
                     console.print(f"[dim]{stats}[/dim]")
-                if is_review:
-                    console.print("[cyan][*][/cyan] 查阅模式，正在生成轻记录...")
-                    review_summary = generate_review_summary(ans, current_cfg)
-                    append_log(review_summary, f"[AI查阅] {_model_tag(current_cfg)}")
-                else:
-                    append_log(ans, f"[AI回复] {_model_tag(current_cfg)}")
+                append_log(ans, f"[AI回复] {_model_tag(current_cfg)}")
             else:
                 console.print(f"[red][!][/red] 重试失败: {ans}")
-            continue
-
-        # --- /q 命令（查阅） ---
-        if user_input == "/q" or user_input.startswith("/q "):
-            query = user_input[3:].strip() if user_input.startswith("/q ") else ""
-            if not query:
-                console.print("[yellow][!][/yellow] 请输入查阅内容。用法: /q <问题>")
-                continue
-
-            console.print("[cyan][*][/cyan] AI 查阅/检索中...")
-            append_log(query, "@AI查阅")
-
-            init_file_if_not_exists()
-            today_log = get_today_file().read_text(encoding="utf-8")
-            prompt = f"【今日记录（{datetime.datetime.now().strftime('%Y-%m-%d')}）】\n{today_log}\n\n【用户提问】\n{query}"
-
-            ans, success, web_n, tool_dict, sr_cnt = call_ai(prompt, current_cfg, read_only=True)
-
-            if success:
-                console.print(Panel(f"{ans}", title="[bold]AI 输出[/bold]", border_style="green"))
-                stats = format_stats(web_n, tool_dict, sr_cnt)
-                if stats:
-                    console.print(f"[dim]{stats}[/dim]")
-                console.print("[cyan][*][/cyan] 查阅模式，正在生成轻记录...")
-                review_summary = generate_review_summary(ans, current_cfg)
-                append_log(review_summary, f"[AI查阅] {_model_tag(current_cfg)}")
-            else:
-                console.print(f"[red][!][/red] 请求失败: {ans}")
             continue
 
         # --- @AI 提问 ---
