@@ -2,7 +2,7 @@
 # 模型列表
 #   name:     显示名称（人看的）
 #   model_id: 请求时的具体模型标识（不填则使用 name）
-#   search:   是否有搜索能力（有则在 UI 和日志中标注 SRCH）
+#   search:   是否有搜索能力（有则在 UI 中标注 SRCH）
 models:
   - name: deepseek-v4-pro
     model_id: deepseek-v4-pro
@@ -26,11 +26,12 @@ diary_dir: "./Records"
 analysis_dir: "./AnalysisReports"
 
 # 自动任务
-# 程序启动后会在后台检查一次，此后跨过零点时处理前一天；
-# 若程序中断数日，下次启动会从上次成功日期继续补做。
+# 程序启动后立即检查，此后每小时检查，并在跨过本地零点后约 5 秒检查；
+# 自动总结上一自然日，生成上一完整自然周和上一完整自然月的报告。
+# 首次启用只处理最近一个已闭合周期；此后从各任务上次成功位置补做。
 automation:
   enabled: true
   model: deepseek-v4-pro     # 留空则使用模型列表中的第一个模型
   daily_summary: true       # 自动写入前一日日记顶部 <summary>
-  daily_report: true        # 自动生成前一日分析日报
   weekly_report: true       # 每周生成上一完整自然周的分析周报
+  monthly_report: true      # 每月生成上一完整自然月的分析月报

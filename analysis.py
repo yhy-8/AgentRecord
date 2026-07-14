@@ -1,7 +1,7 @@
 """日记总结、分析报告和后台调度。
 
 这是未来各类分析 Agent 的接入层。当前先集中承载有实际用途的总结、日报、
-周报及编排逻辑；当 Extractor、Explorer、Cluster、World、Reviewer 等 Agent
+周报、月报及编排逻辑；当 Extractor、Explorer、Cluster、World、Reviewer 等 Agent
 拥有独立状态和足够实现后，再从本模块拆成 agents 包，避免空壳文件。
 """
 
@@ -73,6 +73,36 @@ def _existing_logs(start: datetime.date, end: datetime.date) -> list[tuple[str, 
     return logs
 
 
+def _referenced_source_context(logs: list[tuple[str, str]]) -> str:
+    """读取本周期标准引用指向的 Markdown；拒绝日记和报告目录以外的路径。"""
+    reference_pattern = re.compile(
+        r"^\*\*\d{2}:\d{2} \[引用\]:\*\* \[[^\]]+\]\(<([^>]+)>\)",
+        re.MULTILINE,
+    )
+    allowed_roots = (settings.DIARY_DIR.resolve(), settings.ANALYSIS_DIR.resolve())
+    seen = set()
+    sections = []
+
+    for _, content in logs:
+        for relative_path in reference_pattern.findall(content):
+            source_path = (settings.DIARY_DIR / relative_path).resolve()
+            if source_path in seen or source_path.suffix.lower() != ".md":
+                continue
+            if not any(source_path.is_relative_to(root) for root in allowed_roots):
+                continue
+            if not source_path.is_file():
+                continue
+            try:
+                source_content = source_path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            seen.add(source_path)
+            sections.append(f"### {source_path.name}\n{source_content[:12000]}")
+            if len(sections) == 10:
+                return "\n\n".join(sections)
+    return "\n\n".join(sections) or "（本周期没有可读取的显式引用来源）"
+
+
 def _recent_summary_context(before: datetime.date, days: int = 30) -> str:
     start = before - datetime.timedelta(days=days)
     sections = []
@@ -89,11 +119,38 @@ def _recent_summary_context(before: datetime.date, days: int = 30) -> str:
 def _analysis_report_path(kind: str, start: datetime.date, end: datetime.date) -> Path:
     if kind == "daily":
         return settings.ANALYSIS_DIR / "Daily" / f"{start:%Y-%m-%d}.md"
-    return (
-        settings.ANALYSIS_DIR
-        / "Weekly"
-        / f"{start:%Y-%m-%d}_to_{end:%Y-%m-%d}.md"
-    )
+    if kind == "weekly":
+        return (
+            settings.ANALYSIS_DIR
+            / "Weekly"
+            / f"{start:%Y-%m-%d}_to_{end:%Y-%m-%d}.md"
+        )
+    return settings.ANALYSIS_DIR / "Monthly" / f"{start:%Y-%m}.md"
+
+
+def _monthly_supporting_reports(start: datetime.date, end: datetime.date) -> str:
+    """为月报读取与该月相交的周报，作为已完成分析而非用户原始观点。"""
+    sections = []
+    weekly_dir = settings.ANALYSIS_DIR / "Weekly"
+    for path in sorted(weekly_dir.glob("*.md")):
+        match = re.fullmatch(
+            r"(\d{4}-\d{2}-\d{2})_to_(\d{4}-\d{2}-\d{2})", path.stem
+        )
+        if not match:
+            continue
+        try:
+            report_start = datetime.date.fromisoformat(match.group(1))
+            report_end = datetime.date.fromisoformat(match.group(2))
+        except ValueError:
+            continue
+        if report_end < start or report_start > end:
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        sections.append(f"### {path.name}\n{content[:12000]}")
+    return "\n\n".join(sections) or "（没有可用的同期周报）"
 
 
 def generate_analysis_report(
@@ -101,7 +158,7 @@ def generate_analysis_report(
     anchor: datetime.date,
     model_config: settings.ModelDict,
 ) -> tuple[str, bool, Path | None]:
-    """生成日分析报告或周分析报告，并保存到独立目录。"""
+    """生成日、周或月分析报告，并保存到独立目录。"""
     if kind == "daily":
         start = end = anchor
         report_name = f"{anchor:%Y-%m-%d} 分析日报"
@@ -109,6 +166,11 @@ def generate_analysis_report(
         start = anchor - datetime.timedelta(days=anchor.weekday())
         end = start + datetime.timedelta(days=6)
         report_name = f"{start:%Y-%m-%d} 至 {end:%Y-%m-%d} 分析周报"
+    elif kind == "monthly":
+        start = anchor.replace(day=1)
+        next_month = (start.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+        end = next_month - datetime.timedelta(days=1)
+        report_name = f"{start:%Y年%m月} 分析月报"
     else:
         return f"未知报告类型: {kind}", False, None
 
@@ -119,11 +181,23 @@ def generate_analysis_report(
     period_logs = "\n\n---\n\n".join(
         f"# {date}\n{content}" for date, content in logs
     )
+    referenced_sources = _referenced_source_context(logs)
     history = _recent_summary_context(start)
+    period_focus = {
+        "daily": "关注当天新出现的内容和变化，不必强行上升为长期结论。",
+        "weekly": "关注一周内主题的聚合、推进、反复、转变及仍未解决的问题。",
+        "monthly": "从更高层观察注意力分配、长期主题演化、判断得到的支持或挑战、反复模式，以及下个月最值得继续探索的少量方向。",
+    }[kind]
+    supporting_reports = (
+        _monthly_supporting_reports(start, end)
+        if kind == "monthly"
+        else "（本报告不使用下级周期报告）"
+    )
     prompt = f"""[程序分析报告任务]
 请基于给定原始日记和历史总结生成《{report_name}》。只输出报告 Markdown 正文，不要输出代码围栏或完成提示。
 
 这不是日记内容摘要，而是个人思维智库的分析报告。请根据实际材料选择有价值的部分：
+- 本报告的周期侧重点：{period_focus}
 - 本周期重要的新想法、变化和注意力中心。
 - 与历史思想之间少量但有依据的强关联。
 - 重复出现的问题、观点演化、潜在矛盾和盲点。
@@ -133,11 +207,18 @@ def generate_analysis_report(
 要求：
 - 明确区分用户表达、AI 回复、外部事实和你的推断。
 - 关联历史思想时标注对应日期；弱关联不要写成确定结论。
+- `[引用]` 后的文字是用户由该来源展开的新记录；引用来源正文只是上下文，不能当作用户已经认同其中全部内容。
 - 不把每条记录都转成任务，不逐条复述，不编造。
 - 输出一份可以脱离对话独立阅读的最终报告。
 
 【本周期原始日记】
 {period_logs}
+
+【本周期显式引用的来源】
+{referenced_sources}
+
+【同期下级分析报告】
+{supporting_reports}
 
 【本周期之前 30 天的日记总结】
 {history}"""
@@ -191,8 +272,21 @@ def _automation_model() -> settings.ModelDict:
     )
 
 
+def _set_task_error(state: dict, task: str, message: str) -> None:
+    state.setdefault("errors", {})[task] = (
+        f"{datetime.datetime.now():%Y-%m-%d %H:%M} {message}"
+    )
+
+
+def _clear_task_error(state: dict, task: str) -> None:
+    errors = state.get("errors", {})
+    errors.pop(task, None)
+    if not errors:
+        state.pop("errors", None)
+
+
 def run_due_automatic_tasks() -> None:
-    """补做截至昨天的自动总结/日报，并生成已结束自然周的周报。"""
+    """补做日总结，并生成已经闭合的自然周周报和自然月月报。"""
     automation = settings.CONFIG.get("automation", {})
     if not automation.get("enabled", True):
         return
@@ -202,6 +296,7 @@ def run_due_automatic_tasks() -> None:
     try:
         model_config = _automation_model()
         state = _load_automation_state()
+        state.pop("last_error", None)
         today = datetime.date.today()
         yesterday = today - datetime.timedelta(days=1)
 
@@ -220,62 +315,30 @@ def run_due_automatic_tasks() -> None:
         while current <= yesterday:
             date_text = current.strftime("%Y-%m-%d")
             path = settings.DIARY_DIR / f"{date_text}.md"
-            progress = state.setdefault("daily_progress", {}).setdefault(date_text, {})
-            task_ok = True
-
-            if (
-                path.exists()
-                and automation.get("daily_summary", True)
-                and not progress.get("summary")
-            ):
+            if path.exists() and automation.get("daily_summary", True):
                 _, success = summarize_diary(date_text, model_config)
-                task_ok = task_ok and success
-                if success:
-                    progress["summary"] = True
-                    _save_automation_state(state)
-
-            if (
-                path.exists()
-                and automation.get("daily_report", True)
-                and not progress.get("report")
-            ):
-                _, success, _ = generate_analysis_report("daily", current, model_config)
-                task_ok = task_ok and success
-                if success:
-                    progress["report"] = True
-                    _save_automation_state(state)
-
-            summary_done = (
-                not path.exists()
-                or not automation.get("daily_summary", True)
-                or progress.get("summary")
-            )
-            report_done = (
-                not path.exists()
-                or not automation.get("daily_report", True)
-                or progress.get("report")
-            )
-            if task_ok and summary_done and report_done:
+            else:
+                success = True
+            if success:
                 state["last_daily_date"] = date_text
                 state.get("daily_progress", {}).pop(date_text, None)
-                state.pop("last_error", None)
+                if not state.get("daily_progress"):
+                    state.pop("daily_progress", None)
+                _clear_task_error(state, "daily_summary")
                 _save_automation_state(state)
                 current += datetime.timedelta(days=1)
             else:
-                state["last_error"] = (
-                    f"{datetime.datetime.now():%Y-%m-%d %H:%M} "
-                    f"自动处理 {date_text} 失败"
-                )
+                _set_task_error(state, "daily_summary", f"自动总结 {date_text} 失败")
                 _save_automation_state(state)
                 break
 
         if automation.get("weekly_report", True):
             _run_weekly_reports(today, state, model_config)
+        if automation.get("monthly_report", True):
+            _run_monthly_reports(today, state, model_config)
     except Exception as error:
         state = _load_automation_state()
-        state["last_error"] = (
-            f"{datetime.datetime.now():%Y-%m-%d %H:%M} 自动任务异常: {error}"
-        )
+        _set_task_error(state, "scheduler", f"自动任务异常: {error}")
         _save_automation_state(state)
     finally:
         _AUTOMATION_LOCK.release()
@@ -310,13 +373,59 @@ def _run_weekly_reports(
             success = True
         if success:
             state["last_week_end"] = current_week_end.strftime("%Y-%m-%d")
-            state.pop("last_error", None)
+            _clear_task_error(state, "weekly_report")
             _save_automation_state(state)
             current_week_end += datetime.timedelta(days=7)
         else:
-            state["last_error"] = (
-                f"{datetime.datetime.now():%Y-%m-%d %H:%M} "
-                f"自动生成截至 {current_week_end:%Y-%m-%d} 的周报失败"
+            _set_task_error(
+                state,
+                "weekly_report",
+                f"自动生成截至 {current_week_end:%Y-%m-%d} 的周报失败",
+            )
+            _save_automation_state(state)
+            break
+
+
+def _run_monthly_reports(
+    today: datetime.date,
+    state: dict,
+    model_config: settings.ModelDict,
+) -> None:
+    this_month_start = today.replace(day=1)
+    last_month_end = this_month_start - datetime.timedelta(days=1)
+    state_month = state.get("last_month_end", "")
+    if state_month:
+        try:
+            current_month_start = (
+                datetime.date.fromisoformat(state_month) + datetime.timedelta(days=1)
+            ).replace(day=1)
+        except ValueError:
+            current_month_start = last_month_end.replace(day=1)
+    else:
+        current_month_start = last_month_end.replace(day=1)
+
+    while current_month_start <= last_month_end:
+        next_month = (
+            current_month_start.replace(day=28) + datetime.timedelta(days=4)
+        ).replace(day=1)
+        current_month_end = next_month - datetime.timedelta(days=1)
+        logs = _existing_logs(current_month_start, current_month_end)
+        if logs:
+            _, success, _ = generate_analysis_report(
+                "monthly", current_month_start, model_config
+            )
+        else:
+            success = True
+        if success:
+            state["last_month_end"] = current_month_end.strftime("%Y-%m-%d")
+            _clear_task_error(state, "monthly_report")
+            _save_automation_state(state)
+            current_month_start = next_month
+        else:
+            _set_task_error(
+                state,
+                "monthly_report",
+                f"自动生成 {current_month_start:%Y-%m} 月报失败",
             )
             _save_automation_state(state)
             break
@@ -326,11 +435,15 @@ def _automation_worker() -> None:
     while True:
         run_due_automatic_tasks()
         now = datetime.datetime.now()
-        next_midnight = datetime.datetime.combine(
-            now.date() + datetime.timedelta(days=1), datetime.time.min
-        )
-        seconds_to_midnight = max(60, (next_midnight - now).total_seconds() + 5)
-        time.sleep(min(3600, seconds_to_midnight))
+        time.sleep(_next_automation_check_delay(now))
+
+
+def _next_automation_check_delay(now: datetime.datetime) -> float:
+    next_midnight = datetime.datetime.combine(
+        now.date() + datetime.timedelta(days=1), datetime.time.min
+    )
+    seconds_to_midnight = (next_midnight - now).total_seconds() + 5
+    return min(3600, max(1, seconds_to_midnight))
 
 
 def start_automation_worker() -> None:

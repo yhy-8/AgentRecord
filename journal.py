@@ -5,7 +5,9 @@
 """
 
 import datetime
+import os
 import re
+from pathlib import Path
 
 import settings
 
@@ -109,56 +111,91 @@ def search_history(keyword: str, days_limit: int = 0, summary_only: bool = False
     )
 
 
-def get_today_file():
-    return settings.DIARY_DIR / f"{datetime.datetime.now():%Y-%m-%d}.md"
+def _diary_file_for(submitted_at: datetime.datetime) -> Path:
+    return settings.DIARY_DIR / f"{submitted_at:%Y-%m-%d}.md"
 
 
-def init_file_if_not_exists() -> None:
-    file_path = get_today_file()
+def get_today_file() -> Path:
+    return _diary_file_for(datetime.datetime.now())
+
+
+def init_file_if_not_exists(
+    submitted_at: datetime.datetime | None = None,
+) -> Path:
+    """使用同一个提交时间确定文件路径和文件头，并返回该路径。"""
+    submitted_at = submitted_at or datetime.datetime.now()
+    file_path = _diary_file_for(submitted_at)
     if file_path.exists():
-        return
+        return file_path
     template = (
-        f"# {datetime.datetime.now():%Y-%m-%d}\n\n"
+        f"# {submitted_at:%Y-%m-%d}\n\n"
         "<summary>\n暂无今日总结。\n</summary>\n\n"
         "---\n"
         "## 原始记录流\n\n"
     )
     file_path.write_text(template, encoding="utf-8")
+    return file_path
 
 
-def append_log(content: str, tag: str = "") -> None:
-    init_file_if_not_exists()
-    now = datetime.datetime.now().strftime("%H:%M")
-    with get_today_file().open("a", encoding="utf-8") as file:
+def append_log(
+    content: str,
+    tag: str = "",
+    submitted_at: datetime.datetime | None = None,
+) -> None:
+    """按回车提交时间追加记录；一次写入只使用一个时间值。"""
+    submitted_at = submitted_at or datetime.datetime.now()
+    file_path = init_file_if_not_exists(submitted_at)
+    submitted_time = submitted_at.strftime("%H:%M")
+    with file_path.open("a", encoding="utf-8") as file:
         if tag:
-            file.write(f"**{now} {tag}:** {content}\n\n")
+            file.write(f"**{submitted_time} {tag}:** {content}\n\n")
         else:
-            file.write(f"**{now}:** {content}\n\n")
+            file.write(f"**{submitted_time}:** {content}\n\n")
 
 
-def read_last_at_query() -> tuple[str, bool, str]:
-    """读取今日最后一个 @AI 提问及其回答状态。"""
-    file_path = get_today_file()
-    if not file_path.exists():
-        return "", False, ""
-    content = file_path.read_text(encoding="utf-8")
-    query_pattern = re.compile(
-        r"\*\*(\d{2}:\d{2}) @AI:\*\* (.+?)(?=\n\*\*|\Z)", re.DOTALL
-    )
-    matches = list(query_pattern.finditer(content))
-    if not matches:
-        return "", False, ""
+REFERENCE_KINDS = {
+    "diary": ("日记", lambda: settings.DIARY_DIR),
+    "daily": ("分析日报", lambda: settings.ANALYSIS_DIR / "Daily"),
+    "weekly": ("分析周报", lambda: settings.ANALYSIS_DIR / "Weekly"),
+    "monthly": ("分析月报", lambda: settings.ANALYSIS_DIR / "Monthly"),
+}
 
-    last_match = matches[-1]
-    query_text = last_match.group(2).strip()
-    after_query = content[last_match.end():]
-    reply_pattern = re.compile(
-        r"\*\*\d{2}:\d{2} \[AI回复] .+?:\*\* (.+?)(?=\n\*\*|\Z)", re.DOTALL
-    )
-    reply = reply_pattern.search(after_query)
-    if reply:
-        return query_text, True, reply.group(1).strip()
-    return query_text, False, ""
+
+def list_reference_sources(
+    kind: str, keyword: str = "", limit: int = 20
+) -> list[tuple[str, Path]]:
+    """列出可引用的日记或报告，按文件名倒序返回。"""
+    if kind not in REFERENCE_KINDS:
+        return []
+    type_label, directory_factory = REFERENCE_KINDS[kind]
+    files = sorted(directory_factory().glob("*.md"), reverse=True)
+    if keyword:
+        files = [path for path in files if keyword in path.stem]
+    if limit > 0:
+        files = files[:limit]
+
+    sources = []
+    for path in files:
+        period = path.stem.replace("_to_", " 至 ")
+        sources.append((f"{type_label} | {period}", path))
+    return sources
+
+
+def append_reference(
+    label: str,
+    source_path: Path,
+    note: str = "",
+    submitted_at: datetime.datetime | None = None,
+) -> None:
+    """把来源及可选的新想法作为一条带时间的标准引用记录追加到今日日记。"""
+    submitted_at = submitted_at or datetime.datetime.now()
+    diary_path = _diary_file_for(submitted_at)
+    relative_path = os.path.relpath(source_path, diary_path.parent)
+    portable_path = Path(relative_path).as_posix()
+    content = f"[{label}](<{portable_path}>)"
+    if note.strip():
+        content += f"\n\n{note.strip()}"
+    append_log(content, "[引用]", submitted_at=submitted_at)
 
 
 def update_summary_for_date(date: str, summary_text: str) -> str:
