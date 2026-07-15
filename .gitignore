@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+# Local user data and derived analysis state.
+Records/
+AnalysisReports/
+AGENTS.md
+CLAUDE.md
