@@ -33,10 +33,12 @@ log_dir: "./Log"
 
 # 自动任务
 # 安装系统后台任务后，登录或重启时立即检查，此后每小时第 5 分钟检查；
-# 自动总结上一自然日，生成上一完整自然周和上一完整自然月的报告。
+# 自动总结上一自然日，每天生成信息简报，并生成上一完整自然周和自然月报告。
 # 首次启用只处理最近一个已闭合周期；此后从各任务上次成功位置补做。
 automation:
   enabled: true
   daily_summary: true       # 自动写入前一日日记顶部 <summary>
+  daily_information: true   # 每日联网收集综合新闻和本周记录的定向信息
+  daily_information_time: "08:05"  # 该时间后的首次每小时检查中运行
   weekly_report: true       # 每周生成上一完整自然周的分析周报
   monthly_report: true      # 每月生成上一完整自然月的分析月报

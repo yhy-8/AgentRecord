@@ -192,6 +192,7 @@ def _handle_status() -> None:
         f"  安装详情：{status['install_message']}",
         f"  最后完成检查：{status['last_check_completed_at'] or '尚未记录'}",
         f"  日总结进度：{status['last_daily_date'] or '尚无'}",
+        f"  信息简报进度：{status['last_information_date'] or '尚无'}",
         f"  周报进度：{status['last_week_end'] or '尚无'}",
         f"  月报进度：{status['last_month_end'] or '尚无'}",
     ]

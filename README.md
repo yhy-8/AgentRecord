@@ -120,13 +120,17 @@ log_dir: ./Log
 automation:
   enabled: true
   daily_summary: true
+  daily_information: true
+  daily_information_time: "08:05"
   weekly_report: true
   monthly_report: true
 ```
 
 - `current_model` 是手动总结、手动报告和自动任务统一使用的模型；报告模式执行 `/m` 会永久更新该配置。
 - `diary_dir`、`analysis_dir` 和 `log_dir` 的相对路径以 `config.yaml` 所在目录为基准。
-- 可以分别关闭三种自动任务，或用 `automation.enabled: false` 关闭整个自动流程。
+- `daily_information` 每天生成“高价值综合新闻 + 本周记录定向研究”简报；`daily_information_time` 表示当地时间阈值。
+- 信息简报保存在 `AnalysisReports/Information/YYYY-MM-DD.md`，并作为后续周报、月报的待查证线索；没有可用联网能力时任务会失败，不会生成伪联网简报。
+- 可以分别关闭各项自动任务，或用 `automation.enabled: false` 关闭整个自动流程。
 - 第三方搜索仅在所选模型没有原生搜索能力时使用。
 - 不要把真实 API 密钥提交到版本库或写入测试输出。
 
@@ -134,7 +138,7 @@ automation:
 
 后台任务只需安装一次。安装后，无论 AgentRecord 终端是否打开，操作系统都会在登录或重启后以及每小时自动检查到期任务。
 
-正常进入交互界面时，程序会显示系统后台任务是否已经完整安装；若存在未恢复失败，还会给出一行提示。任意模式执行 `/status` 可查看最后检查时间、日/周/月成功位置和失败重试状态。该提示只检查状态；未安装时仍需执行下面的安装命令。安装完成后可以关闭 AgentRecord 窗口，自动任务不依赖交互进程存活。
+正常进入交互界面时，程序会显示系统后台任务是否已经完整安装；若存在未恢复失败，还会给出一行提示。任意模式执行 `/status` 可查看最后检查时间、日总结/信息简报/周报/月报成功位置和失败重试状态。该提示只检查状态；未安装时仍需执行下面的安装命令。安装完成后可以关闭 AgentRecord 窗口，自动任务不依赖交互进程存活。
 
 Linux 或其他类 Unix 环境：
 
@@ -188,6 +192,7 @@ AgentRecord/
     app.py                     交互主循环
   analysis/
     context.py                 周期输入、引用和历史上下文
+    information.py             每日联网信息简报
     orchestrator.py            总结与多 Agent 报告中控
     store.py                   SQLite 版本化节点和关系
     automation.py              自动任务、锁和系统任务安装
@@ -199,6 +204,7 @@ Records/
   YYYY-MM-DD.md
 AnalysisReports/
   .analysis.sqlite3
+  Information/YYYY-MM-DD.md
   Daily/YYYY-MM-DD_manual.md
   Weekly/YYYY-MM-DD_to_YYYY-MM-DD_manual.md
   Weekly/YYYY-MM-DD_to_YYYY-MM-DD_auto.md

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .. import settings
 from .context import _existing_logs
+from .information import generate_information_briefing
 from .orchestrator import generate_analysis_report, summarize_diary
 
 
@@ -71,7 +72,7 @@ def _acquire_automation_lock() -> Path | None:
 
 
 def run_due_automatic_tasks() -> None:
-    """补做日总结，并生成已经闭合的自然周周报和自然月月报。"""
+    """执行到期的日总结、每日信息简报和闭合周期报告。"""
     automation = settings.CONFIG.get("automation", {})
     if not automation.get("enabled", True):
         return
@@ -86,7 +87,8 @@ def run_due_automatic_tasks() -> None:
     try:
         model_config = _automation_model()
         state.pop("last_error", None)
-        today = datetime.date.today()
+        now = datetime.datetime.now()
+        today = now.date()
         yesterday = today - datetime.timedelta(days=1)
 
         last_daily_text = state.get("last_daily_date", "")
@@ -121,6 +123,8 @@ def run_due_automatic_tasks() -> None:
                 _save_automation_state(state)
                 break
 
+        if automation.get("daily_information", True):
+            _run_daily_information(now, state, model_config)
         if automation.get("weekly_report", True):
             _run_weekly_reports(today, state, model_config)
         if automation.get("monthly_report", True):
@@ -139,6 +143,57 @@ def run_due_automatic_tasks() -> None:
             lock_path.unlink()
         except FileNotFoundError:
             pass
+
+
+def _run_daily_information(
+    now: datetime.datetime,
+    state: dict,
+    model_config: settings.ModelDict,
+) -> None:
+    time_text = str(
+        settings.CONFIG.get("automation", {}).get("daily_information_time", "08:05")
+    )
+    try:
+        scheduled_time = datetime.time.fromisoformat(time_text)
+    except ValueError:
+        scheduled_time = datetime.time(8, 5)
+    last_date_text = state.get("last_information_date", "")
+    if last_date_text:
+        try:
+            current = datetime.date.fromisoformat(last_date_text) + datetime.timedelta(
+                days=1
+            )
+        except ValueError:
+            current = now.date()
+    else:
+        current = now.date()
+    last_due_date = (
+        now.date()
+        if now.time() >= scheduled_time
+        else now.date() - datetime.timedelta(days=1)
+    )
+    while current <= last_due_date:
+        date_text = current.isoformat()
+        try:
+            _, success, _ = generate_information_briefing(current, model_config)
+        except Exception as error:
+            _set_task_error(
+                state,
+                "daily_information",
+                f"自动收集 {date_text} 信息异常: {error}",
+            )
+            _save_automation_state(state)
+            break
+        if not success:
+            _set_task_error(
+                state, "daily_information", f"自动收集 {date_text} 信息失败"
+            )
+            _save_automation_state(state)
+            break
+        state["last_information_date"] = date_text
+        _clear_task_error(state, "daily_information")
+        _save_automation_state(state)
+        current += datetime.timedelta(days=1)
 
 
 def _run_weekly_reports(
@@ -264,13 +319,13 @@ def system_automation_status() -> tuple[bool, str]:
                 return True, "系统自动任务已安装；关闭本窗口后仍会每小时检查。"
             if installed_count:
                 return False, "系统自动任务安装不完整，请重新执行安装命令。"
-            return False, "系统自动任务未安装；自动总结和周期报告不会运行。"
+            return False, "系统自动任务未安装；自动总结、信息简报和周期报告不会运行。"
 
         current = subprocess.run(
             ["crontab", "-l"], capture_output=True, text=True, timeout=30
         )
         if current.returncode == 1:
-            return False, "系统自动任务未安装；自动总结和周期报告不会运行。"
+            return False, "系统自动任务未安装；自动总结、信息简报和周期报告不会运行。"
         if current.returncode != 0:
             message = current.stderr.strip() or "无法读取当前 crontab。"
             return False, f"无法确认系统自动任务状态：{message}"
@@ -302,6 +357,7 @@ def automation_status_snapshot() -> dict:
         "last_check_started_at": state.get("last_check_started_at", ""),
         "last_check_completed_at": state.get("last_check_completed_at", ""),
         "last_daily_date": state.get("last_daily_date", ""),
+        "last_information_date": state.get("last_information_date", ""),
         "last_week_end": state.get("last_week_end", ""),
         "last_month_end": state.get("last_month_end", ""),
         "errors": dict(state.get("errors", {})),

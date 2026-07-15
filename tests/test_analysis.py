@@ -185,6 +185,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
         settings.CONFIG["automation"] = {
             "enabled": True,
             "daily_summary": True,
+            "daily_information": False,
             "weekly_report": False,
             "monthly_report": False,
         }
@@ -505,6 +506,25 @@ class AnalysisWorkflowTests(unittest.TestCase):
         self.assertTrue(any("同期周报分析" in prompt for prompt in self.ai_calls))
         self.assertEqual(original, diary.read_bytes())
 
+    def test_weekly_report_uses_daily_information_as_research_leads(self):
+        day = datetime.date(2026, 7, 14)
+        self.write_diary(day.isoformat())
+        information_dir = settings.ANALYSIS_DIR / "Information"
+        information_dir.mkdir(parents=True)
+        (information_dir / f"{day:%Y-%m-%d}.md").write_text(
+            "一条需要 World 重新查证的外部线索",
+            encoding="utf-8",
+        )
+
+        _, success, _ = orchestrator.generate_analysis_report(
+            "weekly", day, {"name": "mock"}
+        )
+
+        self.assertTrue(success)
+        self.assertTrue(
+            any("一条需要 World 重新查证的外部线索" in prompt for prompt in self.ai_calls)
+        )
+
     def test_report_receives_explicitly_referenced_report_content(self):
         day = datetime.date(2026, 7, 14)
         diary, _ = self.write_diary(day.isoformat())
@@ -561,6 +581,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
         settings.CONFIG["automation"] = {
             "enabled": True,
             "daily_summary": False,
+            "daily_information": False,
             "weekly_report": True,
             "monthly_report": False,
         }
@@ -577,6 +598,35 @@ class AnalysisWorkflowTests(unittest.TestCase):
         )
         self.assertTrue(report_path.exists())
         self.assertEqual(week_end.isoformat(), state["last_week_end"])
+
+    def test_daily_information_runs_after_configured_time_and_retries(self):
+        settings.CONFIG["automation"] = {
+            "enabled": True,
+            "daily_information": True,
+            "daily_information_time": "08:05",
+        }
+        state = {}
+        model = {"name": "mock"}
+        failure = ("失败", False, None)
+        success = ("完成", True, settings.ANALYSIS_DIR / "Information/test.md")
+        with patch.object(
+            automation,
+            "generate_information_briefing",
+            side_effect=[failure, success],
+        ) as generate:
+            automation._run_daily_information(
+                datetime.datetime(2026, 7, 15, 8, 4), state, model
+            )
+            automation._run_daily_information(
+                datetime.datetime(2026, 7, 15, 8, 5), state, model
+            )
+            automation._run_daily_information(
+                datetime.datetime(2026, 7, 15, 9, 5), state, model
+            )
+
+        self.assertEqual(2, generate.call_count)
+        self.assertEqual("2026-07-15", state["last_information_date"])
+        self.assertNotIn("daily_information", state.get("errors", {}))
 
     def test_monthly_task_generates_last_complete_calendar_month_once(self):
         today = datetime.date(2026, 8, 15)

@@ -23,6 +23,7 @@ from ..ai_client import call_ai
 from .context import (
     _analysis_report_path,
     _existing_logs,
+    _information_briefings,
     _log_without_summary,
     _monthly_supporting_reports,
     _period_records,
@@ -302,6 +303,11 @@ def generate_analysis_report(
         if kind == "monthly"
         else "（本报告不使用下级周期报告）"
     )
+    information_briefings = (
+        _information_briefings(start, end)
+        if kind in ("weekly", "monthly")
+        else "（分析日报不使用每日信息简报）"
+    )
     report_path = _analysis_report_path(kind, start, end, origin)
     store: AnalysisStore | None = None
     run_id: str | None = None
@@ -312,6 +318,7 @@ def generate_analysis_report(
             "referenced_sources": referenced_sources,
             "history": history,
             "supporting_reports": supporting_reports,
+            "information_briefings": information_briefings,
         }
         input_hash = hashlib.sha256(
             json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -415,6 +422,7 @@ def generate_analysis_report(
             explorer.SPEC,
             "提取并探索少量高价值观点、思维模型、方法论和点子。"
             "存在可被外部知识实质验证或延伸的内容时，通常选择一至三个方向提出研究问题。"
+            "每日信息简报只是外部线索；使用其中信息前必须创建研究问题交给 World 重新查证。"
             "显式引用和下级报告只是分析材料，不能视为用户已经认可的观点。",
             {
                 "period_focus": period_focus,
@@ -422,6 +430,7 @@ def generate_analysis_report(
                 "referenced_sources": referenced_sources[:30000],
                 "supporting_reports": supporting_reports[:30000],
                 "recent_summaries": history[:30000],
+                "information_briefings": information_briefings,
             },
             model_config,
             store,

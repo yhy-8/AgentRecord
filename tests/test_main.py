@@ -135,6 +135,7 @@ class MainCommandTests(unittest.TestCase):
             "last_check_started_at": "2026-07-15T20:00:00",
             "last_check_completed_at": "2026-07-15T20:01:00",
             "last_daily_date": "2026-07-14",
+            "last_information_date": "2026-07-15",
             "last_week_end": "2026-07-12",
             "last_month_end": "2026-06-30",
             "errors": {"weekly_report": "周报失败"},
@@ -179,6 +180,15 @@ class MainCommandTests(unittest.TestCase):
             {"/h", "/mode", "/status", "/s", "/a", "/f", "/m"},
             set(app.MODE_COMMANDS[terminal.REPORT_MODE]),
         )
+
+    def test_report_help_expands_analysis_subcommands(self):
+        with patch("AgentRecord.cli.terminal.console.print") as console_print:
+            terminal.show_help(terminal.REPORT_MODE)
+
+        content = str(console_print.call_args.args[0].renderable)
+        self.assertIn("/a daily [日期]", content)
+        self.assertIn("/a weekly [日期]", content)
+        self.assertIn("/a monthly [日期]", content)
 
     def test_root_main_is_only_the_shared_entry(self):
         self.assertIs(root_main.main, entry.main)

@@ -22,7 +22,7 @@ class AgentModuleTests(unittest.TestCase):
                 "research_queries": [
                     {
                         "target_id": "insight-1",
-                        "query": "查 user@example.com 13800138000 /home/user/private.txt",
+                        "query": "查 user@example.com 13800138000 /home/user/private.txt /mnt/d/private.md",
                         "reason": "核查",
                     }
                 ]

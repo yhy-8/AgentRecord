@@ -112,7 +112,11 @@ def clean_research_queries(payload: dict, visible_node_ids: set[str]) -> list[di
             continue
         query = re.sub(r"[\w.+-]+@[\w.-]+", "[email]", query)
         query = re.sub(r"(?<!\d)\d{7,}(?!\d)", "[number]", query)
-        query = re.sub(r"(?:[A-Za-z]:\\|/home/|/Users/)[^\s]+", "[local-path]", query)
+        query = re.sub(
+            r"(?:[A-Za-z]:\\|/home/|/Users/|/mnt/)[^\s]+",
+            "[local-path]",
+            query,
+        )
         cleaned.append(
             {
                 "target_id": target_id,

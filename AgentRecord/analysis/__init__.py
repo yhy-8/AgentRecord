@@ -10,13 +10,16 @@ from .automation import (
     uninstall_system_automation,
 )
 from .context import analysis_report_path
+from .information import generate_information_briefing, information_briefing_path
 from .orchestrator import generate_analysis_report, summarize_diary
 
 __all__ = [
     "analysis_report_path",
     "automation_status_snapshot",
     "generate_analysis_report",
+    "generate_information_briefing",
     "install_system_automation",
+    "information_briefing_path",
     "run_due_automatic_tasks",
     "summarize_diary",
     "system_automation_status",
