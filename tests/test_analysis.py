@@ -249,6 +249,14 @@ class AnalysisWorkflowTests(unittest.TestCase):
         )
         self.assertIn('"target_nodes": [{', world_prompt)
         self.assertIn("外部知识", world_prompt)
+        self.assertIn('"id": "T001"', world_prompt)
+        self.assertFalse(
+            any(
+                re.search(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])", prompt)
+                for prompt in self.ai_calls
+                if "[程序 Agent 任务:" in prompt
+            )
+        )
         self.assertEqual(original, diary.read_bytes())
         self.assertEqual(
             settings.ANALYSIS_DIR / "Daily" / "2026-07-14_manual.md", report_path
@@ -270,6 +278,17 @@ class AnalysisWorkflowTests(unittest.TestCase):
             all(node["source_refs"] == ["R-20260714-001"] for node in derived_nodes)
         )
         self.assertEqual("R-20260714-001", store.sources_for_run(run_id)[0]["source_id"])
+
+    def test_aliasing_removes_long_ids_embedded_in_context_text(self):
+        node_id = "a" * 32
+
+        aliased, alias_to_id = orchestrator._alias_model_data(
+            {"node": node_id, "report_metadata": f"分析运行：{node_id}"}
+        )
+
+        self.assertEqual("K001", aliased["node"])
+        self.assertEqual("分析运行：K001", aliased["report_metadata"])
+        self.assertEqual(node_id, alias_to_id["K001"])
 
     def test_failed_pipeline_does_not_overwrite_existing_report(self):
         day = datetime.date(2026, 7, 14)

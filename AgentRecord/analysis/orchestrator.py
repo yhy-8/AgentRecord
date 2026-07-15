@@ -4,6 +4,7 @@ import datetime
 import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 
 from .. import journal, settings
@@ -18,7 +19,7 @@ from ..agents import (
     reviewer,
     world,
 )
-from ..agents.graph import inherit_source_refs
+from ..agents.graph import inherit_source_refs, replace_node_ids
 from ..ai_client import call_ai
 from .context import (
     _analysis_report_path,
@@ -35,6 +36,65 @@ from .store import AnalysisStore
 
 
 logger = logging.getLogger(__name__)
+_LONG_ID_PATTERN = re.compile(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])")
+
+
+def _long_ids(value: object) -> set[str]:
+    if isinstance(value, str):
+        return set(_LONG_ID_PATTERN.findall(value))
+    if isinstance(value, (list, tuple)):
+        result: set[str] = set()
+        for item in value:
+            result.update(_long_ids(item))
+        return result
+    if isinstance(value, dict):
+        result = set()
+        for item in value.values():
+            result.update(_long_ids(item))
+        return result
+    return set()
+
+
+def _replace_id_substrings(value: object, replacements: dict[str, str]) -> object:
+    if isinstance(value, str):
+        return _LONG_ID_PATTERN.sub(
+            lambda match: replacements.get(match.group(0), match.group(0)), value
+        )
+    if isinstance(value, list):
+        return [_replace_id_substrings(item, replacements) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_replace_id_substrings(item, replacements) for item in value)
+    if isinstance(value, dict):
+        return {
+            key: _replace_id_substrings(item, replacements)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _alias_model_data(
+    value: object, *, prefix: str = "K"
+) -> tuple[object, dict[str, str]]:
+    """将模型输入中的长持久 ID 替换为本次调用的短别名。"""
+    ids = sorted(_long_ids(value))
+    id_to_alias = {
+        node_id: f"{prefix}{index:03d}" for index, node_id in enumerate(ids, 1)
+    }
+    alias_to_id = {alias: node_id for node_id, alias in id_to_alias.items()}
+    return _replace_id_substrings(value, id_to_alias), alias_to_id
+
+
+def _compact_relations(relations: list[dict]) -> list[dict]:
+    keys = (
+        "source_id",
+        "target_id",
+        "relation_type",
+        "status",
+        "weight",
+        "confidence",
+        "rationale",
+    )
+    return [{key: relation.get(key) for key in keys} for relation in relations]
 
 
 def _save_validation_failure(
@@ -184,22 +244,22 @@ def _review_candidates(
         node["id"]: f"N{index:03d}" for index, node in enumerate(candidates, 1)
     }
     alias_to_id = {alias: node_id for node_id, alias in id_to_alias.items()}
-    candidate_input = [
-        {**node, "id": id_to_alias[node["id"]]}
-        for node in compact_nodes(candidates)
-    ]
-    relation_input = [
-        {
-            **relation,
-            "source_id": id_to_alias.get(
-                relation["source_id"], relation["source_id"]
-            ),
-            "target_id": id_to_alias.get(
-                relation["target_id"], relation["target_id"]
-            ),
-        }
-        for relation in store.edges_for_run(run_id, statuses=("candidate",))
-    ]
+    candidate_input = compact_nodes(candidates)
+    relation_input = _compact_relations(
+        store.edges_for_run(run_id, statuses=("candidate",))
+    )
+    external_ids = sorted(
+        (_long_ids(candidate_input) | _long_ids(relation_input)) - set(id_to_alias)
+    )
+    all_aliases = {
+        **id_to_alias,
+        **{
+            node_id: f"H{index:03d}"
+            for index, node_id in enumerate(external_ids, 1)
+        },
+    }
+    candidate_input = _replace_id_substrings(candidate_input, all_aliases)
+    relation_input = _replace_id_substrings(relation_input, all_aliases)
     review_input = {
         "mode": "candidate_review",
         "candidate_nodes": candidate_input,
@@ -393,17 +453,22 @@ def generate_analysis_report(
                 if node["node_type"] == "theme"
             ]
         }
-        cluster_payload = _call_agent(
-            cluster.SPEC,
-            "根据本周期证据形成主题和时间轨迹；只在确有依据时关联历史主题。",
+        cluster_input, cluster_aliases = _alias_model_data(
             {
                 "period": {"start": start.isoformat(), "end": end.isoformat()},
                 "nodes": compact_nodes(list(cluster_visible.values())),
-            },
+            }
+        )
+        cluster_payload = _call_agent(
+            cluster.SPEC,
+            "根据本周期证据形成主题和时间轨迹；只在确有依据时关联历史主题。"
+            "输入节点 id 是短别名，必须原样复制；新 temp_id 不得使用 K 加三位数字的格式。",
+            cluster_input,
             model_config,
             store,
             run_id,
         )
+        cluster_payload = replace_node_ids(cluster_payload, cluster_aliases)
         _persist_graph_agent(
             cluster.SPEC,
             cluster.validate,
@@ -418,12 +483,7 @@ def generate_analysis_report(
         explorer_visible = {
             node["id"]: node for node in run_nodes + list(historical_by_id.values())
         }
-        explorer_payload = _call_agent(
-            explorer.SPEC,
-            "提取并探索少量高价值观点、思维模型、方法论和点子。"
-            "存在可被外部知识实质验证或延伸的内容时，通常选择一至三个方向提出研究问题。"
-            "每日信息简报只是外部线索；使用其中信息前必须创建研究问题交给 World 重新查证。"
-            "显式引用和下级报告只是分析材料，不能视为用户已经认可的观点。",
+        explorer_input, explorer_aliases = _alias_model_data(
             {
                 "period_focus": period_focus,
                 "nodes": compact_nodes(list(explorer_visible.values())),
@@ -431,11 +491,21 @@ def generate_analysis_report(
                 "supporting_reports": supporting_reports[:30000],
                 "recent_summaries": history[:30000],
                 "information_briefings": information_briefings,
-            },
+            }
+        )
+        explorer_payload = _call_agent(
+            explorer.SPEC,
+            "提取并探索少量高价值观点、思维模型、方法论和点子。"
+            "存在可被外部知识实质验证或延伸的内容时，通常选择一至三个方向提出研究问题。"
+            "每日信息简报只是外部线索；使用其中信息前必须创建研究问题交给 World 重新查证。"
+            "显式引用和下级报告只是分析材料，不能视为用户已经认可的观点。"
+            "输入节点 id 是短别名，必须原样复制；新 temp_id 不得使用 K 加三位数字的格式。",
+            explorer_input,
             model_config,
             store,
             run_id,
         )
+        explorer_payload = replace_node_ids(explorer_payload, explorer_aliases)
         explorer_ids = _persist_graph_agent(
             explorer.SPEC,
             explorer.validate,
@@ -477,11 +547,7 @@ def generate_analysis_report(
             target_ids = list(
                 dict.fromkeys(item["target_id"] for item in research_queries)
             )
-            world_payload = _call_agent(
-                world.SPEC,
-                "逐项使用外部知识核查并延伸中控给出的候选观念、方法或点子。"
-                "只把 research_queries 中已经去隐私的 query 发送给搜索工具；"
-                "没有可靠结果时标为 unverified。",
+            world_input, world_aliases = _alias_model_data(
                 {
                     "checked_at": datetime.date.today().isoformat(),
                     "research_queries": research_queries,
@@ -505,10 +571,21 @@ def generate_analysis_report(
                         for target_id in target_ids
                     ],
                 },
+                prefix="T",
+            )
+            world_payload = _call_agent(
+                world.SPEC,
+                "逐项使用外部知识核查并延伸中控给出的候选观念、方法或点子。"
+                "只把 research_queries 中已经去隐私的 query 发送给搜索工具；"
+                "没有可靠结果时标为 unverified。"
+                "目标 id 是 T 加三位数字的短别名，必须原样复制；"
+                "新 research temp_id 不得使用该格式。",
+                world_input,
                 model_config,
                 store,
                 run_id,
             )
+            world_payload = replace_node_ids(world_payload, world_aliases)
             _persist_graph_agent(
                 world.SPEC,
                 world.validate,
@@ -576,13 +653,16 @@ def generate_analysis_report(
             and edge["target_id"] in report_node_ids
         ]
 
-        report_input = {
-            "report_name": report_name,
-            "period_focus": period_focus,
-            "accepted_nodes": compact_nodes(accepted_nodes),
-            "accepted_relations": accepted_relations,
-            "source_ids": sorted(record["source_id"] for record in records),
-        }
+        report_input, _ = _alias_model_data(
+            {
+                "report_name": report_name,
+                "period_focus": period_focus,
+                "accepted_nodes": compact_nodes(accepted_nodes),
+                "accepted_relations": _compact_relations(accepted_relations),
+                "source_ids": sorted(record["source_id"] for record in records),
+            },
+            prefix="A",
+        )
         report_markdown = ""
         audit_feedback: list[str] = []
         for attempt in range(2):
@@ -615,7 +695,7 @@ def generate_analysis_report(
                 "审查报告草稿是否只使用 accepted 节点、正确区分来源身份且所有核心判断有依据。",
                 {
                     "mode": "report_review",
-                    "accepted_nodes": compact_nodes(accepted_nodes),
+                    "accepted_nodes": report_input["accepted_nodes"],
                     "draft_markdown": report_markdown,
                     "deterministic_errors": deterministic_errors,
                 },

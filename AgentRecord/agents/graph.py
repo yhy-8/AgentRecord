@@ -9,6 +9,26 @@ from .base import AgentPipelineError, AgentSpec, confidence
 MetadataValidator = Callable[[str, dict, set[str]], None]
 
 
+def replace_node_ids(value: object, replacements: dict[str, str]) -> object:
+    """只替换结构化字段中完整匹配的节点 ID，不改写模型新建的 temp_id。"""
+    if isinstance(value, str):
+        return replacements.get(value, value)
+    if isinstance(value, list):
+        return [replace_node_ids(item, replacements) for item in value]
+    if isinstance(value, tuple):
+        return tuple(replace_node_ids(item, replacements) for item in value)
+    if isinstance(value, dict):
+        return {
+            key: (
+                item
+                if key == "temp_id"
+                else replace_node_ids(item, replacements)
+            )
+            for key, item in value.items()
+        }
+    return value
+
+
 def inherit_source_refs(
     payload: dict,
     *,

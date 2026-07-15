@@ -2,7 +2,7 @@ import unittest
 
 from AgentRecord.agents import AGENTS, explorer, extractor, report, world
 from AgentRecord.agents.base import AgentPipelineError
-from AgentRecord.agents.graph import inherit_source_refs
+from AgentRecord.agents.graph import inherit_source_refs, replace_node_ids
 
 
 class AgentModuleTests(unittest.TestCase):
@@ -34,6 +34,26 @@ class AgentModuleTests(unittest.TestCase):
         self.assertIn("[email]", queries[0]["query"])
         self.assertIn("[number]", queries[0]["query"])
         self.assertIn("[local-path]", queries[0]["query"])
+
+    def test_node_id_replacement_preserves_new_temporary_ids(self):
+        persistent = "a" * 32
+        payload = {
+            "nodes": [
+                {
+                    "temp_id": "new-1",
+                    "source_refs": [persistent],
+                    "metadata": {"target_id": persistent},
+                }
+            ],
+            "edges": [{"source_id": "new-1", "target_id": persistent}],
+        }
+
+        replaced = replace_node_ids(payload, {persistent: "K001"})
+
+        self.assertEqual("new-1", replaced["nodes"][0]["temp_id"])
+        self.assertEqual("K001", replaced["nodes"][0]["source_refs"][0])
+        self.assertEqual("K001", replaced["nodes"][0]["metadata"]["target_id"])
+        self.assertEqual("new-1", replaced["edges"][0]["source_id"])
 
     def test_extractor_accepts_methodology_evidence(self):
         nodes, _ = extractor.validate(
