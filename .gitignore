@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+.idea/
 # Local user data and derived analysis state.
 Records/
 AnalysisReports/
