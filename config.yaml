@@ -2,16 +2,16 @@
 # 模型列表
 #   name:     显示名称（人看的）
 #   model_id: 请求时的具体模型标识（不填则使用 name）
-#   search:   是否有搜索能力（有则在 UI 中标注 SRCH）
+#   search:   是否启用该模型接口提供的原生联网搜索（前提是有原生联网是搜索）
 models:
   - name: deepseek-v4-pro
     model_id: deepseek-v4-pro
-    search: false         # 是否有搜索能力
+    search: false         # false 时可按 third_search 配置使用第三方搜索
     api_url: https://api.deepseek.com/chat/completions
     api_key:
 
 # 总结、手动报告和自动报告统一使用此模型；/m 会永久更新该项
-current_model: deepseek-v4-pro
+current_model: "deepseek-v4-pro"
 
 # 第三方搜索配置（仅当模型无原生搜索能力时生效）
 third_search:
