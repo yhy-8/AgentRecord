@@ -480,7 +480,8 @@ def _run_monthly_reports(
 
 
 _CRON_MARKER = "# AgentRecord automation"
-_WINDOWS_TASK_NAME = "AgentRecord Automation"
+_WINDOWS_HOURLY_TASK_NAME = "AgentRecord Automation"
+_WINDOWS_LOGON_TASK_NAME = "AgentRecord Automation Logon"
 
 
 def _automation_command() -> list[str]:
@@ -498,24 +499,36 @@ def install_system_automation() -> tuple[bool, str]:
     try:
         command = _automation_command()
         if _is_windows():
-            result = subprocess.run(
-                [
+            task_command = subprocess.list2cmdline(command)
+            schedules = (
+                (_WINDOWS_HOURLY_TASK_NAME, "HOURLY"),
+                (_WINDOWS_LOGON_TASK_NAME, "ONLOGON"),
+            )
+            for task_name, schedule in schedules:
+                arguments = [
                     "schtasks",
                     "/Create",
                     "/TN",
-                    _WINDOWS_TASK_NAME,
+                    task_name,
                     "/SC",
-                    "HOURLY",
-                    "/MO",
-                    "1",
-                    "/TR",
-                    subprocess.list2cmdline(command),
-                    "/F",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
+                    schedule,
+                ]
+                if schedule == "HOURLY":
+                    arguments.extend(("/MO", "1", "/ST", "00:05"))
+                arguments.extend(("/TR", task_command, "/F"))
+                result = subprocess.run(
+                    arguments,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if result.returncode != 0:
+                    return (
+                        False,
+                        result.stderr.strip()
+                        or result.stdout.strip()
+                        or f"安装 {task_name} 失败。",
+                    )
         else:
             current = subprocess.run(
                 ["crontab", "-l"], capture_output=True, text=True, timeout=30
@@ -527,7 +540,13 @@ def install_system_automation() -> tuple[bool, str]:
                 for line in current.stdout.splitlines()
                 if _CRON_MARKER not in line
             ]
-            lines.append(f"5 * * * * {shlex.join(command)} {_CRON_MARKER}")
+            task_command = shlex.join(command)
+            lines.extend(
+                (
+                    f"@reboot {task_command} {_CRON_MARKER} startup",
+                    f"5 * * * * {task_command} {_CRON_MARKER} hourly",
+                )
+            )
             result = subprocess.run(
                 ["crontab", "-"],
                 input="\n".join(lines) + "\n",
@@ -537,7 +556,7 @@ def install_system_automation() -> tuple[bool, str]:
             )
         if result.returncode != 0:
             return False, result.stderr.strip() or result.stdout.strip() or "安装失败。"
-        return True, "系统后台任务已安装，每小时第 5 分钟检查到期任务。"
+        return True, "系统后台任务已安装：登录或重启时立即检查，此后每小时检查。"
     except (OSError, subprocess.SubprocessError) as error:
         return False, f"安装系统后台任务失败: {error}"
 
@@ -546,11 +565,28 @@ def uninstall_system_automation() -> tuple[bool, str]:
     """卸载由 AgentRecord 创建的用户级系统任务。"""
     try:
         if _is_windows():
-            result = subprocess.run(
-                ["schtasks", "/Delete", "/TN", _WINDOWS_TASK_NAME, "/F"],
-                capture_output=True,
-                text=True,
-                timeout=30,
+            results = [
+                subprocess.run(
+                    ["schtasks", "/Delete", "/TN", task_name, "/F"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                for task_name in (
+                    _WINDOWS_HOURLY_TASK_NAME,
+                    _WINDOWS_LOGON_TASK_NAME,
+                )
+            ]
+            if all(result.returncode != 0 for result in results):
+                result = results[0]
+                return (
+                    False,
+                    result.stderr.strip()
+                    or result.stdout.strip()
+                    or "未找到可卸载的系统后台任务。",
+                )
+            result = next(
+                result for result in results if result.returncode == 0
             )
         else:
             current = subprocess.run(

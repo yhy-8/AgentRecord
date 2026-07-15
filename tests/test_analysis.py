@@ -262,6 +262,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
 
         self.assertTrue(success)
         cron_input = run.call_args_list[1].kwargs["input"]
+        self.assertIn("@reboot", cron_input)
         self.assertIn("5 * * * *", cron_input)
         self.assertIn("--run-automation", cron_input)
         self.assertIn("# AgentRecord automation", cron_input)
@@ -274,10 +275,14 @@ class AnalysisWorkflowTests(unittest.TestCase):
             success, _ = analysis.install_system_automation()
 
         self.assertTrue(success)
-        command = run.call_args.args[0]
-        self.assertEqual("schtasks", command[0])
-        self.assertIn("/TR", command)
-        self.assertIn("--run-automation", command[command.index("/TR") + 1])
+        self.assertEqual(2, run.call_count)
+        commands = [call.args[0] for call in run.call_args_list]
+        schedules = {command[command.index("/SC") + 1] for command in commands}
+        self.assertEqual({"HOURLY", "ONLOGON"}, schedules)
+        for command in commands:
+            self.assertEqual("schtasks", command[0])
+            self.assertIn("/TR", command)
+            self.assertIn("--run-automation", command[command.index("/TR") + 1])
 
 if __name__ == "__main__":
     unittest.main()

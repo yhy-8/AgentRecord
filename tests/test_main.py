@@ -2,7 +2,7 @@ import datetime
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import main
 import settings
@@ -78,6 +78,16 @@ class MainCommandTests(unittest.TestCase):
             {"/h", "/mode", "/s", "/a", "/m"},
             set(main.MODE_COMMANDS[main.REPORT_MODE]),
         )
+
+    def test_windows_background_entry_hides_console_window(self):
+        windll = Mock()
+        windll.kernel32.GetConsoleWindow.return_value = 123
+        with patch.object(main.sys, "platform", "win32"), patch.object(
+            main.sys, "argv", ["AgentRecord.exe", "--run-automation"]
+        ), patch.object(main.ctypes, "windll", windll, create=True):
+            main._hide_background_console()
+
+        windll.user32.ShowWindow.assert_called_once_with(123, 0)
 
     @patch("main.journal.append_log")
     @patch("main.show_help")

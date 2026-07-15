@@ -1,5 +1,6 @@
 """AgentRecord 可执行入口与终端交互。"""
 
+import ctypes
 import datetime
 import os
 import re
@@ -8,6 +9,21 @@ import shutil
 import sys
 import time
 import unicodedata
+
+
+def _hide_background_console() -> None:
+    """Windows 打包程序执行后台任务时隐藏控制台；正常交互入口不受影响。"""
+    if sys.platform != "win32" or "--run-automation" not in sys.argv:
+        return
+    try:
+        window = ctypes.windll.kernel32.GetConsoleWindow()
+        if window:
+            ctypes.windll.user32.ShowWindow(window, 0)
+    except (AttributeError, OSError):
+        pass
+
+
+_hide_background_console()
 
 from rich.console import Console
 from rich.markdown import Markdown
@@ -29,7 +45,6 @@ try:
     import msvcrt
 
     IS_WINDOWS = True
-    import ctypes
 
     kernel32 = ctypes.windll.kernel32
     handle = kernel32.GetStdHandle(-11)
