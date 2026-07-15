@@ -394,7 +394,9 @@ def generate_analysis_report(
         }
         explorer_payload = _call_agent(
             explorer.SPEC,
-            "提出少量高价值候选洞见。显式引用和下级报告只是分析材料，不能视为用户已经认可的观点。",
+            "提取并探索少量高价值观点、思维模型、方法论和点子。"
+            "存在可被外部知识实质验证或延伸的内容时，通常选择一至三个方向提出研究问题。"
+            "显式引用和下级报告只是分析材料，不能视为用户已经认可的观点。",
             {
                 "period_focus": period_focus,
                 "nodes": compact_nodes(list(explorer_visible.values())),
@@ -444,12 +446,36 @@ def generate_analysis_report(
             )
             raise
         if research_queries:
+            target_ids = list(
+                dict.fromkeys(item["target_id"] for item in research_queries)
+            )
             world_payload = _call_agent(
                 world.SPEC,
-                "逐项核查中控给出的去隐私研究问题；没有可靠结果时标为 unverified。",
+                "逐项使用外部知识核查并延伸中控给出的候选观念、方法或点子。"
+                "只把 research_queries 中已经去隐私的 query 发送给搜索工具；"
+                "没有可靠结果时标为 unverified。",
                 {
                     "checked_at": datetime.date.today().isoformat(),
                     "research_queries": research_queries,
+                    "target_nodes": [
+                        {
+                            "id": target_id,
+                            "node_type": research_visible[target_id]["node_type"],
+                            "title": research_visible[target_id]["title"][:200],
+                            "insight_type": research_visible[target_id]
+                            .get("metadata", {})
+                            .get("insight_type", ""),
+                            "inference_level": research_visible[target_id]
+                            .get("metadata", {})
+                            .get("inference_level", ""),
+                            "why_it_matters": str(
+                                research_visible[target_id]
+                                .get("metadata", {})
+                                .get("why_it_matters", "")
+                            )[:500],
+                        }
+                        for target_id in target_ids
+                    ],
                 },
                 model_config,
                 store,

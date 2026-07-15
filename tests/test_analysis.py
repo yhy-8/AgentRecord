@@ -89,12 +89,12 @@ class AnalysisWorkflowTests(unittest.TestCase):
                             "confidence": 0.8,
                             "source_refs": [evidence["id"]],
                             "metadata": {
-                                "insight_type": "connection",
+                                "insight_type": "methodology",
                                 "evidence_for": [evidence["id"]],
                                 "evidence_against": [],
                                 "inference_level": "low",
                                 "why_it_matters": "用于验证报告流程",
-                                "research_needed": False,
+                                "research_needed": True,
                             },
                         }
                     ],
@@ -108,7 +108,51 @@ class AnalysisWorkflowTests(unittest.TestCase):
                             "rationale": "原始证据支持洞见",
                         }
                     ],
-                    "research_queries": [],
+                    "research_queries": [
+                        {
+                            "target_id": "i1",
+                            "query": "如何验证并延伸一种个人问题分析方法",
+                            "reason": "查找相关方法、反例和相邻概念",
+                        }
+                    ],
+                }
+            elif "[程序 Agent 任务:world]" in prompt:
+                target = data["target_nodes"][0]
+                query = data["research_queries"][0]
+                payload = {
+                    "nodes": [
+                        {
+                            "temp_id": "research-1",
+                            "node_type": "research",
+                            "title": "外部方法研究",
+                            "body": "外部资料提供了验证、反例和延伸方向。",
+                            "confidence": 0.8,
+                            "source_refs": [],
+                            "metadata": {
+                                "target_id": target["id"],
+                                "query": query["query"],
+                                "checked_at": data["checked_at"],
+                                "sources": [
+                                    {
+                                        "title": "测试来源",
+                                        "url": "https://example.com/source",
+                                        "published": "2026-07-14",
+                                    }
+                                ],
+                                "result": "mixed",
+                            },
+                        }
+                    ],
+                    "edges": [
+                        {
+                            "source_id": "research-1",
+                            "target_id": target["id"],
+                            "relation_type": "supports",
+                            "weight": 0.7,
+                            "confidence": 0.8,
+                            "rationale": "外部资料提供了可比较的方法",
+                        }
+                    ],
                 }
             elif "[程序 Agent 任务:report]" in prompt:
                 source_id = data["source_ids"][0]
@@ -199,6 +243,11 @@ class AnalysisWorkflowTests(unittest.TestCase):
         self.assertTrue(
             any("[程序 Agent 任务:report]" in prompt for prompt in self.ai_calls)
         )
+        world_prompt = next(
+            prompt for prompt in self.ai_calls if "[程序 Agent 任务:world]" in prompt
+        )
+        self.assertIn('"target_nodes": [{', world_prompt)
+        self.assertIn("外部知识", world_prompt)
         self.assertEqual(original, diary.read_bytes())
         self.assertEqual(
             settings.ANALYSIS_DIR / "Daily" / "2026-07-14_manual.md", report_path

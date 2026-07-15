@@ -13,7 +13,8 @@ SPEC = AgentSpec(
     writable_node_types=frozenset(),
     writable_relation_types=frozenset(),
     allowed_tools=frozenset(),
-    instructions="""严格检查来源可追溯性、证据强度、来源身份混淆、因果越界、弱关联和套话。宁可拒绝无价值候选，也不要为了丰富报告而放行。
+    instructions="""严格检查来源可追溯性、证据强度、来源身份混淆、因果越界、弱关联和套话。宁可拒绝无价值候选，也不要为了丰富报告而放行；但不要仅因内容属于探索性推断就拒绝，只要它有记录依据、明确标注推断层级和不确定性，并能实质拓宽理解，就可以保留。
+候选审查还要检查外部研究是否真的完成了核查或延伸，而非只罗列链接。报告审查要确认正文提炼了有依据的观点、思维模型或方法论，并在存在 accepted research 时实际整合其反例、相邻概念或延伸方向；同时必须保持用户观点、AI 推断和外部材料的身份边界。
 候选节点使用 N001 形式的本次运行短别名。node_id 必须从中控给出的 valid_node_ids 原样复制，不得缩写、改写或使用其他 ID。
 候选审查输出 JSON：{"decisions":[{"node_id":"N001","status":"accepted|rejected|candidate","reason":"...","confidence":0到1}],"revision_guidance":"..."}。
 报告审查输出 JSON：{"pass":true或false,"unsupported_claims":["..."],"required_changes":["..."],"summary":"..."}。""",

@@ -1,6 +1,6 @@
 import unittest
 
-from AgentRecord.agents import AGENTS, explorer, report, world
+from AgentRecord.agents import AGENTS, explorer, extractor, report, world
 from AgentRecord.agents.base import AgentPipelineError
 from AgentRecord.agents.graph import inherit_source_refs
 
@@ -34,6 +34,100 @@ class AgentModuleTests(unittest.TestCase):
         self.assertIn("[email]", queries[0]["query"])
         self.assertIn("[number]", queries[0]["query"])
         self.assertIn("[local-path]", queries[0]["query"])
+
+    def test_extractor_accepts_methodology_evidence(self):
+        nodes, _ = extractor.validate(
+            {
+                "nodes": [
+                    {
+                        "temp_id": "method-1",
+                        "node_type": "evidence",
+                        "title": "一种复盘方法",
+                        "body": "用户记录了自己反复使用的复盘方法。",
+                        "confidence": 0.9,
+                        "source_refs": ["R-20260714-001"],
+                        "metadata": {
+                            "kind": "methodology",
+                            "speaker": "user",
+                        },
+                    }
+                ],
+                "edges": [],
+            },
+            allowed_source_ids={"R-20260714-001"},
+            visible_node_ids=set(),
+        )
+
+        self.assertEqual("methodology", nodes[0]["metadata"]["kind"])
+
+    def test_explorer_requires_query_for_research_needed_node(self):
+        payload = {
+            "nodes": [
+                {
+                    "temp_id": "insight-1",
+                    "node_type": "insight",
+                    "title": "一种问题分析方法",
+                    "body": "记录显示用户正在形成一种稳定的问题分析方法。",
+                    "confidence": 0.8,
+                    "source_refs": ["R-20260714-001"],
+                    "metadata": {
+                        "insight_type": "methodology",
+                        "evidence_for": ["evidence-1"],
+                        "evidence_against": [],
+                        "inference_level": "medium",
+                        "why_it_matters": "可以与外部方法比较并继续发展",
+                        "research_needed": True,
+                    },
+                }
+            ],
+            "edges": [],
+            "research_queries": [],
+        }
+
+        with self.assertRaisesRegex(AgentPipelineError, "缺少配套研究问题"):
+            explorer.validate(
+                payload,
+                allowed_source_ids={"R-20260714-001"},
+                visible_node_ids={"evidence-1"},
+            )
+
+    def test_explorer_accepts_methodology_with_matching_research_query(self):
+        payload = {
+            "nodes": [
+                {
+                    "temp_id": "insight-1",
+                    "node_type": "insight",
+                    "title": "一种问题分析方法",
+                    "body": "记录显示用户正在形成一种稳定的问题分析方法。",
+                    "confidence": 0.8,
+                    "source_refs": ["R-20260714-001"],
+                    "metadata": {
+                        "insight_type": "methodology",
+                        "evidence_for": ["evidence-1"],
+                        "evidence_against": [],
+                        "inference_level": "medium",
+                        "why_it_matters": "可以与外部方法比较并继续发展",
+                        "research_needed": True,
+                    },
+                }
+            ],
+            "edges": [],
+            "research_queries": [
+                {
+                    "target_id": "insight-1",
+                    "query": "问题分析方法的验证、局限和相邻理论",
+                    "reason": "寻找反例和延伸方向",
+                }
+            ],
+        }
+
+        nodes, _ = explorer.validate(
+            payload,
+            allowed_source_ids={"R-20260714-001"},
+            visible_node_ids={"evidence-1"},
+        )
+
+        self.assertEqual("methodology", nodes[0]["metadata"]["insight_type"])
 
     def test_visible_node_reference_inherits_original_source(self):
         payload = {

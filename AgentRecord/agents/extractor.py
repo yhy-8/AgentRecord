@@ -12,9 +12,9 @@ SPEC = AgentSpec(
     writable_node_types=frozenset({"evidence"}),
     writable_relation_types=frozenset(),
     allowed_tools=frozenset(),
-    instructions="""逐条识别事件、想法、判断、决定、问题和计划。不要概括成宏大主题，不要补充记录中没有的信息。
-每个节点必须引用输入中存在的 source_id，并在 metadata.kind 中写 event、idea、claim、decision、question 或 plan；metadata.speaker 只能是 user、quoted_ai 或 referenced_report。
-输出 JSON：{"nodes":[{"temp_id":"...","node_type":"evidence","title":"...","body":"...","confidence":0到1,"source_refs":["R-..."],"metadata":{"kind":"idea","speaker":"user"}}]}。""",
+    instructions="""逐条识别事件、想法、观点、判断、思维模型、方法论、决定、问题和计划。尤其保留用户解释问题的方式、反复使用的判断原则和仍可发展的点子，不要只提取外部事件。不要概括成宏大主题，不要补充记录中没有的信息。
+每个节点必须引用输入中存在的 source_id，并在 metadata.kind 中写 event、idea、viewpoint、claim、mental_model、methodology、decision、question 或 plan；metadata.speaker 只能是 user、quoted_ai 或 referenced_report。
+输出 JSON：{"nodes":[{"temp_id":"...","node_type":"evidence","title":"...","body":"...","confidence":0到1,"source_refs":["R-..."],"metadata":{"kind":"viewpoint","speaker":"user"}}]}。""",
 )
 
 
@@ -22,7 +22,10 @@ def _validate_metadata(node_type: str, metadata: dict, visible: set[str]) -> Non
     if metadata.get("kind") not in {
         "event",
         "idea",
+        "viewpoint",
         "claim",
+        "mental_model",
+        "methodology",
         "decision",
         "question",
         "plan",
