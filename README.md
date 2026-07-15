@@ -23,31 +23,39 @@
 - 分析报告独立保存在 `AnalysisReports/`。
 - 引用带来源类型、周期、相对链接和引用时刻，来源文件保持不变。
 - 日报保留为手动下钻能力，不默认自动生成，避免每天同时产生总结和日报。
+- 手动与自动报告分开保存，同一周期各自只保留一份；再次生成手动报告前会确认覆盖。
 - 支持多个 OpenAI 兼容模型与可选联网搜索。
 
-## 自动触发规则
+## 系统后台任务
 
 所有周期使用运行机器的本地日期和时间。
 
 | 任务 | 周期定义 | 最早触发时间 | 产物 |
 |---|---|---|---|
-| 日总结 | 本地时间 00:00–23:59 的自然日 | 次日 00:00 以后 | 原日记顶部 `<summary>` |
-| 周报 | 周一至周日的完整自然周 | 下周一 00:00 以后 | `Weekly/周一_to_周日.md` |
-| 月报 | 每月 1 日至最后一日的完整自然月 | 下月 1 日 00:00 以后 | `Monthly/YYYY-MM.md` |
+| 日总结 | 本地时间 00:00–23:59 的自然日 | 次日 00:05 以后 | 原日记顶部 `<summary>` |
+| 周报 | 周一至周日的完整自然周 | 下周一 00:05 以后 | `Weekly/周一_to_周日_auto.md` |
+| 月报 | 每月 1 日至最后一日的完整自然月 | 下月 1 日 00:05 以后 | `Monthly/YYYY-MM_auto.md` |
 
-程序并不是操作系统常驻服务。所谓“自动”是：
+自动任务由操作系统调度，不依赖 AgentRecord 终端保持运行：
 
-1. `main.py` 启动后，后台线程立即检查一次到期任务。
-2. 程序保持运行时每小时检查一次；接近午夜时会在跨过 00:00 约 5 秒后检查。
-3. 程序关闭期间不会工作，但下次启动会根据状态文件补做。
+```bash
+# Windows：安装到当前用户的任务计划程序
+# 类 Unix：安装到当前用户的 crontab
+python main.py --install-automation
+
+# 不再需要自动任务时卸载
+python main.py --uninstall-automation
+```
+
+安装后，系统每小时第 5 分钟启动一次独立进程检查到期任务，完成后退出。慢任务通过跨进程锁避免重叠；关闭终端或 AgentRecord 不影响后续运行。
 
 午夜时仍可继续输入。尚未按回车的文字还不是已保存记录；若跨过午夜后提交，它会进入新一天，而后台只总结已经闭合并保存的前一天内容，因此两者不会争用同一条记录。
 
-任务按“日总结 → 周报 → 月报”顺序检查，但失败彼此隔离：某一天总结失败，不会损坏日记，也不阻止仍可基于原始记录生成的周报和月报。失败原因保存在 `AnalysisReports/.automation-state.json`，未推进对应任务的成功位置，所以下次启动或下一小时检查会重试。
+任务按“日总结 → 周报 → 月报”顺序检查，但失败彼此隔离：某一天总结失败，不会损坏日记，也不阻止仍可基于原始记录生成的周报和月报。失败原因保存在 `AnalysisReports/.automation-state.json`，未推进对应任务的成功位置，所以下一小时检查会重试。
 
 为避免第一次启用时突然处理全部历史记录并产生大量模型调用，首次运行只处理每类任务最近一个已经闭合的周期：昨天、上一完整自然周、上一完整自然月。此后以各任务最后成功日期为起点连续补做遗漏周期。没有日记的周期会直接标记为已检查，不生成空报告。
 
-产物路径固定，因此重复检查是幂等的，不会无故生成多个副本；手动重新生成同一周期时也覆盖同一路径。
+自动报告与手动报告使用不同的固定路径，同一周期各自最多一份。自动检查只覆盖自动报告；再次手动生成时会先确认，确认后只覆盖原手动报告。
 
 ### 各周期分析层次
 
@@ -69,6 +77,8 @@ models:
     api_key: ""
     search: false
 
+current_model: deepseek-v4-pro
+
 third_search:
   enabled: false
   api_url: https://api.bocha.cn/v1/web-search
@@ -82,13 +92,12 @@ analysis_dir: ./AnalysisReports
 
 automation:
   enabled: true
-  model: deepseek-v4-pro
   daily_summary: true
   weekly_report: true
   monthly_report: true
 ```
 
-可以分别关闭三种自动任务，或用 `enabled: false` 关闭整个后台调度。不要把真实 API 密钥提交到版本库。
+`current_model` 是总结、手动报告和自动报告统一使用的模型；报告模式下执行 `/m` 会永久更新它。可以分别关闭三种自动任务，或用 `enabled: false` 关闭整个后台调度。不要把真实 API 密钥提交到版本库。
 
 ## 运行与命令
 
@@ -97,25 +106,31 @@ python main.py
 ```
 
 ```text
-/h                         显示帮助
-/m                         切换总结和分析使用的模型
+记录模式（启动默认）：
+/h                         显示记录模式帮助
+/mode                      切换到报告模式
 /v [日期]                  查看日记；/v help 查看日期格式
 /ref [类型] [筛选词]       引用来源；diary/daily/weekly/monthly
+/d                         删除今日最后一条记录
+/c                         清空终端显示
+
+报告模式：
+/h                         显示报告模式帮助
+/mode                      切换到记录模式
 /s [日期]                  手动生成日记总结；空为今天
 /a daily [日期]            手动生成分析日报
 /a weekly [日期]           手动生成日期所在自然周的周报
 /a monthly [日期]          手动生成日期所在自然月的月报
-/d                         删除今日最后一条记录
-/c                         清空终端显示
+/m                         永久切换总结和报告统一使用的模型
 ```
 
-除命令外的输入全部作为普通记录保存，包括以 `@` 开头的内容。日期支持 `-1`、`today`、`昨天`、`MM-DD` 和 `YYYY-MM-DD` 等格式。
+记录模式中，除命令外的输入全部作为普通记录保存，包括以 `@` 开头的内容；报告模式不接收普通文字。日期支持 `-1`、`today`、`昨天`、`MM-DD` 和 `YYYY-MM-DD` 等格式。
 月报还可以直接使用月份，例如 `/a monthly 2026-06`。
 
 ## 引用示例
 
 ```text
-[model] >> /ref weekly
+>> /ref weekly
 选择编号 [空=取消] >> 1
 关联记录 [可留空] >> 周报中的这个判断可能还能联系到最近的产品决策。
 ```
@@ -123,7 +138,7 @@ python main.py
 日记中保存为：
 
 ```markdown
-**14:32 [引用]:** [分析周报 | 2026-07-06 至 2026-07-12](<../AnalysisReports/Weekly/2026-07-06_to_2026-07-12.md>)
+**14:32 [引用]:** [自动分析周报 | 2026-07-06 至 2026-07-12](<../AnalysisReports/Weekly/2026-07-06_to_2026-07-12_auto.md>)
 
 周报中的这个判断可能还能联系到最近的产品决策。
 ```
@@ -142,9 +157,11 @@ analysis.py    总结、报告和自动任务；项目的分析编排核心
 Records/
   YYYY-MM-DD.md
 AnalysisReports/
-  Daily/YYYY-MM-DD.md                 # 手动生成
-  Weekly/YYYY-MM-DD_to_YYYY-MM-DD.md
-  Monthly/YYYY-MM.md
+  Daily/YYYY-MM-DD_manual.md
+  Weekly/YYYY-MM-DD_to_YYYY-MM-DD_manual.md
+  Weekly/YYYY-MM-DD_to_YYYY-MM-DD_auto.md
+  Monthly/YYYY-MM_manual.md
+  Monthly/YYYY-MM_auto.md
   .automation-state.json
 ```
 

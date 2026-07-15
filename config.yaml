@@ -10,6 +10,9 @@ models:
     api_url: https://api.deepseek.com/chat/completions
     api_key:
 
+# 总结、手动报告和自动报告统一使用此模型；/m 会永久更新该项
+current_model: deepseek-v4-pro
+
 # 第三方搜索配置（仅当模型无原生搜索能力时生效）
 third_search:
   enabled: false               # 全局开关
@@ -26,12 +29,11 @@ diary_dir: "./Records"
 analysis_dir: "./AnalysisReports"
 
 # 自动任务
-# 程序启动后立即检查，此后每小时检查，并在跨过本地零点后约 5 秒检查；
+# 安装系统后台任务后，每小时第 5 分钟检查；
 # 自动总结上一自然日，生成上一完整自然周和上一完整自然月的报告。
 # 首次启用只处理最近一个已闭合周期；此后从各任务上次成功位置补做。
 automation:
   enabled: true
-  model: deepseek-v4-pro     # 留空则使用模型列表中的第一个模型
   daily_summary: true       # 自动写入前一日日记顶部 <summary>
   weekly_report: true       # 每周生成上一完整自然周的分析周报
   monthly_report: true      # 每月生成上一完整自然月的分析月报

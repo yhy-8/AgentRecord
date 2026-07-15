@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import analysis
 import journal
@@ -85,14 +86,36 @@ class AnalysisWorkflowTests(unittest.TestCase):
         self.assertEqual("测试生成内容", report)
         self.assertIn("[程序分析报告任务]", self.ai_calls[-1])
         self.assertEqual(original, diary.read_bytes())
-        self.assertEqual(settings.ANALYSIS_DIR / "Daily" / "2026-07-14.md", report_path)
+        self.assertEqual(
+            settings.ANALYSIS_DIR / "Daily" / "2026-07-14_manual.md", report_path
+        )
         self.assertTrue(report_path.exists())
+
+    def test_manual_and_automatic_reports_have_separate_fixed_paths(self):
+        day = datetime.date(2026, 7, 14)
+        self.write_diary(day.isoformat())
+
+        _, manual_success, manual_path = analysis.generate_analysis_report(
+            "weekly", day, {"name": "mock"}, origin="manual"
+        )
+        _, auto_success, auto_path = analysis.generate_analysis_report(
+            "weekly", day, {"name": "mock"}, origin="auto"
+        )
+
+        self.assertTrue(manual_success and auto_success)
+        self.assertNotEqual(manual_path, auto_path)
+        self.assertTrue(manual_path.exists())
+        self.assertTrue(auto_path.exists())
 
     def test_monthly_report_uses_calendar_month_and_weekly_context(self):
         day = datetime.date(2026, 7, 15)
         diary, _ = self.write_diary(day.isoformat())
         original = diary.read_bytes()
-        weekly = settings.ANALYSIS_DIR / "Weekly" / "2026-07-06_to_2026-07-12.md"
+        weekly = (
+            settings.ANALYSIS_DIR
+            / "Weekly"
+            / "2026-07-06_to_2026-07-12_auto.md"
+        )
         weekly.parent.mkdir(parents=True)
         weekly.write_text("同期周报分析", encoding="utf-8")
 
@@ -101,8 +124,13 @@ class AnalysisWorkflowTests(unittest.TestCase):
         )
 
         self.assertTrue(success)
-        self.assertEqual(settings.ANALYSIS_DIR / "Monthly" / "2026-07.md", report_path)
-        self.assertIn("2026年07月 分析月报", report_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            settings.ANALYSIS_DIR / "Monthly" / "2026-07_manual.md", report_path
+        )
+        self.assertIn(
+            "2026年07月 手动分析月报",
+            report_path.read_text(encoding="utf-8"),
+        )
         self.assertIn("原始日记范围：2026-07-01 至 2026-07-31", report_path.read_text(encoding="utf-8"))
         self.assertIn("同期周报分析", self.ai_calls[-1])
         self.assertEqual(original, diary.read_bytes())
@@ -110,14 +138,18 @@ class AnalysisWorkflowTests(unittest.TestCase):
     def test_report_receives_explicitly_referenced_report_content(self):
         day = datetime.date(2026, 7, 14)
         diary, _ = self.write_diary(day.isoformat())
-        source = settings.ANALYSIS_DIR / "Weekly" / "2026-07-06_to_2026-07-12.md"
+        source = (
+            settings.ANALYSIS_DIR
+            / "Weekly"
+            / "2026-07-06_to_2026-07-12_manual.md"
+        )
         source.parent.mkdir(parents=True)
         source.write_text("被引用周报中的关键判断", encoding="utf-8")
         with diary.open("a", encoding="utf-8") as file:
             file.write(
                 "**11:00 [引用]:** "
                 "[分析周报 | 2026-07-06 至 2026-07-12]"
-                "(<../AnalysisReports/Weekly/2026-07-06_to_2026-07-12.md>)\n\n"
+                "(<../AnalysisReports/Weekly/2026-07-06_to_2026-07-12_manual.md>)\n\n"
                 "由此继续展开。\n\n"
             )
 
@@ -165,7 +197,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
         report_path = (
             settings.ANALYSIS_DIR
             / "Weekly"
-            / f"{week_start.isoformat()}_to_{week_end.isoformat()}.md"
+            / f"{week_start.isoformat()}_to_{week_end.isoformat()}_auto.md"
         )
         state = json.loads(
             (settings.ANALYSIS_DIR / ".automation-state.json").read_text(encoding="utf-8")
@@ -183,7 +215,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
         calls_after_first_run = len(self.ai_calls)
         analysis._run_monthly_reports(today, state, model)
 
-        report_path = settings.ANALYSIS_DIR / "Monthly" / "2026-07.md"
+        report_path = settings.ANALYSIS_DIR / "Monthly" / "2026-07_auto.md"
         self.assertTrue(report_path.exists())
         self.assertEqual("2026-07-31", state["last_month_end"])
         self.assertEqual(calls_after_first_run, len(self.ai_calls))
@@ -197,8 +229,12 @@ class AnalysisWorkflowTests(unittest.TestCase):
             datetime.date(2026, 8, 15), state, {"name": "mock"}
         )
 
-        self.assertTrue((settings.ANALYSIS_DIR / "Monthly" / "2026-06.md").exists())
-        self.assertTrue((settings.ANALYSIS_DIR / "Monthly" / "2026-07.md").exists())
+        self.assertTrue(
+            (settings.ANALYSIS_DIR / "Monthly" / "2026-06_auto.md").exists()
+        )
+        self.assertTrue(
+            (settings.ANALYSIS_DIR / "Monthly" / "2026-07_auto.md").exists()
+        )
         self.assertEqual("2026-07-31", state["last_month_end"])
 
     def test_failed_monthly_task_keeps_position_and_records_error(self):
@@ -216,13 +252,32 @@ class AnalysisWorkflowTests(unittest.TestCase):
         self.assertNotIn("last_month_end", state)
         self.assertIn("monthly_report", state["errors"])
 
-    def test_worker_checks_just_after_midnight_instead_of_waiting_an_hour(self):
-        now = datetime.datetime(2026, 7, 31, 23, 59, 30)
+    def test_installs_hourly_cron_task_for_one_shot_runner(self):
+        listed = Mock(returncode=0, stdout="15 2 * * * existing\n", stderr="")
+        installed = Mock(returncode=0, stdout="", stderr="")
+        with patch("analysis._is_windows", return_value=False), patch(
+            "analysis.subprocess.run", side_effect=[listed, installed]
+        ) as run:
+            success, _ = analysis.install_system_automation()
 
-        delay = analysis._next_automation_check_delay(now)
+        self.assertTrue(success)
+        cron_input = run.call_args_list[1].kwargs["input"]
+        self.assertIn("5 * * * *", cron_input)
+        self.assertIn("--run-automation", cron_input)
+        self.assertIn("# AgentRecord automation", cron_input)
 
-        self.assertEqual(35, delay)
+    def test_installs_windows_scheduled_task_for_one_shot_runner(self):
+        installed = Mock(returncode=0, stdout="", stderr="")
+        with patch("analysis._is_windows", return_value=True), patch(
+            "analysis.subprocess.run", return_value=installed
+        ) as run:
+            success, _ = analysis.install_system_automation()
 
+        self.assertTrue(success)
+        command = run.call_args.args[0]
+        self.assertEqual("schtasks", command[0])
+        self.assertIn("/TR", command)
+        self.assertIn("--run-automation", command[command.index("/TR") + 1])
 
 if __name__ == "__main__":
     unittest.main()

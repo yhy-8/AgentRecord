@@ -15,7 +15,14 @@ from rich.panel import Panel
 
 import journal
 import settings
-from analysis import generate_analysis_report, start_automation_worker, summarize_diary
+from analysis import (
+    analysis_report_path,
+    generate_analysis_report,
+    install_system_automation,
+    run_due_automatic_tasks,
+    summarize_diary,
+    uninstall_system_automation,
+)
 
 
 try:
@@ -37,6 +44,13 @@ except ImportError:
 
 
 console = Console()
+
+RECORD_MODE = "record"
+REPORT_MODE = "report"
+MODE_COMMANDS = {
+    RECORD_MODE: ("/h", "/mode", "/v", "/ref", "/d", "/c"),
+    REPORT_MODE: ("/h", "/mode", "/s", "/a", "/m"),
+}
 
 
 def _display_width(text: str) -> int:
@@ -187,18 +201,31 @@ def show_view_help() -> None:
     )
 
 
-def show_help() -> None:
-    console.print(
-        Panel(
-            "  [cyan]/h[/cyan]        → 显示此帮助\n"
-            "  [cyan]/m[/cyan]        → 切换到下一个模型\n"
+def show_help(mode: str = RECORD_MODE) -> None:
+    if mode == REPORT_MODE:
+        content = (
+            "  [cyan]/h[/cyan]        → 显示报告模式帮助\n"
+            "  [cyan]/mode[/cyan]     → 切换到记录模式\n"
+            "  [cyan]/s [日期][/cyan] → 生成日记顶部总结（空=今天）\n"
+            "  [cyan]/a [类型] [日期][/cyan] → 手动生成报告（daily/weekly/monthly）\n"
+            "  [cyan]/m[/cyan]        → 永久切换总结和报告使用的模型"
+        )
+        title = "[bold]报告模式[/bold]"
+    else:
+        content = (
+            "  普通文字      → 立即写入今日日记\n"
+            "  [cyan]/h[/cyan]        → 显示记录模式帮助\n"
+            "  [cyan]/mode[/cyan]     → 切换到报告模式\n"
             "  [cyan]/v [日期][/cyan] → 查看历史日记（[cyan]/v help[/cyan] 查看用法）\n"
             "  [cyan]/ref [类型] [筛选][/cyan] → 引用日记或分析报告并继续记录\n"
-            "  [cyan]/s [日期][/cyan] → 生成日记顶部总结（空=今天）\n"
-            "  [cyan]/a [类型] [日期][/cyan] → 生成分析报告（daily/weekly/monthly）\n"
-            "  [cyan]/c[/cyan]        → 清空当前窗口\n"
-            "  [cyan]/d[/cyan]        → 删除今日最后一条记录",
-            title="[bold]命令手册[/bold]",
+            "  [cyan]/d[/cyan]        → 删除今日最后一条记录\n"
+            "  [cyan]/c[/cyan]        → 清空当前窗口"
+        )
+        title = "[bold]记录模式[/bold]"
+    console.print(
+        Panel(
+            content,
+            title=title,
             border_style="cyan",
         )
     )
@@ -270,8 +297,18 @@ def _handle_analysis(user_input: str, model_config: settings.ModelDict) -> None:
         return
     anchor = datetime.datetime.strptime(date, "%Y-%m-%d").date()
     label = {"daily": "日报", "weekly": "周报", "monthly": "月报"}[kind]
+    target_path = analysis_report_path(kind, anchor, origin="manual")
+    if target_path and target_path.exists():
+        confirmation = safe_input(
+            f"该周期的手动{label}已存在，确认覆盖？[y/N] >> "
+        ).strip().lower()
+        if confirmation not in ("y", "yes", "是"):
+            console.print("[dim]已取消，原报告保持不变。[/dim]")
+            return
     console.print(f"[cyan][*][/cyan] 正在生成分析{label}...")
-    report, success, report_path = generate_analysis_report(kind, anchor, model_config)
+    report, success, report_path = generate_analysis_report(
+        kind, anchor, model_config, origin="manual"
+    )
     if success:
         console.print(Panel(report, title=f"[bold]分析{label}[/bold]", border_style="green"))
         console.print(f"[dim]报告已保存: {report_path}[/dim]")
@@ -339,20 +376,37 @@ def _handle_reference(user_input: str) -> None:
     console.print(f"[cyan][*][/cyan] 已引用: {label}")
 
 
+def _handle_process_action(arguments: list[str]) -> bool:
+    if "--run-automation" in arguments:
+        run_due_automatic_tasks()
+        return True
+    if "--install-automation" in arguments:
+        success, message = install_system_automation()
+        console.print(f"[{'green' if success else 'red'}]{message}[/]")
+        return True
+    if "--uninstall-automation" in arguments:
+        success, message = uninstall_system_automation()
+        console.print(f"[{'green' if success else 'red'}]{message}[/]")
+        return True
+    return False
+
+
+def _command_token(user_input: str) -> str:
+    return user_input.split(maxsplit=1)[0]
+
+
 def main() -> None:
+    if _handle_process_action(sys.argv[1:]):
+        return
     current_model = settings.ModelConfig.get_model()
+    mode = RECORD_MODE
     console.print(Panel.fit("[bold]AgentRecord 思维记录系统[/bold]", border_style="cyan"))
-    console.print(
-        f"  可用模型: [dim]{', '.join(model['name'] for model in settings.ModelConfig.models())}[/dim]"
-    )
-    show_help()
+    show_help(mode)
     console.print()
-    start_automation_worker()
 
     while True:
         try:
-            search_label = " SRCH" if current_model.get("search") else ""
-            raw_input = safe_input(f"[{current_model['name']}{search_label}] >> ")
+            raw_input = safe_input(">> ")
             submitted_at = datetime.datetime.now()
             user_input = raw_input.strip()
         except (KeyboardInterrupt, EOFError):
@@ -361,12 +415,46 @@ def main() -> None:
         if not user_input:
             continue
 
-        if user_input == "/h":
-            show_help()
-        elif user_input == "/m":
-            current_model = settings.ModelConfig.next_after(current_model["name"])
-            console.print(f"[cyan][*][/cyan] 模型已切换为: {current_model['name']}")
-        elif user_input == "/c":
+        command = _command_token(user_input)
+        if command == "/mode":
+            mode = REPORT_MODE if mode == RECORD_MODE else RECORD_MODE
+            show_help(mode)
+            continue
+        if command == "/h":
+            show_help(mode)
+            continue
+
+        allowed_commands = MODE_COMMANDS[mode]
+        known_commands = set(MODE_COMMANDS[RECORD_MODE] + MODE_COMMANDS[REPORT_MODE])
+        if command in known_commands and command not in allowed_commands:
+            target = "报告" if mode == RECORD_MODE else "记录"
+            console.print(f"[yellow][!][/yellow] 请先用 /mode 切换到{target}模式。")
+            continue
+
+        if mode == REPORT_MODE:
+            if command == "/m":
+                next_model = settings.ModelConfig.next_after(current_model["name"])
+                try:
+                    current_model = settings.ModelConfig.select(next_model["name"])
+                except OSError as error:
+                    console.print(f"[red][!][/red] 模型切换失败: {error}")
+                    continue
+                console.print(
+                    f"[cyan][*][/cyan] 模型已永久切换为: {current_model['name']}"
+                )
+            elif command == "/s" and (
+                user_input == "/s" or user_input.startswith("/s ")
+            ):
+                _handle_summary(user_input, current_model)
+            elif command == "/a" and (
+                user_input == "/a" or user_input.startswith("/a ")
+            ):
+                _handle_analysis(user_input, current_model)
+            else:
+                console.print("[yellow][!][/yellow] 报告模式只接受当前帮助中的命令。")
+            continue
+
+        if user_input == "/c":
             console.clear()
         elif user_input == "/d":
             if journal.delete_last_record():
@@ -377,10 +465,6 @@ def main() -> None:
             _handle_view(user_input)
         elif user_input == "/ref" or user_input.startswith("/ref "):
             _handle_reference(user_input)
-        elif user_input == "/s" or user_input.startswith("/s "):
-            _handle_summary(user_input, current_model)
-        elif user_input == "/a" or user_input.startswith("/a "):
-            _handle_analysis(user_input, current_model)
         else:
             journal.append_log(user_input, submitted_at=submitted_at)
 

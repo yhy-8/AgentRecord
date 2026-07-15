@@ -160,6 +160,14 @@ REFERENCE_KINDS = {
     "monthly": ("分析月报", lambda: settings.ANALYSIS_DIR / "Monthly"),
 }
 
+REPORT_STEM_PATTERNS = {
+    "daily": re.compile(r"^(\d{4}-\d{2}-\d{2})_(manual|auto)$"),
+    "weekly": re.compile(
+        r"^(\d{4}-\d{2}-\d{2})_to_(\d{4}-\d{2}-\d{2})_(manual|auto)$"
+    ),
+    "monthly": re.compile(r"^(\d{4}-\d{2})_(manual|auto)$"),
+}
+
 
 def list_reference_sources(
     kind: str, keyword: str = "", limit: int = 20
@@ -169,6 +177,9 @@ def list_reference_sources(
         return []
     type_label, directory_factory = REFERENCE_KINDS[kind]
     files = sorted(directory_factory().glob("*.md"), reverse=True)
+    if kind != "diary":
+        pattern = REPORT_STEM_PATTERNS[kind]
+        files = [path for path in files if pattern.fullmatch(path.stem)]
     if keyword:
         files = [path for path in files if keyword in path.stem]
     if limit > 0:
@@ -176,8 +187,18 @@ def list_reference_sources(
 
     sources = []
     for path in files:
-        period = path.stem.replace("_to_", " 至 ")
-        sources.append((f"{type_label} | {period}", path))
+        if kind == "diary":
+            period = path.stem
+            label = type_label
+        else:
+            match = REPORT_STEM_PATTERNS[kind].fullmatch(path.stem)
+            if not match:
+                continue
+            origin = match.groups()[-1]
+            period_parts = match.groups()[:-1]
+            period = " 至 ".join(period_parts)
+            label = f"{'手动' if origin == 'manual' else '自动'}{type_label}"
+        sources.append((f"{label} | {period}", path))
     return sources
 
 

@@ -7,9 +7,11 @@
 
 import datetime
 import json
+import os
 import re
-import threading
-import time
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 
 import journal
@@ -116,16 +118,39 @@ def _recent_summary_context(before: datetime.date, days: int = 30) -> str:
     return "\n\n".join(sections) or "（没有可用的历史总结）"
 
 
-def _analysis_report_path(kind: str, start: datetime.date, end: datetime.date) -> Path:
+def _analysis_report_path(
+    kind: str, start: datetime.date, end: datetime.date, origin: str
+) -> Path:
+    suffix = {"manual": "manual", "auto": "auto"}[origin]
     if kind == "daily":
-        return settings.ANALYSIS_DIR / "Daily" / f"{start:%Y-%m-%d}.md"
+        return settings.ANALYSIS_DIR / "Daily" / f"{start:%Y-%m-%d}_{suffix}.md"
     if kind == "weekly":
         return (
             settings.ANALYSIS_DIR
             / "Weekly"
-            / f"{start:%Y-%m-%d}_to_{end:%Y-%m-%d}.md"
+            / f"{start:%Y-%m-%d}_to_{end:%Y-%m-%d}_{suffix}.md"
         )
-    return settings.ANALYSIS_DIR / "Monthly" / f"{start:%Y-%m}.md"
+    return settings.ANALYSIS_DIR / "Monthly" / f"{start:%Y-%m}_{suffix}.md"
+
+
+def analysis_report_path(
+    kind: str, anchor: datetime.date, origin: str = "manual"
+) -> Path | None:
+    """返回报告确定路径，供生成前确认是否覆盖。"""
+    if origin not in ("manual", "auto"):
+        return None
+    if kind == "daily":
+        start = end = anchor
+    elif kind == "weekly":
+        start = anchor - datetime.timedelta(days=anchor.weekday())
+        end = start + datetime.timedelta(days=6)
+    elif kind == "monthly":
+        start = anchor.replace(day=1)
+        next_month = (start.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+        end = next_month - datetime.timedelta(days=1)
+    else:
+        return None
+    return _analysis_report_path(kind, start, end, origin)
 
 
 def _monthly_supporting_reports(start: datetime.date, end: datetime.date) -> str:
@@ -134,7 +159,8 @@ def _monthly_supporting_reports(start: datetime.date, end: datetime.date) -> str
     weekly_dir = settings.ANALYSIS_DIR / "Weekly"
     for path in sorted(weekly_dir.glob("*.md")):
         match = re.fullmatch(
-            r"(\d{4}-\d{2}-\d{2})_to_(\d{4}-\d{2}-\d{2})", path.stem
+            r"(\d{4}-\d{2}-\d{2})_to_(\d{4}-\d{2}-\d{2})_(?:manual|auto)",
+            path.stem,
         )
         if not match:
             continue
@@ -157,20 +183,27 @@ def generate_analysis_report(
     kind: str,
     anchor: datetime.date,
     model_config: settings.ModelDict,
+    *,
+    origin: str = "manual",
 ) -> tuple[str, bool, Path | None]:
     """生成日、周或月分析报告，并保存到独立目录。"""
+    if origin not in ("manual", "auto"):
+        return f"未知报告来源: {origin}", False, None
+    origin_label = "手动" if origin == "manual" else "自动"
     if kind == "daily":
         start = end = anchor
-        report_name = f"{anchor:%Y-%m-%d} 分析日报"
+        report_name = f"{anchor:%Y-%m-%d} {origin_label}分析日报"
     elif kind == "weekly":
         start = anchor - datetime.timedelta(days=anchor.weekday())
         end = start + datetime.timedelta(days=6)
-        report_name = f"{start:%Y-%m-%d} 至 {end:%Y-%m-%d} 分析周报"
+        report_name = (
+            f"{start:%Y-%m-%d} 至 {end:%Y-%m-%d} {origin_label}分析周报"
+        )
     elif kind == "monthly":
         start = anchor.replace(day=1)
         next_month = (start.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
         end = next_month - datetime.timedelta(days=1)
-        report_name = f"{start:%Y年%m月} 分析月报"
+        report_name = f"{start:%Y年%m月} {origin_label}分析月报"
     else:
         return f"未知报告类型: {kind}", False, None
 
@@ -226,11 +259,12 @@ def generate_analysis_report(
     if not success:
         return report, False, None
 
-    report_path = _analysis_report_path(kind, start, end)
+    report_path = _analysis_report_path(kind, start, end, origin)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     title = f"# {report_name}\n\n"
     metadata = (
         f"> 生成时间：{datetime.datetime.now():%Y-%m-%d %H:%M}\n"
+        f"> 生成方式：{origin_label}\n"
         f"> 原始日记范围：{start:%Y-%m-%d} 至 {end:%Y-%m-%d}\n\n"
     )
     temp_path = report_path.with_suffix(report_path.suffix + ".tmp")
@@ -259,17 +293,8 @@ def _save_automation_state(state: dict) -> None:
     temp_path.replace(state_path)
 
 
-_AUTOMATION_LOCK = threading.Lock()
-
-
 def _automation_model() -> settings.ModelDict:
-    automation = settings.CONFIG.get("automation", {})
-    model_name = automation.get("model")
-    return (
-        settings.ModelConfig.get_model(model_name)
-        if model_name
-        else settings.ModelConfig.get_model()
-    )
+    return settings.ModelConfig.get_model()
 
 
 def _set_task_error(state: dict, task: str, message: str) -> None:
@@ -285,14 +310,34 @@ def _clear_task_error(state: dict, task: str) -> None:
         state.pop("errors", None)
 
 
+def _acquire_automation_lock() -> Path | None:
+    """用跨进程锁避免系统调度任务重叠写入状态或报告。"""
+    settings.ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = settings.ANALYSIS_DIR / ".automation.lock"
+    try:
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            age = datetime.datetime.now().timestamp() - lock_path.stat().st_mtime
+            if age <= 6 * 60 * 60:
+                return None
+            lock_path.unlink()
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except (FileNotFoundError, FileExistsError, OSError):
+            return None
+    with os.fdopen(descriptor, "w", encoding="utf-8") as lock_file:
+        lock_file.write(str(os.getpid()))
+    return lock_path
+
+
 def run_due_automatic_tasks() -> None:
     """补做日总结，并生成已经闭合的自然周周报和自然月月报。"""
     automation = settings.CONFIG.get("automation", {})
     if not automation.get("enabled", True):
         return
-    if not _AUTOMATION_LOCK.acquire(blocking=False):
+    lock_path = _acquire_automation_lock()
+    if lock_path is None:
         return
-
     try:
         model_config = _automation_model()
         state = _load_automation_state()
@@ -341,7 +386,10 @@ def run_due_automatic_tasks() -> None:
         _set_task_error(state, "scheduler", f"自动任务异常: {error}")
         _save_automation_state(state)
     finally:
-        _AUTOMATION_LOCK.release()
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _run_weekly_reports(
@@ -367,7 +415,7 @@ def _run_weekly_reports(
         logs = _existing_logs(current_week_start, current_week_end)
         if logs:
             _, success, _ = generate_analysis_report(
-                "weekly", current_week_start, model_config
+                "weekly", current_week_start, model_config, origin="auto"
             )
         else:
             success = True
@@ -412,7 +460,7 @@ def _run_monthly_reports(
         logs = _existing_logs(current_month_start, current_month_end)
         if logs:
             _, success, _ = generate_analysis_report(
-                "monthly", current_month_start, model_config
+                "monthly", current_month_start, model_config, origin="auto"
             )
         else:
             success = True
@@ -431,25 +479,101 @@ def _run_monthly_reports(
             break
 
 
-def _automation_worker() -> None:
-    while True:
-        run_due_automatic_tasks()
-        now = datetime.datetime.now()
-        time.sleep(_next_automation_check_delay(now))
+_CRON_MARKER = "# AgentRecord automation"
+_WINDOWS_TASK_NAME = "AgentRecord Automation"
 
 
-def _next_automation_check_delay(now: datetime.datetime) -> float:
-    next_midnight = datetime.datetime.combine(
-        now.date() + datetime.timedelta(days=1), datetime.time.min
-    )
-    seconds_to_midnight = (next_midnight - now).total_seconds() + 5
-    return min(3600, max(1, seconds_to_midnight))
+def _automation_command() -> list[str]:
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--run-automation"]
+    return [sys.executable, str(Path(__file__).with_name("main.py")), "--run-automation"]
 
 
-def start_automation_worker() -> None:
-    if settings.CONFIG.get("automation", {}).get("enabled", True):
-        threading.Thread(
-            target=_automation_worker,
-            name="agentrecord-automation",
-            daemon=True,
-        ).start()
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def install_system_automation() -> tuple[bool, str]:
+    """安装每小时运行的用户级系统任务；不要求交互程序保持开启。"""
+    try:
+        command = _automation_command()
+        if _is_windows():
+            result = subprocess.run(
+                [
+                    "schtasks",
+                    "/Create",
+                    "/TN",
+                    _WINDOWS_TASK_NAME,
+                    "/SC",
+                    "HOURLY",
+                    "/MO",
+                    "1",
+                    "/TR",
+                    subprocess.list2cmdline(command),
+                    "/F",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        else:
+            current = subprocess.run(
+                ["crontab", "-l"], capture_output=True, text=True, timeout=30
+            )
+            if current.returncode not in (0, 1):
+                return False, current.stderr.strip() or "无法读取当前 crontab。"
+            lines = [
+                line
+                for line in current.stdout.splitlines()
+                if _CRON_MARKER not in line
+            ]
+            lines.append(f"5 * * * * {shlex.join(command)} {_CRON_MARKER}")
+            result = subprocess.run(
+                ["crontab", "-"],
+                input="\n".join(lines) + "\n",
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        if result.returncode != 0:
+            return False, result.stderr.strip() or result.stdout.strip() or "安装失败。"
+        return True, "系统后台任务已安装，每小时第 5 分钟检查到期任务。"
+    except (OSError, subprocess.SubprocessError) as error:
+        return False, f"安装系统后台任务失败: {error}"
+
+
+def uninstall_system_automation() -> tuple[bool, str]:
+    """卸载由 AgentRecord 创建的用户级系统任务。"""
+    try:
+        if _is_windows():
+            result = subprocess.run(
+                ["schtasks", "/Delete", "/TN", _WINDOWS_TASK_NAME, "/F"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        else:
+            current = subprocess.run(
+                ["crontab", "-l"], capture_output=True, text=True, timeout=30
+            )
+            if current.returncode == 1:
+                return True, "系统后台任务未安装。"
+            if current.returncode != 0:
+                return False, current.stderr.strip() or "无法读取当前 crontab。"
+            lines = [
+                line
+                for line in current.stdout.splitlines()
+                if _CRON_MARKER not in line
+            ]
+            result = subprocess.run(
+                ["crontab", "-"],
+                input=("\n".join(lines) + "\n") if lines else "",
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        if result.returncode != 0:
+            return False, result.stderr.strip() or result.stdout.strip() or "卸载失败。"
+        return True, "系统后台任务已卸载。"
+    except (OSError, subprocess.SubprocessError) as error:
+        return False, f"卸载系统后台任务失败: {error}"

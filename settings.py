@@ -3,6 +3,8 @@
 该模块只负责运行配置，不包含日记、模型请求或分析业务。
 """
 
+import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -31,8 +33,16 @@ def _load_config() -> dict:
 
 
 CONFIG = _load_config()
-DIARY_DIR = Path(CONFIG.get("diary_dir", "./AgentRecords"))
-ANALYSIS_DIR = Path(CONFIG.get("analysis_dir", "./AnalysisReports"))
+CONFIG_DIR = _get_config_path().parent
+
+
+def _configured_path(key: str, default: str) -> Path:
+    path = Path(CONFIG.get(key, default))
+    return path if path.is_absolute() else CONFIG_DIR / path
+
+
+DIARY_DIR = _configured_path("diary_dir", "./AgentRecords")
+ANALYSIS_DIR = _configured_path("analysis_dir", "./AnalysisReports")
 DIARY_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -49,7 +59,9 @@ class ModelConfig:
         if not models:
             raise RuntimeError("config.yaml 中未配置任何模型")
         if name_or_index is None:
-            return models[0]
+            name_or_index = CONFIG.get("current_model")
+            if not name_or_index:
+                return models[0]
         if isinstance(name_or_index, int):
             return models[name_or_index % len(models)]
 
@@ -74,3 +86,23 @@ class ModelConfig:
         models = cls.models()
         index = cls.index_of(name)
         return models[(index + 1) % len(models)]
+
+    @classmethod
+    def select(cls, name: str) -> ModelDict:
+        """持久化统一模型选择，同时保留配置文件中的注释与原有排版。"""
+        model = cls.get_model(name)
+        config_path = _get_config_path()
+        content = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+        selected_line = f"current_model: {json.dumps(model['name'], ensure_ascii=False)}"
+        pattern = re.compile(r"^current_model\s*:.*$", re.MULTILINE)
+        if pattern.search(content):
+            updated = pattern.sub(selected_line, content, count=1)
+        else:
+            separator = "" if not content or content.endswith("\n") else "\n"
+            updated = f"{content}{separator}{selected_line}\n"
+
+        temp_path = config_path.with_suffix(config_path.suffix + ".tmp")
+        temp_path.write_text(updated, encoding="utf-8")
+        temp_path.replace(config_path)
+        CONFIG["current_model"] = model["name"]
+        return model
