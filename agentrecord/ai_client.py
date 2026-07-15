@@ -6,12 +6,11 @@
 
 import datetime
 import json
-from typing import Any
+from typing import Any, Collection
 
 import requests
 
-import journal
-import settings
+from . import journal, settings
 
 
 def _build_system_prompt() -> str:
@@ -184,17 +183,29 @@ def execute_tool(function_name: str, arguments: dict) -> tuple[str, int]:
     return f"未知工具: {function_name}", 0
 
 
-def call_ai(prompt: str, model_config: settings.ModelDict) -> tuple[str, bool, int, dict[str, int], int]:
-    """调用 OpenAI 兼容接口并完成最多五轮本地工具循环。"""
+def call_ai(
+    prompt: str,
+    model_config: settings.ModelDict,
+    *,
+    allowed_tools: Collection[str] | None = None,
+) -> tuple[str, bool, int, dict[str, int], int]:
+    """调用 OpenAI 兼容接口，并只开放中控授权的工具。"""
     messages = [
         {"role": "system", "content": _build_system_prompt()},
         {"role": "user", "content": prompt},
     ]
-    tools = list(TOOLS)
+    tools = [
+        tool
+        for tool in TOOLS
+        if allowed_tools is None
+        or tool["function"]["name"] in allowed_tools
+    ]
     third_search = settings.CONFIG.get("third_search", {})
     native_search = model_config.get("search", False)
+    web_allowed = allowed_tools is None or "web_search" in allowed_tools
     use_third_search = (
-        not native_search
+        web_allowed
+        and not native_search
         and third_search.get("enabled", False)
         and third_search.get("api_key", "")
     )
@@ -204,21 +215,24 @@ def call_ai(prompt: str, model_config: settings.ModelDict) -> tuple[str, bool, i
     payload: dict[str, Any] = {
         "model": model_config.get("model_id") or model_config["name"],
         "messages": messages,
-        "tools": tools,
-        "tool_choice": "auto",
     }
-    if native_search:
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+    if native_search and web_allowed:
         model_name = (model_config.get("model_id") or model_config["name"]).lower()
         if "glm" in model_name:
-            payload["tools"] = payload["tools"] + [
+            payload["tools"] = payload.get("tools", []) + [
                 {"type": "web_search", "web_search": {"enable": True}}
             ]
         elif "moonshot" in model_name or "kimi" in model_name:
-            payload["tools"] = payload["tools"] + [
+            payload["tools"] = payload.get("tools", []) + [
                 {"type": "builtin_function", "function": {"name": "$web_search"}}
             ]
         else:
             payload["web_search"] = True
+        if payload.get("tools"):
+            payload["tool_choice"] = "auto"
 
     headers = {
         "Authorization": f"Bearer {model_config['api_key']}",

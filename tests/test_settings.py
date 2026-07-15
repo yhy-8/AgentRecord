@@ -3,10 +3,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import settings
+from agentrecord import settings
 
 
 class ModelSettingsTests(unittest.TestCase):
+    def test_source_config_remains_at_project_root(self):
+        self.assertEqual(
+            Path(settings.__file__).resolve().parent.parent / "config.yaml",
+            settings._get_config_path(),
+        )
+
     def test_selected_model_is_persisted_without_rewriting_config(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.yaml"
@@ -24,7 +30,7 @@ class ModelSettingsTests(unittest.TestCase):
                 "models": [{"name": "first"}, {"name": "second"}],
             }
             try:
-                with patch("settings._get_config_path", return_value=config_path):
+                with patch("agentrecord.settings._get_config_path", return_value=config_path):
                     selected = settings.ModelConfig.select("second")
             finally:
                 settings.CONFIG = original_config

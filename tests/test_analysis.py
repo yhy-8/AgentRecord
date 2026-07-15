@@ -1,13 +1,14 @@
 import datetime
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-import analysis
-import journal
-import settings
+from agentrecord import journal, settings
+from agentrecord.analysis import automation, context, orchestrator
+from agentrecord.analysis.store import AnalysisStore
 
 
 class AnalysisWorkflowTests(unittest.TestCase):
@@ -16,7 +17,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
         root = Path(self.temp_dir.name)
         self.original_diary_dir = settings.DIARY_DIR
         self.original_analysis_dir = settings.ANALYSIS_DIR
-        self.original_call_ai = analysis.call_ai
+        self.original_call_ai = orchestrator.call_ai
         self.original_automation = settings.CONFIG.get("automation")
 
         settings.DIARY_DIR = root / "Records"
@@ -24,11 +25,117 @@ class AnalysisWorkflowTests(unittest.TestCase):
         settings.DIARY_DIR.mkdir()
         self.ai_calls = []
 
-        def fake_call_ai(prompt, model_cfg):
+        def fake_call_ai(prompt, model_cfg, *, allowed_tools=None):
             self.ai_calls.append(prompt)
-            return "测试生成内容", True, 0, {}, 0
+            if "[程序 Agent 任务:" not in prompt:
+                return "测试生成内容", True, 0, {}, 0
 
-        analysis.call_ai = fake_call_ai
+            input_text = prompt.split("【中控提供的输入 JSON】\n", 1)[1]
+            input_text = input_text.split("\n\n只输出一个符合契约", 1)[0]
+            data = json.loads(input_text)
+            if "[程序 Agent 任务:extractor]" in prompt:
+                record = data["records"][0]
+                payload = {
+                    "nodes": [
+                        {
+                            "temp_id": "e1",
+                            "node_type": "evidence",
+                            "title": "测试证据",
+                            "body": record["text"],
+                            "confidence": 0.9,
+                            "source_refs": [record["source_id"]],
+                            "metadata": {"kind": "idea", "speaker": record["speaker"]},
+                        }
+                    ]
+                }
+            elif "[程序 Agent 任务:cluster]" in prompt:
+                evidence = data["nodes"][0]
+                payload = {
+                    "nodes": [
+                        {
+                            "temp_id": "t1",
+                            "node_type": "theme",
+                            "title": "测试主题",
+                            "body": "测试主题正在形成。",
+                            "confidence": 0.8,
+                            "source_refs": evidence["source_refs"],
+                            "metadata": {"trajectory": "new"},
+                        }
+                    ],
+                    "edges": [
+                        {
+                            "source_id": evidence["id"],
+                            "target_id": "t1",
+                            "relation_type": "member_of",
+                            "weight": 0.8,
+                            "confidence": 0.8,
+                            "rationale": "证据属于该主题",
+                        }
+                    ],
+                }
+            elif "[程序 Agent 任务:explorer]" in prompt:
+                evidence = next(
+                    node for node in data["nodes"] if node["node_type"] == "evidence"
+                )
+                payload = {
+                    "nodes": [
+                        {
+                            "temp_id": "i1",
+                            "node_type": "insight",
+                            "title": "测试洞见",
+                            "body": "材料中出现了值得继续判断的方向。",
+                            "confidence": 0.8,
+                            "source_refs": evidence["source_refs"],
+                            "metadata": {
+                                "insight_type": "connection",
+                                "evidence_for": [evidence["id"]],
+                                "evidence_against": [],
+                                "inference_level": "low",
+                                "why_it_matters": "用于验证报告流程",
+                                "research_needed": False,
+                            },
+                        }
+                    ],
+                    "edges": [
+                        {
+                            "source_id": evidence["id"],
+                            "target_id": "i1",
+                            "relation_type": "supports",
+                            "weight": 0.8,
+                            "confidence": 0.8,
+                            "rationale": "原始证据支持洞见",
+                        }
+                    ],
+                    "research_queries": [],
+                }
+            elif "[程序 Agent 任务:report]" in prompt:
+                source_id = data["source_ids"][0]
+                payload = {
+                    "markdown": f"## 核心发现\n\n测试生成内容 [{source_id}]"
+                }
+            elif data.get("mode") == "candidate_review":
+                payload = {
+                    "decisions": [
+                        {
+                            "node_id": node["id"],
+                            "status": "accepted",
+                            "reason": "测试接受",
+                            "confidence": 0.9,
+                        }
+                        for node in data["candidate_nodes"]
+                    ],
+                    "revision_guidance": "",
+                }
+            else:
+                payload = {
+                    "pass": True,
+                    "unsupported_claims": [],
+                    "required_changes": [],
+                    "summary": "通过",
+                }
+            return json.dumps(payload, ensure_ascii=False), True, 0, {}, 0
+
+        orchestrator.call_ai = fake_call_ai
         settings.CONFIG["automation"] = {
             "enabled": True,
             "daily_summary": True,
@@ -39,7 +146,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
     def tearDown(self):
         settings.DIARY_DIR = self.original_diary_dir
         settings.ANALYSIS_DIR = self.original_analysis_dir
-        analysis.call_ai = self.original_call_ai
+        orchestrator.call_ai = self.original_call_ai
         if self.original_automation is None:
             settings.CONFIG.pop("automation", None)
         else:
@@ -64,7 +171,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
         date = "2026-07-14"
         diary, raw_stream = self.write_diary(date)
 
-        summary, success = analysis.summarize_diary(date, {"name": "mock"})
+        summary, success = orchestrator.summarize_diary(date, {"name": "mock"})
 
         self.assertTrue(success)
         self.assertEqual("测试生成内容", summary)
@@ -78,27 +185,58 @@ class AnalysisWorkflowTests(unittest.TestCase):
         diary, _ = self.write_diary(day.isoformat())
         original = diary.read_bytes()
 
-        report, success, report_path = analysis.generate_analysis_report(
+        report, success, report_path = orchestrator.generate_analysis_report(
             "daily", day, {"name": "mock"}
         )
 
         self.assertTrue(success)
-        self.assertEqual("测试生成内容", report)
-        self.assertIn("[程序分析报告任务]", self.ai_calls[-1])
+        self.assertIn("测试生成内容", report)
+        self.assertTrue(
+            any("[程序 Agent 任务:extractor]" in prompt for prompt in self.ai_calls)
+        )
+        self.assertTrue(
+            any("[程序 Agent 任务:report]" in prompt for prompt in self.ai_calls)
+        )
         self.assertEqual(original, diary.read_bytes())
         self.assertEqual(
             settings.ANALYSIS_DIR / "Daily" / "2026-07-14_manual.md", report_path
         )
         self.assertTrue(report_path.exists())
+        run_id = re.search(
+            r"分析运行：([0-9a-f]+)", report_path.read_text(encoding="utf-8")
+        ).group(1)
+        store = AnalysisStore(settings.ANALYSIS_DIR / ".analysis.sqlite3")
+        self.assertEqual("completed", store.run_record(run_id)["status"])
+        self.assertTrue(store.nodes_for_run(run_id, statuses=("accepted",)))
+        self.assertEqual("R-20260714-001", store.sources_for_run(run_id)[0]["source_id"])
+
+    def test_failed_pipeline_does_not_overwrite_existing_report(self):
+        day = datetime.date(2026, 7, 14)
+        self.write_diary(day.isoformat())
+        report_path = settings.ANALYSIS_DIR / "Daily" / "2026-07-14_manual.md"
+        report_path.parent.mkdir(parents=True)
+        report_path.write_text("已有报告", encoding="utf-8")
+
+        def failed_call_ai(prompt, model_cfg, *, allowed_tools=None):
+            return "模型失败", False, 0, {}, 0
+
+        orchestrator.call_ai = failed_call_ai
+        _, success, returned_path = orchestrator.generate_analysis_report(
+            "daily", day, {"name": "mock"}
+        )
+
+        self.assertFalse(success)
+        self.assertIsNone(returned_path)
+        self.assertEqual("已有报告", report_path.read_text(encoding="utf-8"))
 
     def test_manual_and_automatic_reports_have_separate_fixed_paths(self):
         day = datetime.date(2026, 7, 14)
         self.write_diary(day.isoformat())
 
-        _, manual_success, manual_path = analysis.generate_analysis_report(
+        _, manual_success, manual_path = orchestrator.generate_analysis_report(
             "weekly", day, {"name": "mock"}, origin="manual"
         )
-        _, auto_success, auto_path = analysis.generate_analysis_report(
+        _, auto_success, auto_path = orchestrator.generate_analysis_report(
             "weekly", day, {"name": "mock"}, origin="auto"
         )
 
@@ -119,7 +257,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
         weekly.parent.mkdir(parents=True)
         weekly.write_text("同期周报分析", encoding="utf-8")
 
-        _, success, report_path = analysis.generate_analysis_report(
+        _, success, report_path = orchestrator.generate_analysis_report(
             "monthly", day, {"name": "mock"}
         )
 
@@ -132,7 +270,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
             report_path.read_text(encoding="utf-8"),
         )
         self.assertIn("原始日记范围：2026-07-01 至 2026-07-31", report_path.read_text(encoding="utf-8"))
-        self.assertIn("同期周报分析", self.ai_calls[-1])
+        self.assertTrue(any("同期周报分析" in prompt for prompt in self.ai_calls))
         self.assertEqual(original, diary.read_bytes())
 
     def test_report_receives_explicitly_referenced_report_content(self):
@@ -153,25 +291,26 @@ class AnalysisWorkflowTests(unittest.TestCase):
                 "由此继续展开。\n\n"
             )
 
-        analysis.generate_analysis_report("daily", day, {"name": "mock"})
+        orchestrator.generate_analysis_report("daily", day, {"name": "mock"})
 
-        self.assertIn("【本周期显式引用的来源】", self.ai_calls[-1])
-        self.assertIn("被引用周报中的关键判断", self.ai_calls[-1])
+        self.assertTrue(
+            any("被引用周报中的关键判断" in prompt for prompt in self.ai_calls)
+        )
 
     def test_reference_context_rejects_paths_outside_data_directories(self):
         outside = Path(self.temp_dir.name) / "outside.md"
         outside.write_text("不应读取的内容", encoding="utf-8")
         logs = [("2026-07-14", "**11:00 [引用]:** [外部](<../outside.md>)")]
 
-        context = analysis._referenced_source_context(logs)
+        referenced = context._referenced_source_context(logs)
 
-        self.assertNotIn("不应读取的内容", context)
+        self.assertNotIn("不应读取的内容", referenced)
 
     def test_automatic_tasks_process_yesterday_and_record_state(self):
         yesterday = datetime.date.today() - datetime.timedelta(days=1)
         diary, raw_stream = self.write_diary(yesterday.isoformat())
 
-        analysis.run_due_automatic_tasks()
+        automation.run_due_automatic_tasks()
 
         state_path = settings.ANALYSIS_DIR / ".automation-state.json"
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -192,7 +331,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
             "monthly_report": False,
         }
 
-        analysis.run_due_automatic_tasks()
+        automation.run_due_automatic_tasks()
 
         report_path = (
             settings.ANALYSIS_DIR
@@ -211,9 +350,9 @@ class AnalysisWorkflowTests(unittest.TestCase):
         state = {}
         model = {"name": "mock"}
 
-        analysis._run_monthly_reports(today, state, model)
+        automation._run_monthly_reports(today, state, model)
         calls_after_first_run = len(self.ai_calls)
-        analysis._run_monthly_reports(today, state, model)
+        automation._run_monthly_reports(today, state, model)
 
         report_path = settings.ANALYSIS_DIR / "Monthly" / "2026-07_auto.md"
         self.assertTrue(report_path.exists())
@@ -225,7 +364,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
         self.write_diary("2026-07-10")
         state = {"last_month_end": "2026-05-31"}
 
-        analysis._run_monthly_reports(
+        automation._run_monthly_reports(
             datetime.date(2026, 8, 15), state, {"name": "mock"}
         )
 
@@ -240,12 +379,12 @@ class AnalysisWorkflowTests(unittest.TestCase):
     def test_failed_monthly_task_keeps_position_and_records_error(self):
         self.write_diary("2026-07-10")
 
-        def failed_call_ai(prompt, model_cfg):
+        def failed_call_ai(prompt, model_cfg, *, allowed_tools=None):
             return "失败", False, 0, {}, 0
 
-        analysis.call_ai = failed_call_ai
+        orchestrator.call_ai = failed_call_ai
         state = {}
-        analysis._run_monthly_reports(
+        automation._run_monthly_reports(
             datetime.date(2026, 8, 1), state, {"name": "mock"}
         )
 
@@ -255,10 +394,10 @@ class AnalysisWorkflowTests(unittest.TestCase):
     def test_installs_hourly_cron_task_for_one_shot_runner(self):
         listed = Mock(returncode=0, stdout="15 2 * * * existing\n", stderr="")
         installed = Mock(returncode=0, stdout="", stderr="")
-        with patch("analysis._is_windows", return_value=False), patch(
-            "analysis.subprocess.run", side_effect=[listed, installed]
+        with patch("agentrecord.analysis.automation._is_windows", return_value=False), patch(
+            "agentrecord.analysis.automation.subprocess.run", side_effect=[listed, installed]
         ) as run:
-            success, _ = analysis.install_system_automation()
+            success, _ = automation.install_system_automation()
 
         self.assertTrue(success)
         cron_input = run.call_args_list[1].kwargs["input"]
@@ -267,12 +406,19 @@ class AnalysisWorkflowTests(unittest.TestCase):
         self.assertIn("--run-automation", cron_input)
         self.assertIn("# AgentRecord automation", cron_input)
 
+    def test_source_automation_command_uses_root_entry(self):
+        with patch.object(automation.sys, "frozen", False, create=True):
+            command = automation._automation_command()
+
+        self.assertEqual(settings.CONFIG_DIR / "main.py", Path(command[1]))
+        self.assertEqual("--run-automation", command[2])
+
     def test_installs_windows_scheduled_task_for_one_shot_runner(self):
         installed = Mock(returncode=0, stdout="", stderr="")
-        with patch("analysis._is_windows", return_value=True), patch(
-            "analysis.subprocess.run", return_value=installed
+        with patch("agentrecord.analysis.automation._is_windows", return_value=True), patch(
+            "agentrecord.analysis.automation.subprocess.run", return_value=installed
         ) as run:
-            success, _ = analysis.install_system_automation()
+            success, _ = automation.install_system_automation()
 
         self.assertTrue(success)
         self.assertEqual(2, run.call_count)

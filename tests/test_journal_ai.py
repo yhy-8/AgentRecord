@@ -3,8 +3,7 @@
 import unittest
 from unittest.mock import patch
 
-import ai_client
-import settings
+from agentrecord import ai_client, settings
 
 
 class FakeResponse:
@@ -39,7 +38,7 @@ class JournalAITests(unittest.TestCase):
         else:
             settings.CONFIG["third_search"] = self.original_third_search
 
-    @patch("ai_client.requests.post")
+    @patch("agentrecord.ai_client.requests.post")
     def test_returns_complete_openai_compatible_response(self, post):
         post.return_value = FakeResponse(
             {"choices": [{"message": {"role": "assistant", "content": "最终回答"}}]}
@@ -56,8 +55,24 @@ class JournalAITests(unittest.TestCase):
         self.assertEqual("test-model-id", payload["model"])
         self.assertNotIn("web_search", payload)
 
-    @patch("ai_client.execute_tool")
-    @patch("ai_client.requests.post")
+    @patch("agentrecord.ai_client.requests.post")
+    def test_central_permission_can_remove_all_tools(self, post):
+        post.return_value = FakeResponse(
+            {"choices": [{"message": {"role": "assistant", "content": "JSON"}}]}
+        )
+
+        answer, success, _, _, _ = ai_client.call_ai(
+            "结构化任务", self.model, allowed_tools=frozenset()
+        )
+
+        self.assertTrue(success)
+        self.assertEqual("JSON", answer)
+        payload = post.call_args.kwargs["json"]
+        self.assertNotIn("tools", payload)
+        self.assertNotIn("tool_choice", payload)
+
+    @patch("agentrecord.ai_client.execute_tool")
+    @patch("agentrecord.ai_client.requests.post")
     def test_executes_tool_call_then_requests_final_answer(self, post, execute_tool):
         post.side_effect = [
             FakeResponse(

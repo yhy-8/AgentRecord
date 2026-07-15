@@ -21,13 +21,17 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
       - name: Build executable
         run: |
-          pyinstaller --onefile --clean --name AgentRecord --hidden-import=yaml --add-data "config.yaml;." --exclude-module termios --exclude-module tty main.py
+          pyinstaller --onefile --clean --name AgentRecord --hidden-import=yaml --exclude-module termios --exclude-module tty main.py
+          Copy-Item config.yaml dist\config.yaml
           dir dist\
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: AgentRecord-windows
-          path: dist/AgentRecord.exe
+          path: dist/

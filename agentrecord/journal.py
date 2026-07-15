@@ -9,7 +9,7 @@ import os
 import re
 from pathlib import Path
 
-import settings
+from . import settings
 
 
 def resolve_date(arg: str) -> str:

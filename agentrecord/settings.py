@@ -20,7 +20,7 @@ def _get_config_path() -> Path:
     if getattr(sys, "frozen", False):
         base = Path(sys.executable).parent
     else:
-        base = Path(__file__).parent
+        base = Path(__file__).resolve().parent.parent
     return base / "config.yaml"
 
 

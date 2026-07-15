@@ -2,7 +2,7 @@
 
 想写什么就写什么——日常、计划、经历、观点、判断、问题或一闪而过的念头。AgentRecord 不要求用户先分类，也不把记录过程变成与 AI 对话。它与写在纸上的核心区别是：每条内容都以统一格式带时间保存，可以通过同样稳定的格式引用过去的日记和报告；当一天、一周、一个月结束后，Agent 在后台整理已经积累的材料，寻找关联、变化、矛盾、盲点和新的探索方向，并交付可以独立阅读的总结或报告。
 
-用户负责自由记录与最终判断，Agent 负责在记录之后收集上下文、展开分析和汇报。这个“低摩擦记录 → 可追溯引用 → 周期性探索分析”的循环，就是 AgentRecord 的核心。
+用户负责自由记录与最终判断，Agent 负责在记录之后收集上下文、展开分析和汇报。分析由 Extractor、Cluster、Explorer、World、Reviewer 和 Report 六类职责明确的 Agent 完成；中控统一提供最小上下文和工具权限，Agent 不能直接修改日记、数据库或报告文件。这个“低摩擦记录 → 可追溯引用 → 可迭代分析 → 周期报告”的循环，就是 AgentRecord 的核心。
 
 项目不提供 `@AI` 即时聊天。AI 的价值集中在记录之后的分析，而不是回答随手可在其他 AI 产品中提出的常识问题。完整的数据边界和架构基线见 [DESIGN.md](./DESIGN.md)。
 
@@ -14,6 +14,12 @@ Linux 或其他类 Unix 环境直接运行 Python：
 
 ```bash
 python main.py
+```
+
+也可以通过包入口启动：
+
+```bash
+python -m agentrecord
 ```
 
 Windows 用户运行打包后的程序：
@@ -166,8 +172,11 @@ Copy-Item config.yaml dist\config.yaml
   └─ 立即成为带日期和时间的 Markdown 原始记录
        ├─ /ref 显式引用过去的日记或报告
        ├─ 自然日闭合：生成前一日总结
-       ├─ 自然周闭合：生成上一完整周的分析周报
-       └─ 自然月闭合：生成上一完整月的分析月报
+       └─ 周期报告
+            ├─ 提取证据、聚合主题和探索候选洞见
+            ├─ 必要时核查外部事实和反例
+            ├─ 审查后保存节点与关系到 SQLite
+            └─ 报告草稿再次审查后原子保存
 ```
 
 - 普通输入立即落盘；模型、网络或自动任务失败不会影响记录。
@@ -177,6 +186,8 @@ Copy-Item config.yaml dist\config.yaml
 - 引用带来源类型、周期、相对链接和引用时刻，来源文件保持不变。
 - 日报只作为手动下钻能力；自动流程默认生成日总结、周报和月报。
 - 手动与自动报告分开保存，同一周期各自只保留一份。
+- Agent 的运行记录、中间产物、候选/接受/拒绝节点和关系保存在 `AnalysisReports/.analysis.sqlite3`。同一周期重跑可以复用已接受内容；修订通过新版本替代旧版本，不静默覆盖历史判断。
+- SQLite 是本地派生分析知识层，不替代 `Records/` 中的 Markdown 原始记录。不要在程序运行时手工删除数据库、WAL 或 SHM 文件。
 
 ## 后台任务细节
 
@@ -200,20 +211,32 @@ Copy-Item config.yaml dist\config.yaml
 
 自动任务使用 `_auto.md` 固定路径，手动任务使用 `_manual.md` 固定路径，因此两者互不覆盖。月报会综合当月原始记录、显式引用、月前 30 天的日记总结，以及与当月相交的已有周报。
 
-未来增加每日信息获取、分析和整合 Agent 时，仍应接入同一个一次性后台调度入口：系统按时唤醒，完成到期工作并保存进度，然后退出。这样后台分析的模型或网络失败不会影响用户打开应用记录内容。
+六类分析 Agent 接入同一个一次性后台调度入口：系统按时唤醒，中控按权限完成到期工作、保存 SQLite 运行状态，然后退出。这样任何 Agent 的模型、网络或审查失败都不会影响用户打开应用记录内容，也不会覆盖已存在的报告。
 
 ## 文件布局
 
 ```text
-main.py        唯一入口、终端输入和命令映射
-settings.py    配置、目录和模型选择
-journal.py     原始日记读写、日期解析和引用
-ai_client.py   OpenAI 兼容请求、只读工具循环和联网搜索
-analysis.py    总结、报告和自动任务；项目的分析编排核心
+main.py                         极薄的脚本与 PyInstaller 入口
+agentrecord/
+  settings.py                  配置、目录和模型选择
+  journal.py                   原始日记唯一读写边界
+  ai_client.py                 OpenAI 兼容请求和授权工具循环
+  cli/
+    entry.py                   进程参数和 Windows 后台入口
+    terminal.py                跨平台终端输入和 Rich 展示
+    commands.py                记录/报告命令
+    app.py                     交互主循环
+  analysis/
+    context.py                 周期输入、引用和历史上下文
+    orchestrator.py            总结与多 Agent 报告中控
+    store.py                   SQLite 版本化节点和关系
+    automation.py              自动任务、锁和系统任务安装
+  agents/                      六个独立 Agent 及共享协议
 
 Records/
   YYYY-MM-DD.md
 AnalysisReports/
+  .analysis.sqlite3
   Daily/YYYY-MM-DD_manual.md
   Weekly/YYYY-MM-DD_to_YYYY-MM-DD_manual.md
   Weekly/YYYY-MM-DD_to_YYYY-MM-DD_auto.md
