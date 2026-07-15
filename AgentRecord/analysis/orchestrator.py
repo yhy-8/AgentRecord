@@ -160,28 +160,74 @@ def _review_candidates(
     candidates = store.nodes_for_run(run_id, statuses=("candidate",))
     if not candidates:
         raise AgentPipelineError("本次分析没有产生可审查节点")
-    payload = _call_agent(
-        reviewer.SPEC,
-        "审查所有候选节点。每个候选节点必须且只能返回一个决定；证据不足或价值很低时拒绝。",
+    id_to_alias = {
+        node["id"]: f"N{index:03d}" for index, node in enumerate(candidates, 1)
+    }
+    alias_to_id = {alias: node_id for node_id, alias in id_to_alias.items()}
+    candidate_input = [
+        {**node, "id": id_to_alias[node["id"]]}
+        for node in compact_nodes(candidates)
+    ]
+    relation_input = [
         {
-            "mode": "candidate_review",
-            "candidate_nodes": compact_nodes(candidates),
-            "relations": store.edges_for_run(run_id, statuses=("candidate",)),
-        },
-        model_config,
-        store,
-        run_id,
-    )
-    candidate_ids = {node["id"] for node in candidates}
-    try:
-        normalized = reviewer.validate_candidate_review(payload, candidate_ids)
-    except AgentPipelineError as error:
-        _save_validation_failure(
-            store, run_id, reviewer.SPEC.name, payload, error
+            **relation,
+            "source_id": id_to_alias.get(
+                relation["source_id"], relation["source_id"]
+            ),
+            "target_id": id_to_alias.get(
+                relation["target_id"], relation["target_id"]
+            ),
+        }
+        for relation in store.edges_for_run(run_id, statuses=("candidate",))
+    ]
+    review_input = {
+        "mode": "candidate_review",
+        "candidate_nodes": candidate_input,
+        "relations": relation_input,
+        "valid_node_ids": list(alias_to_id),
+    }
+    payload = {}
+    normalized_aliases = []
+    validation_error = ""
+    for attempt in range(2):
+        current_input = dict(review_input)
+        if validation_error:
+            current_input["previous_validation_error"] = validation_error
+        task = (
+            "审查所有候选节点。每个候选节点必须且只能返回一个决定；"
+            "node_id 必须从 valid_node_ids 原样复制，证据不足或价值很低时拒绝。"
+            if attempt == 0
+            else "上次决定未通过结构校验。请根据错误重新审查全部候选节点；"
+            "每个 node_id 必须从 valid_node_ids 原样复制，不要使用持久节点 ID。"
         )
-        raise
+        payload = _call_agent(
+            reviewer.SPEC,
+            task,
+            current_input,
+            model_config,
+            store,
+            run_id,
+        )
+        try:
+            normalized_aliases = reviewer.validate_candidate_review(
+                payload, set(alias_to_id)
+            )
+        except AgentPipelineError as error:
+            _save_validation_failure(
+                store, run_id, reviewer.SPEC.name, payload, error
+            )
+            if attempt == 0:
+                validation_error = str(error)
+                continue
+            raise
+        break
+    normalized = [
+        {**decision, "node_id": alias_to_id[decision["node_id"]]}
+        for decision in normalized_aliases
+    ]
     stored_payload = dict(payload)
     stored_payload["decisions"] = normalized
+    stored_payload["node_aliases"] = alias_to_id
     store.save_artifact(run_id, reviewer.SPEC.name, stored_payload)
     store.apply_node_decisions(normalized)
     accepted = {item["node_id"] for item in normalized if item["status"] == "accepted"}

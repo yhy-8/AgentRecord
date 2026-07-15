@@ -38,12 +38,26 @@ def _handle_process_action(arguments: list[str]) -> bool:
     if "--install-automation" in arguments:
         success, message = install_system_automation()
         console.print(f"[{'green' if success else 'red'}]{message}[/]")
+        if not success:
+            raise SystemExit(1)
         return True
     if "--uninstall-automation" in arguments:
         success, message = uninstall_system_automation()
         console.print(f"[{'green' if success else 'red'}]{message}[/]")
+        if not success:
+            raise SystemExit(1)
         return True
     return False
+
+
+def _show_automation_status() -> None:
+    from ..analysis import system_automation_status
+    from .terminal import console
+
+    installed, message = system_automation_status()
+    color = "green" if installed else "yellow"
+    marker = "*" if installed else "!"
+    console.print(f"[{color}][{marker}] {message}[/{color}]")
 
 
 def main() -> None:
@@ -57,6 +71,7 @@ def main() -> None:
     logger.info("application_started action=%s", action)
     if _handle_process_action(sys.argv[1:]):
         return
+    _show_automation_status()
     from .app import run_interactive
 
     run_interactive()

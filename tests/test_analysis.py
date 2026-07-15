@@ -1,8 +1,10 @@
 import datetime
 import json
 import re
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -238,6 +240,111 @@ class AnalysisWorkflowTests(unittest.TestCase):
         self.assertIsNone(returned_path)
         self.assertEqual("已有报告", report_path.read_text(encoding="utf-8"))
 
+    def test_candidate_review_uses_aliases_and_retries_once(self):
+        day = datetime.date(2026, 7, 14)
+        self.write_diary(day.isoformat())
+        working_call_ai = orchestrator.call_ai
+        review_inputs = []
+
+        def flaky_reviewer(prompt, model_cfg, *, allowed_tools=None):
+            if "[程序 Agent 任务:reviewer]" not in prompt:
+                return working_call_ai(
+                    prompt, model_cfg, allowed_tools=allowed_tools
+                )
+            input_text = prompt.split("【中控提供的输入 JSON】\n", 1)[1]
+            input_text = input_text.split("\n\n只输出一个符合契约", 1)[0]
+            data = json.loads(input_text)
+            if data.get("mode") != "candidate_review":
+                return working_call_ai(
+                    prompt, model_cfg, allowed_tools=allowed_tools
+                )
+            review_inputs.append(data)
+            decisions = [
+                {
+                    "node_id": node["id"],
+                    "status": "accepted",
+                    "reason": "测试接受",
+                    "confidence": 0.9,
+                }
+                for node in data["candidate_nodes"]
+            ]
+            if len(review_inputs) == 1:
+                decisions[0]["node_id"] = "N999"
+            payload = {"decisions": decisions, "revision_guidance": ""}
+            return json.dumps(payload), True, 0, {}, 0
+
+        orchestrator.call_ai = flaky_reviewer
+        _, success, report_path = orchestrator.generate_analysis_report(
+            "daily", day, {"name": "mock"}
+        )
+
+        self.assertTrue(success)
+        self.assertEqual(2, len(review_inputs))
+        for data in review_inputs:
+            self.assertTrue(
+                all(
+                    re.fullmatch(r"N\d{3}", node["id"])
+                    for node in data["candidate_nodes"]
+                )
+            )
+        run_id = re.search(
+            r"分析运行：([0-9a-f]+)", report_path.read_text(encoding="utf-8")
+        ).group(1)
+        with closing(
+            sqlite3.connect(settings.ANALYSIS_DIR / ".analysis.sqlite3")
+        ) as connection:
+            artifacts = connection.execute(
+                """
+                SELECT revision, status FROM agent_artifacts
+                WHERE run_id = ? AND agent = 'reviewer'
+                ORDER BY revision
+                """,
+                (run_id,),
+            ).fetchall()
+        self.assertEqual([(1, "failed"), (2, "completed")], artifacts)
+
+    def test_candidate_review_stops_after_one_retry(self):
+        day = datetime.date(2026, 7, 14)
+        self.write_diary(day.isoformat())
+        working_call_ai = orchestrator.call_ai
+        review_calls = 0
+
+        def invalid_reviewer(prompt, model_cfg, *, allowed_tools=None):
+            nonlocal review_calls
+            if "[程序 Agent 任务:reviewer]" not in prompt:
+                return working_call_ai(
+                    prompt, model_cfg, allowed_tools=allowed_tools
+                )
+            input_text = prompt.split("【中控提供的输入 JSON】\n", 1)[1]
+            input_text = input_text.split("\n\n只输出一个符合契约", 1)[0]
+            data = json.loads(input_text)
+            if data.get("mode") != "candidate_review":
+                return working_call_ai(
+                    prompt, model_cfg, allowed_tools=allowed_tools
+                )
+            review_calls += 1
+            payload = {
+                "decisions": [
+                    {
+                        "node_id": "N999",
+                        "status": "accepted",
+                        "reason": "无效别名",
+                        "confidence": 0.9,
+                    }
+                ],
+                "revision_guidance": "",
+            }
+            return json.dumps(payload), True, 0, {}, 0
+
+        orchestrator.call_ai = invalid_reviewer
+        _, success, report_path = orchestrator.generate_analysis_report(
+            "daily", day, {"name": "mock"}
+        )
+
+        self.assertFalse(success)
+        self.assertIsNone(report_path)
+        self.assertEqual(2, review_calls)
+
     def test_manual_and_automatic_reports_have_separate_fixed_paths(self):
         day = datetime.date(2026, 7, 14)
         self.write_diary(day.isoformat())
@@ -414,6 +521,39 @@ class AnalysisWorkflowTests(unittest.TestCase):
         self.assertIn("5 * * * *", cron_input)
         self.assertIn("--run-automation", cron_input)
         self.assertIn("# AgentRecord automation", cron_input)
+
+    def test_reports_complete_cron_automation_status(self):
+        listed = Mock(
+            returncode=0,
+            stdout=(
+                "@reboot python main.py --run-automation "
+                "# AgentRecord automation startup\n"
+                "5 * * * * python main.py --run-automation "
+                "# AgentRecord automation hourly\n"
+            ),
+            stderr="",
+        )
+        with patch(
+            "AgentRecord.analysis.automation._is_windows", return_value=False
+        ), patch(
+            "AgentRecord.analysis.automation.subprocess.run", return_value=listed
+        ):
+            installed, message = automation.system_automation_status()
+
+        self.assertTrue(installed)
+        self.assertIn("已安装", message)
+
+    def test_reports_missing_cron_automation_status(self):
+        listed = Mock(returncode=1, stdout="", stderr="no crontab")
+        with patch(
+            "AgentRecord.analysis.automation._is_windows", return_value=False
+        ), patch(
+            "AgentRecord.analysis.automation.subprocess.run", return_value=listed
+        ):
+            installed, message = automation.system_automation_status()
+
+        self.assertFalse(installed)
+        self.assertIn("未安装", message)
 
     def test_source_automation_command_uses_root_entry(self):
         with patch.object(automation.sys, "frozen", False, create=True):

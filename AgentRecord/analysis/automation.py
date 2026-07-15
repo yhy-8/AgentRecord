@@ -234,6 +234,55 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
+def system_automation_status() -> tuple[bool, str]:
+    """检查当前程序对应的系统自动任务是否完整安装。"""
+    try:
+        if _is_windows():
+            results = [
+                subprocess.run(
+                    ["schtasks", "/Query", "/TN", task_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                for task_name in (
+                    _WINDOWS_HOURLY_TASK_NAME,
+                    _WINDOWS_LOGON_TASK_NAME,
+                )
+            ]
+            installed_count = sum(result.returncode == 0 for result in results)
+            if installed_count == len(results):
+                return True, "系统自动任务已安装；关闭本窗口后仍会每小时检查。"
+            if installed_count:
+                return False, "系统自动任务安装不完整，请重新执行安装命令。"
+            return False, "系统自动任务未安装；自动总结和周期报告不会运行。"
+
+        current = subprocess.run(
+            ["crontab", "-l"], capture_output=True, text=True, timeout=30
+        )
+        if current.returncode == 1:
+            return False, "系统自动任务未安装；自动总结和周期报告不会运行。"
+        if current.returncode != 0:
+            message = current.stderr.strip() or "无法读取当前 crontab。"
+            return False, f"无法确认系统自动任务状态：{message}"
+        lines = current.stdout.splitlines()
+        has_startup = any(
+            _CRON_MARKER in line and line.rstrip().endswith("startup")
+            for line in lines
+        )
+        has_hourly = any(
+            _CRON_MARKER in line and line.rstrip().endswith("hourly")
+            for line in lines
+        )
+        if has_startup and has_hourly:
+            return True, "系统自动任务已安装；关闭本窗口后仍会每小时检查。"
+        if has_startup or has_hourly:
+            return False, "系统自动任务安装不完整，请重新执行安装命令。"
+        return False, "系统自动任务未安装；自动总结和周期报告不会运行。"
+    except (OSError, subprocess.SubprocessError) as error:
+        return False, f"无法确认系统自动任务状态：{error}"
+
+
 def install_system_automation() -> tuple[bool, str]:
     """安装每小时运行的用户级系统任务；不要求交互程序保持开启。"""
     try:

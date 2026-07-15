@@ -125,6 +125,24 @@ class MainCommandTests(unittest.TestCase):
     def test_root_main_is_only_the_shared_entry(self):
         self.assertIs(root_main.main, entry.main)
 
+    def test_interactive_startup_shows_automation_status(self):
+        with patch(
+            "AgentRecord.analysis.system_automation_status",
+            return_value=(True, "系统自动任务已安装。"),
+        ), patch("AgentRecord.cli.terminal.console.print") as console_print:
+            entry._show_automation_status()
+
+        console_print.assert_called_once()
+        self.assertIn("已安装", str(console_print.call_args.args[0]))
+
+    def test_failed_automation_install_returns_nonzero_exit(self):
+        with patch(
+            "AgentRecord.analysis.install_system_automation",
+            return_value=(False, "安装失败"),
+        ), patch("AgentRecord.cli.terminal.console.print"):
+            with self.assertRaisesRegex(SystemExit, "1"):
+                entry._handle_process_action(["--install-automation"])
+
     def test_windows_background_entry_hides_console_window(self):
         windll = Mock()
         windll.kernel32.GetConsoleWindow.return_value = 123

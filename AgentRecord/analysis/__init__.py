@@ -5,6 +5,7 @@ from .automation import (
     _run_weekly_reports,
     install_system_automation,
     run_due_automatic_tasks,
+    system_automation_status,
     uninstall_system_automation,
 )
 from .context import analysis_report_path
@@ -16,5 +17,6 @@ __all__ = [
     "install_system_automation",
     "run_due_automatic_tasks",
     "summarize_diary",
+    "system_automation_status",
     "uninstall_system_automation",
 ]

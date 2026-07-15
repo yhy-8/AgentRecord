@@ -14,7 +14,8 @@ SPEC = AgentSpec(
     writable_relation_types=frozenset(),
     allowed_tools=frozenset(),
     instructions="""严格检查来源可追溯性、证据强度、来源身份混淆、因果越界、弱关联和套话。宁可拒绝无价值候选，也不要为了丰富报告而放行。
-候选审查输出 JSON：{"decisions":[{"node_id":"...","status":"accepted|rejected|candidate","reason":"...","confidence":0到1}],"revision_guidance":"..."}。
+候选节点使用 N001 形式的本次运行短别名。node_id 必须从中控给出的 valid_node_ids 原样复制，不得缩写、改写或使用其他 ID。
+候选审查输出 JSON：{"decisions":[{"node_id":"N001","status":"accepted|rejected|candidate","reason":"...","confidence":0到1}],"revision_guidance":"..."}。
 报告审查输出 JSON：{"pass":true或false,"unsupported_claims":["..."],"required_changes":["..."],"summary":"..."}。""",
 )
 
