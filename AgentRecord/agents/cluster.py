@@ -15,7 +15,8 @@ SPEC = AgentSpec(
     ),
     allowed_tools=frozenset(),
     instructions="""只建立材料支持的主题，避免把单条偶然记录包装成长期趋势。可以结合已接受历史主题判断新出现、持续、增强、衰退、分叉或合并。
-输出 JSON：{"nodes":[{"temp_id":"...","node_type":"theme","title":"...","body":"...","confidence":0到1,"source_refs":["R-..."],"supersedes_id":null,"metadata":{"trajectory":"new|continuing|growing|weakening|split|merged"}}],"edges":[{"source_id":"节点ID","target_id":"节点ID","relation_type":"member_of|evolves_from|splits_from|merges_into","weight":0到1,"confidence":0到1,"rationale":"..."}]}。""",
+source_refs 可以填写输入中的证据/主题节点 ID，中控会展开其原始来源；不要编造来源 ID。
+输出 JSON：{"nodes":[{"temp_id":"...","node_type":"theme","title":"...","body":"...","confidence":0到1,"source_refs":["输入节点ID"],"supersedes_id":null,"metadata":{"trajectory":"new|continuing|growing|weakening|split|merged"}}],"edges":[{"source_id":"节点ID","target_id":"节点ID","relation_type":"member_of|evolves_from|splits_from|merges_into","weight":0到1,"confidence":0到1,"rationale":"..."}]}。""",
 )
 
 

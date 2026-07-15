@@ -4,5 +4,6 @@ __pycache__/
 # Local user data and derived analysis state.
 Records/
 AnalysisReports/
+Log/
 AGENTS.md
 CLAUDE.md

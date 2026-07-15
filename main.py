@@ -1,6 +1,6 @@
 """Thin source and PyInstaller entry point."""
 
-from agentrecord.cli.entry import main
+from AgentRecord.cli.entry import main
 
 
 if __name__ == "__main__":

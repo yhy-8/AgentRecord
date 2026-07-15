@@ -19,7 +19,7 @@ python main.py
 也可以通过包入口启动：
 
 ```bash
-python -m agentrecord
+python -m AgentRecord
 ```
 
 Windows 用户运行打包后的程序：
@@ -188,6 +188,7 @@ Copy-Item config.yaml dist\config.yaml
 - 手动与自动报告分开保存，同一周期各自只保留一份。
 - Agent 的运行记录、中间产物、候选/接受/拒绝节点和关系保存在 `AnalysisReports/.analysis.sqlite3`。同一周期重跑可以复用已接受内容；修订通过新版本替代旧版本，不静默覆盖历史判断。
 - SQLite 是本地派生分析知识层，不替代 `Records/` 中的 Markdown 原始记录。不要在程序运行时手工删除数据库、WAL 或 SHM 文件。
+- 运行诊断日志保存在 `Log/AgentRecord.log`，达到 5 MiB 后自动轮转，最多保留 2 个归档；日志不包含完整日记或模型请求/响应正文。
 
 ## 后台任务细节
 
@@ -217,8 +218,9 @@ Copy-Item config.yaml dist\config.yaml
 
 ```text
 main.py                         极薄的脚本与 PyInstaller 入口
-agentrecord/
+AgentRecord/
   settings.py                  配置、目录和模型选择
+  logging_config.py            标准日志与按大小轮转
   journal.py                   原始日记唯一读写边界
   ai_client.py                 OpenAI 兼容请求和授权工具循环
   cli/
@@ -243,6 +245,8 @@ AnalysisReports/
   Monthly/YYYY-MM_manual.md
   Monthly/YYYY-MM_auto.md
   .automation-state.json
+Log/
+  AgentRecord.log              当前运行日志；归档后缀为 .1 和 .2
 ```
 
 ## 测试

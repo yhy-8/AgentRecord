@@ -1,11 +1,82 @@
 """Central validation of graph-shaped Agent output."""
 
+import copy
 from collections.abc import Callable
 
 from .base import AgentPipelineError, AgentSpec, confidence
 
 
 MetadataValidator = Callable[[str, dict, set[str]], None]
+
+
+def inherit_source_refs(
+    payload: dict,
+    *,
+    allowed_source_ids: set[str],
+    visible_nodes: dict[str, dict],
+) -> dict:
+    """Expand visible knowledge-node references into original source IDs.
+
+    Downstream Agents reason over knowledge node IDs.  The orchestrator, rather
+    than the model, owns the deterministic provenance expansion back to R-* IDs.
+    """
+    normalized = copy.deepcopy(payload)
+    raw_nodes = normalized.get("nodes", [])
+    raw_edges = normalized.get("edges", [])
+    if not isinstance(raw_nodes, list):
+        return normalized
+
+    linked_visible: dict[str, list[str]] = {}
+    if isinstance(raw_edges, list):
+        for edge in raw_edges:
+            if not isinstance(edge, dict):
+                continue
+            source_id = str(edge.get("source_id", "")).strip()
+            target_id = str(edge.get("target_id", "")).strip()
+            if source_id in visible_nodes:
+                linked_visible.setdefault(target_id, []).append(source_id)
+            if target_id in visible_nodes:
+                linked_visible.setdefault(source_id, []).append(target_id)
+
+    def expand(reference: object) -> list[object]:
+        if not isinstance(reference, str):
+            return [reference]
+        if reference in allowed_source_ids:
+            return [reference]
+        if reference in visible_nodes:
+            return [
+                source_id
+                for source_id in visible_nodes[reference].get("source_refs", [])
+                if source_id in allowed_source_ids
+            ]
+        return [reference]
+
+    for node in raw_nodes:
+        if not isinstance(node, dict):
+            continue
+        references = node.get("source_refs", [])
+        if not isinstance(references, list):
+            continue
+        inherited = list(references)
+        temporary_id = str(node.get("temp_id", "")).strip()
+        inherited.extend(linked_visible.get(temporary_id, []))
+        metadata = node.get("metadata", {})
+        if isinstance(metadata, dict):
+            for field in ("evidence_for", "evidence_against"):
+                value = metadata.get(field, [])
+                if isinstance(value, list):
+                    inherited.extend(value)
+            target_id = metadata.get("target_id")
+            if isinstance(target_id, str):
+                inherited.append(target_id)
+
+        expanded: list[object] = []
+        for reference in inherited:
+            for source_id in expand(reference):
+                if source_id not in expanded:
+                    expanded.append(source_id)
+        node["source_refs"] = expanded
+    return normalized
 
 
 def validate_graph_payload(
@@ -37,11 +108,16 @@ def validate_graph_payload(
         if not title or not body:
             raise AgentPipelineError(f"{spec.name} 节点缺少标题或正文")
         source_refs = raw_node.get("source_refs", [])
-        if not isinstance(source_refs, list) or any(
+        if not isinstance(source_refs, list):
+            raise AgentPipelineError(f"{spec.name} 节点的 source_refs 必须是数组")
+        unknown_source_count = sum(
             not isinstance(item, str) or item not in allowed_source_ids
             for item in source_refs
-        ):
-            raise AgentPipelineError(f"{spec.name} 节点包含未知来源")
+        )
+        if unknown_source_count:
+            raise AgentPipelineError(
+                f"{spec.name} 节点包含 {unknown_source_count} 个未知来源"
+            )
         if node_type != "research" and not source_refs:
             raise AgentPipelineError(f"{spec.name} 的 {node_type} 节点缺少来源")
         supersedes_id = raw_node.get("supersedes_id") or None

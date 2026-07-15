@@ -41,7 +41,7 @@ def _configured_path(key: str, default: str) -> Path:
     return path if path.is_absolute() else CONFIG_DIR / path
 
 
-DIARY_DIR = _configured_path("diary_dir", "./AgentRecords")
+DIARY_DIR = _configured_path("diary_dir", "./Records")
 ANALYSIS_DIR = _configured_path("analysis_dir", "./AnalysisReports")
 DIARY_DIR.mkdir(parents=True, exist_ok=True)
 

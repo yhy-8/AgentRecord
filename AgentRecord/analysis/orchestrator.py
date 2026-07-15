@@ -3,6 +3,7 @@
 import datetime
 import hashlib
 import json
+import logging
 from pathlib import Path
 
 from .. import journal, settings
@@ -17,6 +18,7 @@ from ..agents import (
     reviewer,
     world,
 )
+from ..agents.graph import inherit_source_refs
 from ..ai_client import call_ai
 from .context import (
     _analysis_report_path,
@@ -29,6 +31,31 @@ from .context import (
     _referenced_source_context,
 )
 from .store import AnalysisStore
+
+
+logger = logging.getLogger(__name__)
+
+
+def _save_validation_failure(
+    store: AnalysisStore,
+    run_id: str,
+    agent: str,
+    payload: dict,
+    error: AgentPipelineError,
+) -> None:
+    store.save_artifact(
+        run_id,
+        agent,
+        payload,
+        status="failed",
+        error=str(error),
+    )
+    logger.warning(
+        "agent_validation_failed run=%s agent=%s reason=%s",
+        run_id,
+        agent,
+        str(error),
+    )
 
 
 def summarize_diary(date: str, model_config: settings.ModelDict) -> tuple[str, bool]:
@@ -68,8 +95,9 @@ def _call_agent(
     run_id: str,
 ) -> dict:
     """Invoke an Agent while the orchestrator owns failure persistence."""
+    logger.info("agent_start run=%s agent=%s", run_id, spec.name)
     try:
-        return invoke_agent(spec, task, input_data, model_config, call_ai)
+        payload = invoke_agent(spec, task, input_data, model_config, call_ai)
     except AgentPipelineError as error:
         store.save_artifact(
             run_id,
@@ -78,7 +106,15 @@ def _call_agent(
             status="failed",
             error=str(error),
         )
+        logger.warning(
+            "agent_failed run=%s agent=%s error_type=%s",
+            run_id,
+            spec.name,
+            error.__class__.__name__,
+        )
         raise
+    logger.info("agent_completed run=%s agent=%s", run_id, spec.name)
+    return payload
 
 
 def _persist_graph_agent(
@@ -89,14 +125,25 @@ def _persist_graph_agent(
     run_id: str,
     *,
     allowed_source_ids: set[str],
-    visible_node_ids: set[str],
+    visible_nodes: dict[str, dict],
 ) -> dict[str, str]:
-    nodes, edges = validator(
+    normalized_payload = inherit_source_refs(
         payload,
         allowed_source_ids=allowed_source_ids,
-        visible_node_ids=visible_node_ids,
+        visible_nodes=visible_nodes,
     )
-    stored_payload = dict(payload)
+    try:
+        nodes, edges = validator(
+            normalized_payload,
+            allowed_source_ids=allowed_source_ids,
+            visible_node_ids=set(visible_nodes),
+        )
+    except AgentPipelineError as error:
+        _save_validation_failure(
+            store, run_id, spec.name, normalized_payload, error
+        )
+        raise
+    stored_payload = dict(normalized_payload)
     stored_payload["nodes"] = nodes
     stored_payload["edges"] = edges
     store.save_artifact(run_id, spec.name, stored_payload)
@@ -126,7 +173,13 @@ def _review_candidates(
         run_id,
     )
     candidate_ids = {node["id"] for node in candidates}
-    normalized = reviewer.validate_candidate_review(payload, candidate_ids)
+    try:
+        normalized = reviewer.validate_candidate_review(payload, candidate_ids)
+    except AgentPipelineError as error:
+        _save_validation_failure(
+            store, run_id, reviewer.SPEC.name, payload, error
+        )
+        raise
     stored_payload = dict(payload)
     stored_payload["decisions"] = normalized
     store.save_artifact(run_id, reviewer.SPEC.name, stored_payload)
@@ -206,6 +259,14 @@ def generate_analysis_report(
             model_config.get("name", ""),
             input_hash,
         )
+        logger.info(
+            "analysis_started run=%s kind=%s origin=%s period=%s..%s",
+            run_id,
+            kind,
+            origin,
+            start.isoformat(),
+            end.isoformat(),
+        )
         store.save_sources(run_id, records)
 
         previous_nodes = (
@@ -242,7 +303,7 @@ def generate_analysis_report(
                 store,
                 run_id,
                 allowed_source_ids={record["source_id"] for record in record_chunk},
-                visible_node_ids=set(),
+                visible_nodes={},
             )
 
         evidence_nodes = store.nodes_for_run(
@@ -278,7 +339,7 @@ def generate_analysis_report(
             store,
             run_id,
             allowed_source_ids=allowed_source_ids,
-            visible_node_ids=set(cluster_visible),
+            visible_nodes=cluster_visible,
         )
 
         run_nodes = store.nodes_for_run(run_id, statuses=("candidate",))
@@ -306,7 +367,7 @@ def generate_analysis_report(
             store,
             run_id,
             allowed_source_ids=allowed_source_ids,
-            visible_node_ids=set(explorer_visible),
+            visible_nodes=explorer_visible,
         )
 
         query_payload = dict(explorer_payload)
@@ -320,10 +381,22 @@ def generate_analysis_report(
             for item in explorer_payload.get("research_queries", [])
             if isinstance(item, dict)
         ]
-        research_targets = set(explorer_visible) | set(explorer_ids.values())
-        research_queries = explorer.clean_research_queries(
-            query_payload, research_targets
-        )
+        persisted_explorer = {
+            node["id"]: node
+            for node in store.nodes_for_run(run_id, statuses=("candidate",))
+            if node["id"] in set(explorer_ids.values())
+        }
+        research_visible = explorer_visible | persisted_explorer
+        research_targets = set(research_visible)
+        try:
+            research_queries = explorer.clean_research_queries(
+                query_payload, research_targets
+            )
+        except AgentPipelineError as error:
+            _save_validation_failure(
+                store, run_id, explorer.SPEC.name, query_payload, error
+            )
+            raise
         if research_queries:
             world_payload = _call_agent(
                 world.SPEC,
@@ -343,7 +416,7 @@ def generate_analysis_report(
                 store,
                 run_id,
                 allowed_source_ids=allowed_source_ids,
-                visible_node_ids=research_targets,
+                visible_nodes=research_visible,
             )
 
         accepted_current = _review_candidates(store, run_id, model_config)
@@ -425,7 +498,13 @@ def generate_analysis_report(
             report_payload = _call_agent(
                 report_agent.SPEC, task, current_input, model_config, store, run_id
             )
-            report_markdown = report_agent.markdown_from_payload(report_payload)
+            try:
+                report_markdown = report_agent.markdown_from_payload(report_payload)
+            except AgentPipelineError as error:
+                _save_validation_failure(
+                    store, run_id, report_agent.SPEC.name, report_payload, error
+                )
+                raise
             store.save_artifact(run_id, report_agent.SPEC.name, report_payload)
 
             deterministic_errors = report_agent.validation_errors(
@@ -444,9 +523,15 @@ def generate_analysis_report(
                 store,
                 run_id,
             )
-            audit_passed, audit_feedback = reviewer.validate_report_review(
-                audit_payload
-            )
+            try:
+                audit_passed, audit_feedback = reviewer.validate_report_review(
+                    audit_payload
+                )
+            except AgentPipelineError as error:
+                _save_validation_failure(
+                    store, run_id, "reviewer_report", audit_payload, error
+                )
+                raise
             store.save_artifact(run_id, "reviewer_report", audit_payload)
             audit_feedback.extend(deterministic_errors)
             if audit_passed and not deterministic_errors:
@@ -486,6 +571,7 @@ def generate_analysis_report(
                 restore_path.write_bytes(previous_content)
                 restore_path.replace(report_path)
             raise
+        logger.info("analysis_completed run=%s kind=%s", run_id, kind)
         return report_markdown, True, report_path
     except Exception as error:
         message = str(error) or error.__class__.__name__
@@ -494,6 +580,9 @@ def generate_analysis_report(
                 store.fail_run(run_id, message)
             except Exception as state_error:
                 message += f"；保存失败状态时又发生异常: {state_error}"
+        logger.error(
+            "analysis_failed run=%s error_type=%s",
+            run_id or "not-started",
+            error.__class__.__name__,
+        )
         return f"多 Agent 分析失败: {message}", False, None
-
-

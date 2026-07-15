@@ -1,7 +1,11 @@
 """Process entry point shared by scripts, module execution, and PyInstaller."""
 
 import ctypes
+import logging
 import sys
+
+
+logger = logging.getLogger(__name__)
 
 
 def _hide_background_console() -> None:
@@ -43,6 +47,14 @@ def _handle_process_action(arguments: list[str]) -> bool:
 
 
 def main() -> None:
+    from ..logging_config import configure_logging
+
+    configure_logging()
+    action = next(
+        (argument for argument in sys.argv[1:] if argument.startswith("--")),
+        "interactive",
+    )
+    logger.info("application_started action=%s", action)
     if _handle_process_action(sys.argv[1:]):
         return
     from .app import run_interactive

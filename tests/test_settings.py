@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agentrecord import settings
+from AgentRecord import settings
 
 
 class ModelSettingsTests(unittest.TestCase):
@@ -30,7 +30,7 @@ class ModelSettingsTests(unittest.TestCase):
                 "models": [{"name": "first"}, {"name": "second"}],
             }
             try:
-                with patch("agentrecord.settings._get_config_path", return_value=config_path):
+                with patch("AgentRecord.settings._get_config_path", return_value=config_path):
                     selected = settings.ModelConfig.select("second")
             finally:
                 settings.CONFIG = original_config

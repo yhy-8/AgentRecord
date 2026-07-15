@@ -1,8 +1,12 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
-from agentrecord.analysis.store import AnalysisStore
+from AgentRecord.agents import cluster
+from AgentRecord.agents.base import AgentPipelineError
+from AgentRecord.analysis import orchestrator
+from AgentRecord.analysis.store import AnalysisStore
 
 
 class AnalysisStoreTests(unittest.TestCase):
@@ -153,6 +157,46 @@ class AnalysisStoreTests(unittest.TestCase):
         self.store.accept_edges_for_run(run_id, {node_ids["a"]})
 
         self.assertEqual("rejected", self.store.edges_for_run(run_id)[0]["status"])
+
+    def test_validation_failure_is_saved_as_failed_agent_artifact(self):
+        run_id, _ = self.store.start_run(
+            "daily", "2026-07-14", "2026-07-14", "manual", "mock", "hash"
+        )
+        payload = {
+            "nodes": [
+                {
+                    "temp_id": "theme-1",
+                    "node_type": "theme",
+                    "title": "主题",
+                    "body": "内容",
+                    "source_refs": ["unknown-source"],
+                    "metadata": {"trajectory": "new"},
+                }
+            ],
+            "edges": [],
+        }
+
+        with self.assertRaises(AgentPipelineError):
+            orchestrator._persist_graph_agent(
+                cluster.SPEC,
+                cluster.validate,
+                payload,
+                self.store,
+                run_id,
+                allowed_source_ids={"R-20260714-001"},
+                visible_nodes={},
+            )
+
+        connection = sqlite3.connect(self.store.path)
+        try:
+            status, error = connection.execute(
+                "SELECT status, error FROM agent_artifacts WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual("failed", status)
+        self.assertIn("未知来源", error)
 
 
 if __name__ == "__main__":

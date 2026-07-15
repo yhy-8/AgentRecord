@@ -210,4 +210,3 @@ def show_help(mode: str = RECORD_MODE) -> None:
             border_style="cyan",
         )
     )
-

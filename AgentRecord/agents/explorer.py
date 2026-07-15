@@ -19,7 +19,8 @@ SPEC = AgentSpec(
     ),
     allowed_tools=frozenset(),
     instructions="""优先少量、有依据且能提高下一轮思考质量的发现。明确区分记录事实和推断，为每个候选列出支持来源、反证或替代解释。需要外部核查时给出不含私人细节的 research_queries；不要自己声称已经查证。
-输出 JSON：{"nodes":[{"temp_id":"...","node_type":"hypothesis|insight","title":"...","body":"...","confidence":0到1,"source_refs":["R-..."],"supersedes_id":null,"metadata":{"insight_type":"connection|evolution|contradiction|blind_spot","evidence_for":["节点ID"],"evidence_against":["节点ID"],"inference_level":"low|medium|high","why_it_matters":"...","research_needed":true}}],"edges":[{"source_id":"节点ID","target_id":"节点ID","relation_type":"supports|challenges|evolves_from|contradicts","weight":0到1,"confidence":0到1,"rationale":"..."}],"research_queries":[{"target_id":"候选节点ID","query":"去除私人细节后的查询","reason":"..."}]}。""",
+source_refs 可以填写输入中的知识节点 ID，中控会展开其原始来源；不要编造来源 ID。
+输出 JSON：{"nodes":[{"temp_id":"...","node_type":"hypothesis|insight","title":"...","body":"...","confidence":0到1,"source_refs":["输入节点ID"],"supersedes_id":null,"metadata":{"insight_type":"connection|evolution|contradiction|blind_spot","evidence_for":["节点ID"],"evidence_against":["节点ID"],"inference_level":"low|medium|high","why_it_matters":"...","research_needed":true}}],"edges":[{"source_id":"节点ID","target_id":"节点ID","relation_type":"supports|challenges|evolves_from|contradicts","weight":0到1,"confidence":0到1,"rationale":"..."}],"research_queries":[{"target_id":"候选节点ID","query":"去除私人细节后的查询","reason":"..."}]}。""",
 )
 
 

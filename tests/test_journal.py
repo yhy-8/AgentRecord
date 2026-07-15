@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agentrecord import journal, settings
+from AgentRecord import journal, settings
 
 
 class JournalTests(unittest.TestCase):
@@ -53,7 +53,7 @@ class JournalTests(unittest.TestCase):
         label = "手动分析周报 | 2026-07-06 至 2026-07-12"
         fixed_now = datetime.datetime(2026, 7, 15, 14, 32)
 
-        with patch("agentrecord.journal.datetime.datetime") as mock_datetime:
+        with patch("AgentRecord.journal.datetime.datetime") as mock_datetime:
             mock_datetime.now.return_value = fixed_now
             journal.append_reference(label, report, "继续展开的想法")
 
@@ -66,7 +66,7 @@ class JournalTests(unittest.TestCase):
         submitted_at = datetime.datetime(2026, 7, 15, 23, 59, 59)
         after_midnight = datetime.datetime(2026, 7, 16, 0, 0, 0)
 
-        with patch("agentrecord.journal.datetime.datetime") as mock_datetime:
+        with patch("AgentRecord.journal.datetime.datetime") as mock_datetime:
             mock_datetime.now.side_effect = [submitted_at, after_midnight]
             journal.append_log("跨午夜提交")
 
@@ -83,7 +83,7 @@ class JournalTests(unittest.TestCase):
         submitted_at = datetime.datetime(2026, 7, 15, 23, 59, 59)
         after_midnight = datetime.datetime(2026, 7, 16, 0, 0, 0)
 
-        with patch("agentrecord.journal.datetime.datetime") as mock_datetime:
+        with patch("AgentRecord.journal.datetime.datetime") as mock_datetime:
             mock_datetime.now.side_effect = [submitted_at, after_midnight]
             journal.append_reference("分析月报 | 2026-06", report, "跨午夜引用")
 
@@ -95,7 +95,7 @@ class JournalTests(unittest.TestCase):
 
     def test_delete_last_record_removes_multiline_reference_only(self):
         fixed_now = datetime.datetime(2026, 7, 15, 9, 0)
-        with patch("agentrecord.journal.datetime.datetime") as mock_datetime:
+        with patch("AgentRecord.journal.datetime.datetime") as mock_datetime:
             mock_datetime.now.return_value = fixed_now
             journal.append_log("先前记录")
             journal.append_log("[日记 | 2026-07-14](<2026-07-14.md>)\n\n关联想法", "[引用]")

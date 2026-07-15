@@ -185,4 +185,3 @@ def _record_chunks(records: list[dict], max_characters: int = 24000) -> list[lis
         chunks.append(current)
     return chunks
 
-

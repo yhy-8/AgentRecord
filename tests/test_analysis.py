@@ -6,9 +6,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from agentrecord import journal, settings
-from agentrecord.analysis import automation, context, orchestrator
-from agentrecord.analysis.store import AnalysisStore
+from AgentRecord import journal, settings
+from AgentRecord.analysis import automation, context, orchestrator
+from AgentRecord.analysis.store import AnalysisStore
 
 
 class AnalysisWorkflowTests(unittest.TestCase):
@@ -58,7 +58,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
                             "title": "测试主题",
                             "body": "测试主题正在形成。",
                             "confidence": 0.8,
-                            "source_refs": evidence["source_refs"],
+                            "source_refs": [evidence["id"]],
                             "metadata": {"trajectory": "new"},
                         }
                     ],
@@ -85,7 +85,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
                             "title": "测试洞见",
                             "body": "材料中出现了值得继续判断的方向。",
                             "confidence": 0.8,
-                            "source_refs": evidence["source_refs"],
+                            "source_refs": [evidence["id"]],
                             "metadata": {
                                 "insight_type": "connection",
                                 "evidence_for": [evidence["id"]],
@@ -208,6 +208,15 @@ class AnalysisWorkflowTests(unittest.TestCase):
         store = AnalysisStore(settings.ANALYSIS_DIR / ".analysis.sqlite3")
         self.assertEqual("completed", store.run_record(run_id)["status"])
         self.assertTrue(store.nodes_for_run(run_id, statuses=("accepted",)))
+        derived_nodes = store.nodes_for_run(
+            run_id,
+            statuses=("accepted",),
+            node_types=("theme", "insight"),
+        )
+        self.assertTrue(derived_nodes)
+        self.assertTrue(
+            all(node["source_refs"] == ["R-20260714-001"] for node in derived_nodes)
+        )
         self.assertEqual("R-20260714-001", store.sources_for_run(run_id)[0]["source_id"])
 
     def test_failed_pipeline_does_not_overwrite_existing_report(self):
@@ -394,8 +403,8 @@ class AnalysisWorkflowTests(unittest.TestCase):
     def test_installs_hourly_cron_task_for_one_shot_runner(self):
         listed = Mock(returncode=0, stdout="15 2 * * * existing\n", stderr="")
         installed = Mock(returncode=0, stdout="", stderr="")
-        with patch("agentrecord.analysis.automation._is_windows", return_value=False), patch(
-            "agentrecord.analysis.automation.subprocess.run", side_effect=[listed, installed]
+        with patch("AgentRecord.analysis.automation._is_windows", return_value=False), patch(
+            "AgentRecord.analysis.automation.subprocess.run", side_effect=[listed, installed]
         ) as run:
             success, _ = automation.install_system_automation()
 
@@ -415,8 +424,8 @@ class AnalysisWorkflowTests(unittest.TestCase):
 
     def test_installs_windows_scheduled_task_for_one_shot_runner(self):
         installed = Mock(returncode=0, stdout="", stderr="")
-        with patch("agentrecord.analysis.automation._is_windows", return_value=True), patch(
-            "agentrecord.analysis.automation.subprocess.run", return_value=installed
+        with patch("AgentRecord.analysis.automation._is_windows", return_value=True), patch(
+            "AgentRecord.analysis.automation.subprocess.run", return_value=installed
         ) as run:
             success, _ = automation.install_system_automation()
 

@@ -1,7 +1,8 @@
 import unittest
 
-from agentrecord.agents import AGENTS, explorer, report, world
-from agentrecord.agents.base import AgentPipelineError
+from AgentRecord.agents import AGENTS, explorer, report, world
+from AgentRecord.agents.base import AgentPipelineError
+from AgentRecord.agents.graph import inherit_source_refs
 
 
 class AgentModuleTests(unittest.TestCase):
@@ -33,6 +34,31 @@ class AgentModuleTests(unittest.TestCase):
         self.assertIn("[email]", queries[0]["query"])
         self.assertIn("[number]", queries[0]["query"])
         self.assertIn("[local-path]", queries[0]["query"])
+
+    def test_visible_node_reference_inherits_original_source(self):
+        payload = {
+            "nodes": [
+                {
+                    "temp_id": "theme-1",
+                    "source_refs": ["evidence-1"],
+                    "metadata": {},
+                }
+            ],
+            "edges": [],
+        }
+
+        normalized = inherit_source_refs(
+            payload,
+            allowed_source_ids={"R-20260714-001"},
+            visible_nodes={
+                "evidence-1": {"source_refs": ["R-20260714-001"]}
+            },
+        )
+
+        self.assertEqual(
+            ["R-20260714-001"], normalized["nodes"][0]["source_refs"]
+        )
+        self.assertEqual(["evidence-1"], payload["nodes"][0]["source_refs"])
 
     def test_world_rejects_verified_claim_without_external_url(self):
         payload = {
