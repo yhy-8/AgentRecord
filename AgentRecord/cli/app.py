@@ -11,6 +11,7 @@ from .commands import (
     _handle_summary,
     _handle_view,
 )
+from .report_jobs import manual_report_jobs
 from .terminal import (
     RECORD_MODE,
     REPORT_MODE,
@@ -43,6 +44,13 @@ def run_interactive() -> None:
             submitted_at = datetime.datetime.now()
             user_input = raw_input.strip()
         except (KeyboardInterrupt, EOFError):
+            running = manual_report_jobs.running_label()
+            if running:
+                console.print(
+                    f"[yellow][!][/yellow] {running}仍在后台生成，"
+                    "当前退出已取消；完成前请不要关闭窗口。"
+                )
+                continue
             console.print("[dim]系统退出。[/dim]")
             break
         if not user_input:
@@ -82,7 +90,9 @@ def run_interactive() -> None:
             elif command == "/a" and (
                 user_input == "/a" or user_input.startswith("/a ")
             ):
-                _handle_analysis(user_input, current_model)
+                if _handle_analysis(user_input, current_model):
+                    mode = RECORD_MODE
+                    console.print("[dim]已返回记录模式。[/dim]")
             else:
                 console.print("[yellow][!][/yellow] 报告模式只接受当前帮助中的命令。")
             continue

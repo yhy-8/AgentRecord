@@ -1,5 +1,7 @@
 import datetime
+import io
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -54,12 +56,46 @@ class MainCommandTests(unittest.TestCase):
         "AgentRecord.cli.commands.generate_analysis_report",
         return_value=("月报", True, Path("report.md")),
     )
-    def test_monthly_analysis_accepts_year_month(self, generate_report):
-        commands._handle_analysis("/a monthly 2026-07", {"name": "mock"})
+    @patch("AgentRecord.cli.commands.post_notification")
+    def test_monthly_analysis_accepts_year_month(self, notify, generate_report):
+        started = commands._handle_analysis("/a monthly 2026-07", {"name": "mock"})
+        commands.manual_report_jobs.wait(1)
 
+        self.assertTrue(started)
         self.assertEqual("monthly", generate_report.call_args.args[0])
         self.assertEqual(datetime.date(2026, 7, 1), generate_report.call_args.args[1])
         self.assertEqual("manual", generate_report.call_args.kwargs["origin"])
+        self.assertIn("分析月报已完成", notify.call_args.args[0])
+
+    @patch("AgentRecord.cli.commands.post_notification")
+    def test_only_one_manual_report_runs_per_window(self, notify):
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+
+        def slow_report(kind, anchor, model_config, *, origin):
+            worker_started.set()
+            release_worker.wait(2)
+            return "完成", True, Path("report.md")
+
+        with patch(
+            "AgentRecord.cli.commands.generate_analysis_report",
+            side_effect=slow_report,
+        ):
+            try:
+                first = commands._handle_analysis(
+                    "/a monthly 2026-07", {"name": "mock"}
+                )
+                self.assertTrue(worker_started.wait(1))
+                second = commands._handle_analysis(
+                    "/a weekly 2026-07-15", {"name": "mock"}
+                )
+            finally:
+                release_worker.set()
+                commands.manual_report_jobs.wait(1)
+
+        self.assertTrue(first)
+        self.assertFalse(second)
+        notify.assert_called_once()
 
     @patch("AgentRecord.cli.commands.generate_analysis_report")
     def test_existing_manual_report_requires_confirmation(self, generate_report):
@@ -128,6 +164,65 @@ class MainCommandTests(unittest.TestCase):
         app.run_interactive()
 
         append_log.assert_not_called()
+
+    @patch("AgentRecord.cli.app.journal.append_log")
+    @patch("AgentRecord.cli.app._handle_analysis", return_value=True)
+    @patch("AgentRecord.cli.app.show_help")
+    @patch(
+        "AgentRecord.cli.app.safe_input",
+        side_effect=["/mode", "/a monthly 2026-07", "后台期间继续记录", EOFError],
+    )
+    def test_started_report_returns_to_record_mode(
+        self, safe_input, show_help, handle_analysis, append_log
+    ):
+        app.run_interactive()
+
+        append_log.assert_called_once()
+        self.assertEqual("后台期间继续记录", append_log.call_args.args[0])
+
+    @patch("AgentRecord.cli.app.console.print")
+    @patch("AgentRecord.cli.app.show_help")
+    @patch(
+        "AgentRecord.cli.app.safe_input",
+        side_effect=[KeyboardInterrupt, EOFError],
+    )
+    def test_soft_exit_is_cancelled_while_manual_report_runs(
+        self, safe_input, show_help, console_print
+    ):
+        with patch.object(
+            app.manual_report_jobs,
+            "running_label",
+            side_effect=["分析月报", ""],
+        ):
+            app.run_interactive()
+
+        messages = [
+            str(call.args[0]) for call in console_print.call_args_list if call.args
+        ]
+        self.assertTrue(any("当前退出已取消" in message for message in messages))
+
+    def test_terminal_notification_queue_is_thread_safe(self):
+        terminal.post_notification("后台报告完成", "green")
+
+        self.assertEqual(
+            [("后台报告完成", "green")], terminal._pending_notifications()
+        )
+
+    def test_terminal_notification_restores_current_input(self):
+        output = io.BytesIO()
+        stream = io.TextIOWrapper(output, encoding="utf-8")
+        terminal.post_notification("后台报告完成", "green")
+
+        with patch.object(terminal.sys, "stdout", stream), patch.object(
+            terminal, "console"
+        ) as console:
+            terminal._show_notifications(">> ", list("正在输入"))
+            stream.flush()
+
+        self.assertTrue(output.getvalue().endswith(">> 正在输入".encode("utf-8")))
+        console.print.assert_called_once_with(
+            "后台报告完成", style="green", markup=False
+        )
 
 
 if __name__ == "__main__":

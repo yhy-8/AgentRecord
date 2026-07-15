@@ -8,7 +8,8 @@ from rich.panel import Panel
 
 from .. import journal, settings
 from ..analysis import analysis_report_path, generate_analysis_report, summarize_diary
-from .terminal import console, safe_input, show_view_help
+from .report_jobs import manual_report_jobs
+from .terminal import console, post_notification, safe_input, show_view_help
 
 
 def _handle_view(user_input: str) -> None:
@@ -67,14 +68,14 @@ def _parse_analysis_arguments(user_input: str) -> tuple[str, str]:
     return kind, date_argument
 
 
-def _handle_analysis(user_input: str, model_config: settings.ModelDict) -> None:
+def _handle_analysis(user_input: str, model_config: settings.ModelDict) -> bool:
     kind, date_argument = _parse_analysis_arguments(user_input)
     if kind == "monthly" and re.fullmatch(r"\d{4}-\d{2}", date_argument):
         date_argument += "-01"
     date = journal.resolve_date(date_argument)
     if not date:
         console.print(f"[yellow][!][/yellow] 无法解析日期: {date_argument}")
-        return
+        return False
     anchor = datetime.datetime.strptime(date, "%Y-%m-%d").date()
     label = {"daily": "日报", "weekly": "周报", "monthly": "月报"}[kind]
     target_path = analysis_report_path(kind, anchor, origin="manual")
@@ -84,16 +85,23 @@ def _handle_analysis(user_input: str, model_config: settings.ModelDict) -> None:
         ).strip().lower()
         if confirmation not in ("y", "yes", "是"):
             console.print("[dim]已取消，原报告保持不变。[/dim]")
-            return
-    console.print(f"[cyan][*][/cyan] 正在生成分析{label}...")
-    report, success, report_path = generate_analysis_report(
-        kind, anchor, model_config, origin="manual"
+            return False
+    started = manual_report_jobs.start(
+        kind,
+        anchor,
+        model_config,
+        generate_analysis_report,
+        post_notification,
     )
-    if success:
-        console.print(Panel(report, title=f"[bold]分析{label}[/bold]", border_style="green"))
-        console.print(f"[dim]报告已保存: {report_path}[/dim]")
-    else:
-        console.print(f"[red][!][/red] 报告生成失败: {report}")
+    if not started:
+        running = manual_report_jobs.running_label() or "手动报告"
+        console.print(f"[yellow][!][/yellow] {running}仍在后台生成，请完成后再试。")
+        return False
+    console.print(
+        f"[cyan][*][/cyan] 分析{label}已转入后台；可以继续记录，"
+        "完成前请不要关闭当前窗口。"
+    )
+    return True
 
 
 _REFERENCE_KIND_ALIASES = {

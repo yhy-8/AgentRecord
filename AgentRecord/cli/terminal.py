@@ -2,6 +2,7 @@
 
 import ctypes
 import os
+import queue
 import select
 import shutil
 import sys
@@ -31,9 +32,26 @@ except ImportError:
 
 
 console = Console()
+_NOTIFICATIONS: queue.SimpleQueue[tuple[str, str | None]] = queue.SimpleQueue()
 
 RECORD_MODE = "record"
 REPORT_MODE = "report"
+
+
+def post_notification(message: str, style: str | None = None) -> None:
+    """Queue a worker-thread notification for rendering by the input thread."""
+    _NOTIFICATIONS.put((message, style))
+
+
+def _pending_notifications() -> list[tuple[str, str | None]]:
+    notifications = []
+    while True:
+        try:
+            notifications.append(_NOTIFICATIONS.get_nowait())
+        except queue.Empty:
+            return notifications
+
+
 def _display_width(text: str) -> int:
     width = 0
     for character in text:
@@ -59,6 +77,26 @@ def _redraw_line(prompt: str, characters: list[str], popped: str = "") -> None:
     sys.stdout.flush()
 
 
+def _show_notifications(prompt: str, characters: list[str]) -> None:
+    notifications = _pending_notifications()
+    if not notifications:
+        return
+    current_width = _display_width(prompt) + sum(
+        _display_width(character) for character in characters
+    )
+    terminal_width = shutil.get_terminal_size().columns or 80
+    current_rows = max(1, (current_width + terminal_width - 1) // terminal_width)
+    if current_rows > 1:
+        sys.stdout.write(f"\x1b[{current_rows - 1}A")
+    sys.stdout.write("\r")
+    sys.stdout.buffer.write(b"\x1b[0J")
+    sys.stdout.flush()
+    for message, style in notifications:
+        console.print(message, style=style, markup=False)
+    sys.stdout.write(prompt + "".join(characters))
+    sys.stdout.flush()
+
+
 def _safe_input_unix(prompt: str) -> str:
     sys.stdout.write(prompt)
     sys.stdout.flush()
@@ -69,6 +107,9 @@ def _safe_input_unix(prompt: str) -> str:
         tty.setraw(file_descriptor)
         characters: list[str] = []
         while True:
+            if not select.select([file_descriptor], [], [], 0.1)[0]:
+                _show_notifications(prompt, characters)
+                continue
             byte = os.read(file_descriptor, 1)
             if not byte:
                 break
@@ -129,6 +170,10 @@ def _safe_input_windows(prompt: str) -> str:
     characters: list[str] = []
 
     while True:
+        if not msvcrt.kbhit():
+            _show_notifications(prompt, characters)
+            time.sleep(0.05)
+            continue
         character = msvcrt.getwch()
         if character in ("\r", "\n"):
             sys.stdout.write("\r\n")
@@ -188,7 +233,7 @@ def show_help(mode: str = RECORD_MODE) -> None:
             "  [cyan]/h[/cyan]        → 显示报告模式帮助\n"
             "  [cyan]/mode[/cyan]     → 切换到记录模式\n"
             "  [cyan]/s [日期][/cyan] → 生成日记顶部总结（空=今天）\n"
-            "  [cyan]/a [类型] [日期][/cyan] → 手动生成报告（daily/weekly/monthly）\n"
+            "  [cyan]/a [类型] [日期][/cyan] → 后台生成报告（daily/weekly/monthly）\n"
             "  [cyan]/m[/cyan]        → 永久切换总结和报告使用的模型"
         )
         title = "[bold]报告模式[/bold]"
