@@ -96,23 +96,42 @@ def _call_agent(
 ) -> dict:
     """Invoke an Agent while the orchestrator owns failure persistence."""
     logger.info("agent_start run=%s agent=%s", run_id, spec.name)
-    try:
-        payload = invoke_agent(spec, task, input_data, model_config, call_ai)
-    except AgentPipelineError as error:
-        store.save_artifact(
-            run_id,
-            spec.name,
-            {"response": error.response},
-            status="failed",
-            error=str(error),
-        )
-        logger.warning(
-            "agent_failed run=%s agent=%s error_type=%s",
-            run_id,
-            spec.name,
-            error.__class__.__name__,
-        )
-        raise
+    current_task = task
+    current_input = input_data
+    for attempt in range(2):
+        try:
+            payload = invoke_agent(
+                spec, current_task, current_input, model_config, call_ai
+            )
+            break
+        except AgentPipelineError as error:
+            store.save_artifact(
+                run_id,
+                spec.name,
+                {"response": error.response},
+                status="failed",
+                error=str(error),
+            )
+            repairable = str(error).startswith(
+                ("Agent 没有返回 JSON 对象", "Agent JSON 无法解析", "Agent JSON 顶层必须是对象")
+            )
+            logger.warning(
+                "agent_failed run=%s agent=%s error_type=%s format_repair=%s",
+                run_id,
+                spec.name,
+                error.__class__.__name__,
+                repairable and attempt == 0,
+            )
+            if not repairable or attempt == 1:
+                raise
+            current_task = (
+                "上次回答只是 JSON 格式无效。仅修复语法和顶层对象格式，"
+                "不要重新分析、增删或改写内容；只输出修复后的 JSON 对象。"
+            )
+            current_input = {
+                "validation_error": str(error),
+                "invalid_response": error.response,
+            }
     logger.info("agent_completed run=%s agent=%s", run_id, spec.name)
     return payload
 

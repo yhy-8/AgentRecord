@@ -394,6 +394,73 @@ class AnalysisWorkflowTests(unittest.TestCase):
         self.assertIsNone(report_path)
         self.assertEqual(2, review_calls)
 
+    def test_malformed_agent_json_gets_one_format_only_repair(self):
+        day = datetime.date(2026, 7, 14)
+        self.write_diary(day.isoformat())
+        working_call_ai = orchestrator.call_ai
+        extractor_calls = 0
+
+        def malformed_then_repaired(prompt, model_cfg, *, allowed_tools=None):
+            nonlocal extractor_calls
+            if "[程序 Agent 任务:extractor]" not in prompt:
+                return working_call_ai(prompt, model_cfg, allowed_tools=allowed_tools)
+            extractor_calls += 1
+            if extractor_calls == 1:
+                return '{"nodes": [', True, 0, {}, 0
+            payload = {
+                "nodes": [
+                    {
+                        "temp_id": "e1",
+                        "node_type": "evidence",
+                        "title": "修复后证据",
+                        "body": "一个原始想法。",
+                        "confidence": 0.9,
+                        "source_refs": ["R-20260714-001"],
+                        "metadata": {"kind": "idea", "speaker": "user"},
+                    }
+                ]
+            }
+            return json.dumps(payload, ensure_ascii=False), True, 0, {}, 0
+
+        orchestrator.call_ai = malformed_then_repaired
+        _, success, report_path = orchestrator.generate_analysis_report(
+            "daily", day, {"name": "mock"}
+        )
+
+        self.assertTrue(success)
+        self.assertEqual(2, extractor_calls)
+        run_id = re.search(
+            r"分析运行：([0-9a-f]+)", report_path.read_text(encoding="utf-8")
+        ).group(1)
+        with closing(sqlite3.connect(settings.ANALYSIS_DIR / ".analysis.sqlite3")) as connection:
+            statuses = connection.execute(
+                """
+                SELECT status FROM agent_artifacts
+                WHERE run_id = ? AND agent = 'extractor' ORDER BY revision
+                """,
+                (run_id,),
+            ).fetchall()
+        self.assertEqual([("failed",), ("completed",)], statuses)
+
+    def test_format_repair_does_not_retry_model_or_network_failure(self):
+        store = AnalysisStore()
+        run_id, _ = store.start_run(
+            "daily", "2026-07-14", "2026-07-14", "manual", "mock", "hash"
+        )
+        failed_call = Mock(return_value=("network down", False, 0, {}, 0))
+        with patch.object(orchestrator, "call_ai", failed_call):
+            with self.assertRaisesRegex(Exception, "调用失败"):
+                orchestrator._call_agent(
+                    orchestrator.extractor.SPEC,
+                    "提取",
+                    {"records": []},
+                    {"name": "mock"},
+                    store,
+                    run_id,
+                )
+
+        failed_call.assert_called_once()
+
     def test_manual_and_automatic_reports_have_separate_fixed_paths(self):
         day = datetime.date(2026, 7, 14)
         self.write_diary(day.isoformat())
@@ -480,6 +547,8 @@ class AnalysisWorkflowTests(unittest.TestCase):
         state_path = settings.ANALYSIS_DIR / ".automation-state.json"
         state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(yesterday.isoformat(), state["last_daily_date"])
+        self.assertIn("last_check_started_at", state)
+        self.assertIn("last_check_completed_at", state)
         self.assertFalse((settings.ANALYSIS_DIR / "Daily" / f"{yesterday.isoformat()}.md").exists())
         self.assertIn("<summary>\n测试生成内容\n</summary>", diary.read_text(encoding="utf-8"))
         self.assertTrue(diary.read_text(encoding="utf-8").endswith(raw_stream))

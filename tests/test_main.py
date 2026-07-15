@@ -112,13 +112,71 @@ class MainCommandTests(unittest.TestCase):
 
         generate_report.assert_not_called()
 
+    @patch(
+        "AgentRecord.cli.commands.generate_analysis_report",
+        return_value=("周报", True, Path("report.md")),
+    )
+    @patch("AgentRecord.cli.commands.post_notification")
+    def test_weekly_analysis_without_date_uses_period_selector(self, notify, generate):
+        for date in ("2026-07-07", "2026-07-09", "2026-07-14"):
+            (settings.DIARY_DIR / f"{date}.md").write_text("记录", encoding="utf-8")
+
+        with patch("AgentRecord.cli.commands.safe_input", return_value="1"):
+            started = commands._handle_analysis("/a weekly", {"name": "mock"})
+        commands.manual_report_jobs.wait(1)
+
+        self.assertTrue(started)
+        self.assertEqual(datetime.date(2026, 7, 13), generate.call_args.args[1])
+
+    def test_status_command_displays_progress_and_failure(self):
+        snapshot = {
+            "installed": True,
+            "install_message": "已安装",
+            "last_check_started_at": "2026-07-15T20:00:00",
+            "last_check_completed_at": "2026-07-15T20:01:00",
+            "last_daily_date": "2026-07-14",
+            "last_week_end": "2026-07-12",
+            "last_month_end": "2026-06-30",
+            "errors": {"weekly_report": "周报失败"},
+        }
+        with patch(
+            "AgentRecord.cli.commands.automation_status_snapshot",
+            return_value=snapshot,
+        ), patch("AgentRecord.cli.commands.console.print") as console_print:
+            commands._handle_status()
+
+        output = str(console_print.call_args.args[0].renderable)
+        self.assertIn("2026-07-14", output)
+        self.assertIn("weekly_report", output)
+
+    def test_feedback_command_records_correction(self):
+        store = Mock()
+        store.feedback_candidates.return_value = [
+            {
+                "id": "node-1",
+                "node_type": "insight",
+                "period_start": "2026-07-14",
+                "title": "原洞见",
+                "body": "原内容",
+            }
+        ]
+        with patch("AgentRecord.cli.commands.AnalysisStore", return_value=store), patch(
+            "AgentRecord.cli.commands.safe_input",
+            side_effect=["1", "3", "新洞见", "新内容"],
+        ):
+            commands._handle_feedback()
+
+        store.record_user_feedback.assert_called_once_with(
+            "node-1", "correct", title="新洞见", body="新内容"
+        )
+
     def test_help_commands_are_separated_by_mode(self):
         self.assertEqual(
-            {"/h", "/mode", "/v", "/ref", "/d", "/c"},
+            {"/h", "/mode", "/status", "/v", "/ref", "/d", "/c"},
             set(app.MODE_COMMANDS[terminal.RECORD_MODE]),
         )
         self.assertEqual(
-            {"/h", "/mode", "/s", "/a", "/m"},
+            {"/h", "/mode", "/status", "/s", "/a", "/f", "/m"},
             set(app.MODE_COMMANDS[terminal.REPORT_MODE]),
         )
 
@@ -127,8 +185,12 @@ class MainCommandTests(unittest.TestCase):
 
     def test_interactive_startup_shows_automation_status(self):
         with patch(
-            "AgentRecord.analysis.system_automation_status",
-            return_value=(True, "系统自动任务已安装。"),
+            "AgentRecord.analysis.automation_status_snapshot",
+            return_value={
+                "installed": True,
+                "install_message": "系统自动任务已安装。",
+                "errors": {},
+            },
         ), patch("AgentRecord.cli.terminal.console.print") as console_print:
             entry._show_automation_status()
 

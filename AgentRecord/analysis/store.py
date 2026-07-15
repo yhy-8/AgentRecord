@@ -16,7 +16,7 @@ from typing import Iterator, Sequence
 from .. import settings
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 NODE_STATUSES = {"candidate", "accepted", "rejected", "superseded"}
 RUN_STATUSES = {"running", "completed", "failed"}
 
@@ -63,6 +63,18 @@ class AnalysisStore:
             connection.close()
 
     def _initialize(self) -> None:
+        connection = self._connect()
+        try:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            connection.close()
+        if version > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"分析数据库版本 {version} 高于程序支持的 {SCHEMA_VERSION}"
+            )
+        if version == 1:
+            self._backup_v1_database()
+
         with self.transaction() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             if version > SCHEMA_VERSION:
@@ -148,6 +160,14 @@ class AnalysisStore:
                         updated_at TEXT NOT NULL
                     );
 
+                    CREATE TABLE node_feedback (
+                        id TEXT PRIMARY KEY,
+                        node_id TEXT NOT NULL REFERENCES knowledge_nodes(id),
+                        action TEXT NOT NULL,
+                        replacement_node_id TEXT REFERENCES knowledge_nodes(id),
+                        created_at TEXT NOT NULL
+                    );
+
                     CREATE INDEX idx_runs_period
                         ON analysis_runs(kind, period_start, period_end, origin, status);
                     CREATE INDEX idx_nodes_run_status
@@ -156,9 +176,44 @@ class AnalysisStore:
                         ON knowledge_nodes(status, updated_at DESC);
                     CREATE INDEX idx_edges_run_status
                         ON knowledge_edges(run_id, status, relation_type);
+                    CREATE INDEX idx_node_feedback_node
+                        ON node_feedback(node_id, created_at DESC);
                     """
                 )
                 connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            elif version == 1:
+                connection.execute(
+                    """
+                    CREATE TABLE node_feedback (
+                        id TEXT PRIMARY KEY,
+                        node_id TEXT NOT NULL REFERENCES knowledge_nodes(id),
+                        action TEXT NOT NULL,
+                        replacement_node_id TEXT REFERENCES knowledge_nodes(id),
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    "CREATE INDEX idx_node_feedback_node "
+                    "ON node_feedback(node_id, created_at DESC)"
+                )
+                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def _backup_v1_database(self) -> None:
+        """升级前使用 SQLite backup API 保留一份包含 WAL 内容的一致备份。"""
+        backup_path = Path(f"{self.path}.v1.bak")
+        if backup_path.exists():
+            return
+        temp_path = Path(f"{backup_path}.tmp")
+        temp_path.unlink(missing_ok=True)
+        source = sqlite3.connect(self.path, timeout=10)
+        target = sqlite3.connect(temp_path)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+        temp_path.replace(backup_path)
 
     def start_run(
         self,
@@ -499,6 +554,102 @@ class AnalysisStore:
         return self._select_nodes(
             where + " ORDER BY updated_at DESC LIMIT ?", parameters, raw_suffix=True
         )
+
+    def feedback_candidates(self, limit: int = 20) -> list[dict]:
+        """列出最近已接受的观念类节点，供用户审核。"""
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT n.*, r.kind, r.period_start, r.period_end
+                FROM knowledge_nodes AS n
+                JOIN analysis_runs AS r ON r.id = n.run_id
+                WHERE n.status = 'accepted'
+                  AND n.node_type IN ('theme', 'hypothesis', 'insight')
+                  AND r.status = 'completed'
+                ORDER BY r.completed_at DESC, n.updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        finally:
+            connection.close()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["source_refs"] = _loads(item.pop("source_refs_json"))
+            item["metadata"] = _loads(item.pop("metadata_json"))
+            result.append(item)
+        return result
+
+    def record_user_feedback(
+        self,
+        node_id: str,
+        action: str,
+        *,
+        title: str = "",
+        body: str = "",
+    ) -> str | None:
+        """记录可追溯的用户决定；已有报告不回写。"""
+        if action not in {"accept", "reject", "correct"}:
+            raise ValueError(f"无效用户反馈: {action}")
+        with self.transaction() as connection:
+            node = connection.execute(
+                "SELECT * FROM knowledge_nodes WHERE id = ?", (node_id,)
+            ).fetchone()
+            if not node:
+                raise ValueError(f"找不到节点: {node_id}")
+            if node["status"] != "accepted":
+                raise ValueError("只能处理当前已接受的节点")
+
+            now = _now()
+            replacement_id = None
+            if action == "reject":
+                connection.execute(
+                    "UPDATE knowledge_nodes SET status = 'rejected', updated_at = ? WHERE id = ?",
+                    (now, node_id),
+                )
+            else:
+                replacement_id = uuid.uuid4().hex
+                metadata = _loads(node["metadata_json"])
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata["user_feedback"] = action
+                connection.execute(
+                    """
+                    INSERT INTO knowledge_nodes(
+                        id, run_id, node_type, title, body, status, confidence,
+                        created_by, source_refs_json, metadata_json, revision,
+                        supersedes_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'accepted', ?, 'user', ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        replacement_id,
+                        node["run_id"],
+                        node["node_type"],
+                        title.strip() or node["title"],
+                        body.strip() or node["body"],
+                        node["confidence"],
+                        node["source_refs_json"],
+                        _json(metadata),
+                        node["revision"] + 1,
+                        node_id,
+                        now,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE knowledge_nodes SET status = 'superseded', updated_at = ? WHERE id = ?",
+                    (now, node_id),
+                )
+            connection.execute(
+                """
+                INSERT INTO node_feedback(id, node_id, action, replacement_node_id, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (uuid.uuid4().hex, node_id, action, replacement_id, now),
+            )
+        return replacement_id
 
     def _select_nodes(
         self, where: str, parameters: Sequence[object], *, raw_suffix: bool = False

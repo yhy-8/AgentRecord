@@ -7,7 +7,9 @@ from rich.panel import Panel
 from .. import journal, settings
 from .commands import (
     _handle_analysis,
+    _handle_feedback,
     _handle_reference,
+    _handle_status,
     _handle_summary,
     _handle_view,
 )
@@ -22,8 +24,8 @@ from .terminal import (
 
 
 MODE_COMMANDS = {
-    RECORD_MODE: ("/h", "/mode", "/v", "/ref", "/d", "/c"),
-    REPORT_MODE: ("/h", "/mode", "/s", "/a", "/m"),
+    RECORD_MODE: ("/h", "/mode", "/status", "/v", "/ref", "/d", "/c"),
+    REPORT_MODE: ("/h", "/mode", "/status", "/s", "/a", "/f", "/m"),
 }
 
 
@@ -64,6 +66,9 @@ def run_interactive() -> None:
         if command == "/h":
             show_help(mode)
             continue
+        if command == "/status":
+            _handle_status()
+            continue
 
         allowed_commands = MODE_COMMANDS[mode]
         known_commands = set(MODE_COMMANDS[RECORD_MODE] + MODE_COMMANDS[REPORT_MODE])
@@ -93,6 +98,8 @@ def run_interactive() -> None:
                 if _handle_analysis(user_input, current_model):
                     mode = RECORD_MODE
                     console.print("[dim]已返回记录模式。[/dim]")
+            elif command == "/f":
+                _handle_feedback()
             else:
                 console.print("[yellow][!][/yellow] 报告模式只接受当前帮助中的命令。")
             continue

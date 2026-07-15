@@ -78,9 +78,13 @@ def run_due_automatic_tasks() -> None:
     lock_path = _acquire_automation_lock()
     if lock_path is None:
         return
+    state = _load_automation_state()
+    state["last_check_started_at"] = datetime.datetime.now().isoformat(
+        timespec="seconds"
+    )
+    _save_automation_state(state)
     try:
         model_config = _automation_model()
-        state = _load_automation_state()
         state.pop("last_error", None)
         today = datetime.date.today()
         yesterday = today - datetime.timedelta(days=1)
@@ -126,6 +130,11 @@ def run_due_automatic_tasks() -> None:
         _set_task_error(state, "scheduler", f"自动任务异常: {error}")
         _save_automation_state(state)
     finally:
+        state = _load_automation_state()
+        state["last_check_completed_at"] = datetime.datetime.now().isoformat(
+            timespec="seconds"
+        )
+        _save_automation_state(state)
         try:
             lock_path.unlink()
         except FileNotFoundError:
@@ -281,6 +290,22 @@ def system_automation_status() -> tuple[bool, str]:
         return False, "系统自动任务未安装；自动总结和周期报告不会运行。"
     except (OSError, subprocess.SubprocessError) as error:
         return False, f"无法确认系统自动任务状态：{error}"
+
+
+def automation_status_snapshot() -> dict:
+    """汇总安装状态、最后检查、各类进度和当前失败。"""
+    installed, install_message = system_automation_status()
+    state = _load_automation_state()
+    return {
+        "installed": installed,
+        "install_message": install_message,
+        "last_check_started_at": state.get("last_check_started_at", ""),
+        "last_check_completed_at": state.get("last_check_completed_at", ""),
+        "last_daily_date": state.get("last_daily_date", ""),
+        "last_week_end": state.get("last_week_end", ""),
+        "last_month_end": state.get("last_month_end", ""),
+        "errors": dict(state.get("errors", {})),
+    }
 
 
 def install_system_automation() -> tuple[bool, str]:

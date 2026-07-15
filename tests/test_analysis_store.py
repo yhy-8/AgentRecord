@@ -1,6 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from AgentRecord.agents import cluster
@@ -197,6 +198,68 @@ class AnalysisStoreTests(unittest.TestCase):
             connection.close()
         self.assertEqual("failed", status)
         self.assertIn("未知来源", error)
+
+    def _completed_theme(self) -> tuple[str, str]:
+        run_id, _ = self.store.start_run(
+            "daily", "2026-07-14", "2026-07-14", "manual", "mock", "hash"
+        )
+        node_id = self.store.add_nodes(
+            run_id,
+            "cluster",
+            [
+                {
+                    "temp_id": "theme",
+                    "node_type": "theme",
+                    "title": "原观念",
+                    "body": "原内容",
+                    "confidence": 0.8,
+                    "source_refs": ["R-20260714-001"],
+                }
+            ],
+        )["theme"]
+        self.store.apply_node_decisions([{"node_id": node_id, "status": "accepted"}])
+        self.store.complete_run(run_id, Path("report.md"))
+        return run_id, node_id
+
+    def test_user_correction_creates_auditable_accepted_revision(self):
+        run_id, old_id = self._completed_theme()
+
+        new_id = self.store.record_user_feedback(
+            old_id, "correct", title="修正后观念", body="修正后内容"
+        )
+
+        nodes = {node["id"]: node for node in self.store.nodes_for_run(run_id)}
+        self.assertEqual("superseded", nodes[old_id]["status"])
+        self.assertEqual("accepted", nodes[new_id]["status"])
+        self.assertEqual("user", nodes[new_id]["created_by"])
+        self.assertEqual(old_id, nodes[new_id]["supersedes_id"])
+        self.assertEqual(2, nodes[new_id]["revision"])
+        self.assertEqual("修正后观念", nodes[new_id]["title"])
+
+    def test_user_rejection_removes_node_from_feedback_candidates(self):
+        _, node_id = self._completed_theme()
+        self.assertEqual(node_id, self.store.feedback_candidates()[0]["id"])
+
+        self.store.record_user_feedback(node_id, "reject")
+
+        self.assertEqual([], self.store.feedback_candidates())
+
+    def test_v1_database_is_backed_up_and_migrated_to_v2(self):
+        with closing(sqlite3.connect(self.store.path)) as connection:
+            connection.execute("DROP TABLE node_feedback")
+            connection.execute("PRAGMA user_version = 1")
+            connection.commit()
+
+        AnalysisStore(self.store.path)
+
+        with closing(sqlite3.connect(self.store.path)) as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            table = connection.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'node_feedback'"
+            ).fetchone()
+        self.assertEqual(2, version)
+        self.assertIsNotNone(table)
+        self.assertTrue(Path(f"{self.store.path}.v1.bak").exists())
 
 
 if __name__ == "__main__":

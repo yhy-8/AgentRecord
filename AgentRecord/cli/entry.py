@@ -51,13 +51,18 @@ def _handle_process_action(arguments: list[str]) -> bool:
 
 
 def _show_automation_status() -> None:
-    from ..analysis import system_automation_status
+    from ..analysis import automation_status_snapshot
     from .terminal import console
 
-    installed, message = system_automation_status()
-    color = "green" if installed else "yellow"
-    marker = "*" if installed else "!"
-    console.print(f"[{color}][{marker}] {message}[/{color}]")
+    status = automation_status_snapshot()
+    color = "green" if status["installed"] else "yellow"
+    marker = "*" if status["installed"] else "!"
+    console.print(f"[{color}][{marker}] {status['install_message']}[/{color}]")
+    if status["errors"]:
+        tasks = "、".join(status["errors"])
+        console.print(
+            f"[yellow][!] 自动任务存在未恢复失败：{tasks}；用 /status 查看。[/yellow]"
+        )
 
 
 def main() -> None:

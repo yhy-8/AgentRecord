@@ -232,8 +232,10 @@ def show_help(mode: str = RECORD_MODE) -> None:
         content = (
             "  [cyan]/h[/cyan]        → 显示报告模式帮助\n"
             "  [cyan]/mode[/cyan]     → 切换到记录模式\n"
+            "  [cyan]/status[/cyan]   → 查看自动任务安装、进度与失败状态\n"
             "  [cyan]/s [日期][/cyan] → 生成日记顶部总结（空=今天）\n"
-            "  [cyan]/a [类型] [日期][/cyan] → 后台生成报告（daily/weekly/monthly）\n"
+            "  [cyan]/a [类型] [日期][/cyan] → 后台生成报告（周/月空日期时快速选择）\n"
+            "  [cyan]/f[/cyan]        → 认可、否决或修正最近的观念节点\n"
             "  [cyan]/m[/cyan]        → 永久切换总结和报告使用的模型"
         )
         title = "[bold]报告模式[/bold]"
@@ -242,6 +244,7 @@ def show_help(mode: str = RECORD_MODE) -> None:
             "  普通文字      → 立即写入今日日记\n"
             "  [cyan]/h[/cyan]        → 显示记录模式帮助\n"
             "  [cyan]/mode[/cyan]     → 切换到报告模式\n"
+            "  [cyan]/status[/cyan]   → 查看自动任务安装、进度与失败状态\n"
             "  [cyan]/v [日期][/cyan] → 查看历史日记（[cyan]/v help[/cyan] 查看用法）\n"
             "  [cyan]/ref [类型] [筛选][/cyan] → 引用日记或分析报告并继续记录\n"
             "  [cyan]/d[/cyan]        → 删除今日最后一条记录\n"
