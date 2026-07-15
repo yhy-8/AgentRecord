@@ -21,7 +21,7 @@ def configure_logging(
     force: bool = False,
 ) -> Path | None:
     """Configure one size-rotated handler for the AgentRecord logger tree."""
-    directory = log_dir or settings.CONFIG_DIR / "Log"
+    directory = log_dir or settings.LOG_DIR
     path = directory / LOG_NAME
     logger = logging.getLogger("AgentRecord")
     logger.setLevel(logging.INFO)

@@ -13,6 +13,9 @@ class ModelSettingsTests(unittest.TestCase):
             settings._get_config_path(),
         )
 
+    def test_log_directory_uses_config_relative_default(self):
+        self.assertEqual(settings.CONFIG_DIR / "Log", settings.LOG_DIR)
+
     def test_selected_model_is_persisted_without_rewriting_config(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.yaml"

@@ -112,6 +112,7 @@ third_search:
 
 diary_dir: ./Records
 analysis_dir: ./AnalysisReports
+log_dir: ./Log
 
 automation:
   enabled: true
@@ -121,7 +122,7 @@ automation:
 ```
 
 - `current_model` 是手动总结、手动报告和自动任务统一使用的模型；报告模式执行 `/m` 会永久更新该配置。
-- `diary_dir` 和 `analysis_dir` 的相对路径以 `config.yaml` 所在目录为基准。
+- `diary_dir`、`analysis_dir` 和 `log_dir` 的相对路径以 `config.yaml` 所在目录为基准。
 - 可以分别关闭三种自动任务，或用 `automation.enabled: false` 关闭整个自动流程。
 - 第三方搜索仅在所选模型没有原生搜索能力时使用。
 - 不要把真实 API 密钥提交到版本库或写入测试输出。
@@ -188,7 +189,7 @@ Copy-Item config.yaml dist\config.yaml
 - 手动与自动报告分开保存，同一周期各自只保留一份。
 - Agent 的运行记录、中间产物、候选/接受/拒绝节点和关系保存在 `AnalysisReports/.analysis.sqlite3`。同一周期重跑可以复用已接受内容；修订通过新版本替代旧版本，不静默覆盖历史判断。
 - SQLite 是本地派生分析知识层，不替代 `Records/` 中的 Markdown 原始记录。不要在程序运行时手工删除数据库、WAL 或 SHM 文件。
-- 运行诊断日志保存在 `Log/AgentRecord.log`，达到 5 MiB 后自动轮转，最多保留 2 个归档；日志不包含完整日记或模型请求/响应正文。
+- 运行诊断日志默认保存在 `Log/AgentRecord.log`，目录可通过 `log_dir` 修改。日志达到 5 MiB 后自动轮转，最多保留 2 个归档；日志不包含完整日记或模型请求/响应正文。
 
 ## 后台任务细节
 

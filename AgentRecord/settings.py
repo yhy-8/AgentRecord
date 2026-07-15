@@ -43,6 +43,7 @@ def _configured_path(key: str, default: str) -> Path:
 
 DIARY_DIR = _configured_path("diary_dir", "./Records")
 ANALYSIS_DIR = _configured_path("analysis_dir", "./AnalysisReports")
+LOG_DIR = _configured_path("log_dir", "./Log")
 DIARY_DIR.mkdir(parents=True, exist_ok=True)
 
 
