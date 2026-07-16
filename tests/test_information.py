@@ -10,6 +10,18 @@ from AgentRecord.analysis import context, information
 
 
 class InformationBriefingTests(unittest.TestCase):
+    @staticmethod
+    def valid_briefing(exploration: str = "可延伸。") -> str:
+        highlights = "\n\n".join(
+            f"### {number}. 事项 {number}\n\n新资料 [来源](https://example.com/{number})"
+            for number in range(1, 6)
+        )
+        return (
+            f"## 今日值得关注\n\n{highlights}\n\n"
+            f"## 与本周思考相关的探索\n\n{exploration}\n\n"
+            "## 可继续追踪\n\n后续更新。"
+        )
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         root = Path(self.temp_dir.name)
@@ -56,9 +68,7 @@ class InformationBriefingTests(unittest.TestCase):
                 return json.dumps(payload), True, 0, {}, 0
             collector_prompts.append(prompt)
             return (
-                "## 今日值得关注\n\n新资料 [来源](https://example.com/news)\n\n"
-                "## 与本周思考相关的探索\n\n可延伸。\n\n"
-                "## 可继续追踪\n\n后续更新。",
+                self.valid_briefing(),
                 True,
                 0,
                 {"web_search": 2},
@@ -129,9 +139,7 @@ class InformationBriefingTests(unittest.TestCase):
                 )
             collector_prompts.append(prompt)
             return (
-                "## 今日值得关注\n\n新资料 [来源](https://example.com/news)\n\n"
-                "## 与本周思考相关的探索\n\n新增内容。\n\n"
-                "## 可继续追踪\n\n后续更新。",
+                self.valid_briefing("新增内容。"),
                 True,
                 0,
                 {"web_search": 3},
@@ -154,6 +162,35 @@ class InformationBriefingTests(unittest.TestCase):
         generated = path.read_text(encoding="utf-8")
         self.assertNotIn("个人知识管理最新进展", generated)
         self.assertIn("本地优先笔记软件数据迁移风险", generated)
+
+    def test_invalid_query_json_fails_without_a_second_model_call(self):
+        date = datetime.date(2026, 7, 15)
+        (settings.DIARY_DIR / "2026-07-15.md").write_text(
+            "# 2026-07-15\n\n<summary>\n\n</summary>\n\n"
+            "---\n## 原始记录流\n\n**09:00:** 研究一个问题。\n",
+            encoding="utf-8",
+        )
+
+        with patch.object(
+            information,
+            "call_ai",
+            return_value=("不是 JSON", True, 0, {}, 0),
+        ) as call:
+            message, success, path = information.generate_information_briefing(
+                date, {"name": "mock", "search": False}
+            )
+
+        self.assertFalse(success)
+        self.assertIsNone(path)
+        self.assertIn("没有返回有效 JSON", message)
+        self.assertEqual(1, call.call_count)
+
+    def test_today_highlights_require_exactly_five_numbered_items(self):
+        self.assertTrue(information._has_five_daily_highlights(self.valid_briefing()))
+        only_four = self.valid_briefing().replace(
+            "### 5. 事项 5\n\n新资料 [来源](https://example.com/5)\n\n", ""
+        )
+        self.assertFalse(information._has_five_daily_highlights(only_four))
 
     def test_briefing_fails_when_web_search_is_not_configured(self):
         settings.CONFIG["third_search"] = {"enabled": False, "api_key": ""}

@@ -178,7 +178,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
         )
         self.assertTrue(manual and auto)
         self.assertNotEqual(manual_path, auto_path)
-        self.assertIn("手动重试自动任务", auto_path.read_text(encoding="utf-8"))
+        self.assertIn("自动任务重试", auto_path.read_text(encoding="utf-8"))
 
     def test_report_reference_is_not_loaded_but_diary_reference_is(self):
         day = "2026-07-14"
@@ -289,7 +289,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
             [call.args[0] for call in generate.call_args_list],
         )
 
-    def test_retrospective_keeps_separate_format_and_review_repairs(self):
+    def test_retrospective_validation_failure_stops_without_rewriting(self):
         source_id = "R-20260714-001"
         base_input = {
             "period": {"kind": "weekly", "start": "2026-07-13", "end": "2026-07-19"},
@@ -297,18 +297,14 @@ class AnalysisWorkflowTests(unittest.TestCase):
             "historical_profiles": [],
         }
         invalid = {"markdown": "缺少引用", "profile_entries": []}
-        valid = {"markdown": f"有依据的回顾 [{source_id}]", "profile_entries": []}
-        revised = {"markdown": f"按审查意见修订 [{source_id}]", "profile_entries": []}
         store = Mock()
 
         with patch.object(
-            orchestrator, "_call_agent", side_effect=[invalid, valid, revised]
-        ) as call_agent, patch.object(
-            orchestrator,
-            "_review",
-            side_effect=[(False, {}, ["收紧事实表述"]), (True, {}, [])],
+            orchestrator, "_call_agent", return_value=invalid
+        ) as call_agent, patch.object(orchestrator, "_review") as review, self.assertRaises(
+            AgentPipelineError
         ):
-            markdown, _, _ = orchestrator._retrospective_section(
+            orchestrator._retrospective_section(
                 base_input,
                 {source_id},
                 {source_id},
@@ -318,10 +314,10 @@ class AnalysisWorkflowTests(unittest.TestCase):
                 "run-id",
             )
 
-        self.assertEqual(f"按审查意见修订 [{source_id}]", markdown)
-        self.assertEqual(3, call_agent.call_count)
+        self.assertEqual(1, call_agent.call_count)
+        review.assert_not_called()
 
-    def test_json_format_repair_preserves_first_search_telemetry(self):
+    def test_invalid_agent_json_fails_without_a_repair_call(self):
         parse_error = AgentPipelineError(
             "Agent JSON 无法解析: test",
             response="invalid",
@@ -331,20 +327,12 @@ class AnalysisWorkflowTests(unittest.TestCase):
                 "search_results": 12,
             },
         )
-        repaired = {
-            "markdown": "repaired",
-            "_telemetry": {
-                "web_citations": 0,
-                "tool_calls": {},
-                "search_results": 0,
-            },
-        }
         store = Mock()
 
         with patch.object(
-            orchestrator, "invoke_agent", side_effect=[parse_error, repaired]
-        ):
-            payload = orchestrator._call_agent(
+            orchestrator, "invoke_agent", side_effect=parse_error
+        ) as invoke, self.assertRaises(AgentPipelineError):
+            orchestrator._call_agent(
                 orchestrator.researcher.SPEC,
                 "研究",
                 {},
@@ -353,8 +341,10 @@ class AnalysisWorkflowTests(unittest.TestCase):
                 "run-id",
             )
 
-        self.assertEqual(1, payload["_telemetry"]["tool_calls"]["web_search"])
-        self.assertEqual(12, payload["_telemetry"]["search_results"])
+        self.assertEqual(1, invoke.call_count)
+        saved_payload = store.save_artifact.call_args.args[2]
+        self.assertEqual(1, saved_payload["_telemetry"]["tool_calls"]["web_search"])
+        self.assertEqual(12, saved_payload["_telemetry"]["search_results"])
 
     def test_linux_session_lock_uses_logind_locked_hint(self):
         results = [
@@ -434,6 +424,40 @@ class AnalysisWorkflowTests(unittest.TestCase):
 
         weekly.assert_not_called()
         monthly.assert_not_called()
+
+    def test_failed_task_becomes_due_at_the_next_clock_hour(self):
+        state = {
+            "errors": {"weekly_report": "2026-07-17 00:25 周报失败"},
+            "retry_after": {"weekly_report": "2026-07-17T01:00:00"},
+        }
+
+        self.assertFalse(
+            automation._failure_retry_is_due(
+                state, "weekly_report", datetime.datetime(2026, 7, 17, 0, 59)
+            )
+        )
+        self.assertTrue(
+            automation._failure_retry_is_due(
+                state, "weekly_report", datetime.datetime(2026, 7, 17, 1, 0)
+            )
+        )
+
+    def test_recorded_failure_sets_and_clears_next_hour_deadline(self):
+        class FixedDateTime(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 7, 17, 0, 25, 41)
+
+        state = {}
+        with patch.object(automation.datetime, "datetime", FixedDateTime):
+            automation._set_task_error(state, "weekly_report", "周报失败")
+
+        self.assertEqual(
+            "2026-07-17T01:00:00", state["retry_after"]["weekly_report"]
+        )
+        automation._clear_task_error(state, "weekly_report")
+        self.assertNotIn("errors", state)
+        self.assertNotIn("retry_after", state)
 
     def test_retry_command_launches_detached_process(self):
         settings.ANALYSIS_DIR.mkdir()

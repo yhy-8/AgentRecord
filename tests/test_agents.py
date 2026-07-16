@@ -7,10 +7,14 @@ from AgentRecord.agents import (
     retrospective,
     reviewer,
 )
-from AgentRecord.agents.base import AgentPipelineError
+from AgentRecord.agents.base import AgentPipelineError, _parse_json
 
 
 class AgentModuleTests(unittest.TestCase):
+    def test_json_parser_rejects_markdown_fences_without_repairing(self):
+        with self.assertRaisesRegex(AgentPipelineError, "JSON 无法解析"):
+            _parse_json('```json\n{"markdown":"内容"}\n```')
+
     def test_four_agents_have_separate_responsibilities(self):
         self.assertEqual(
             {"retrospective", "research_planner", "researcher", "reviewer"},
@@ -33,6 +37,18 @@ class AgentModuleTests(unittest.TestCase):
                 current_source_ids={"R-20260714-001"},
                 visible_profile_ids=set(),
             )
+
+    def test_grouped_record_citations_are_all_recognized(self):
+        markdown = "整理内容 [R-20260714-001, R-20260714-002]"
+
+        result, _ = retrospective.validate(
+            {"markdown": markdown, "profile_entries": []},
+            allowed_source_ids={"R-20260714-001", "R-20260714-002"},
+            current_source_ids={"R-20260714-001", "R-20260714-002"},
+            visible_profile_ids=set(),
+        )
+
+        self.assertEqual(markdown, result)
 
     def test_profile_update_requires_current_period_evidence(self):
         with self.assertRaisesRegex(AgentPipelineError, "本周期来源"):

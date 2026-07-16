@@ -43,7 +43,7 @@ v3 删除旧版通用知识图谱，把数据库职责缩小为：
 | `error` | 失败原因 |
 | `created_at/completed_at` | 本地时间戳 |
 
-手动触发只允许 `origin=manual, trigger=manual`。系统计划任务使用 `origin=auto, trigger=scheduled`；`/retry` 使用 `origin=auto, trigger=retry`。
+手动触发只允许 `origin=manual, trigger=manual`。系统计划任务首次执行使用 `origin=auto, trigger=scheduled`；整点自动重试和 `/retry` 都使用 `origin=auto, trigger=retry`。
 
 每次重跑都插入新行。Markdown 固定路径可以被覆盖，运行 ID 仍保留每次尝试的审计身份。
 

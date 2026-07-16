@@ -35,25 +35,23 @@ class AgentPipelineError(RuntimeError):
 
 def _parse_json(text: str) -> dict:
     stripped = text.strip()
-    if stripped.startswith("```"):
-        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, count=1)
-        stripped = re.sub(r"\s*```$", "", stripped, count=1)
     try:
         value = json.loads(stripped)
-    except json.JSONDecodeError:
-        start = stripped.find("{")
-        end = stripped.rfind("}")
-        if start < 0 or end <= start:
-            raise AgentPipelineError("Agent 没有返回 JSON 对象", response=text)
-        try:
-            value = json.loads(stripped[start : end + 1])
-        except json.JSONDecodeError as error:
-            raise AgentPipelineError(
-                f"Agent JSON 无法解析: {error}", response=text
-            ) from error
+    except json.JSONDecodeError as error:
+        raise AgentPipelineError(
+            f"Agent JSON 无法解析: {error}", response=text
+        ) from error
     if not isinstance(value, dict):
         raise AgentPipelineError("Agent JSON 顶层必须是对象", response=text)
     return value
+
+
+def cited_source_ids(markdown: str) -> set[str]:
+    """Return source IDs appearing inside Markdown citation brackets."""
+    refs: set[str] = set()
+    for citation in re.findall(r"\[([^\]\n]+)\]", markdown):
+        refs.update(re.findall(r"R-\d{8}-\d{3}", citation))
+    return refs
 
 
 def _prompt(spec: AgentSpec, task: str, input_data: dict) -> str:

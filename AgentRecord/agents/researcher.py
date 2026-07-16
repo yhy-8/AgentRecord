@@ -2,7 +2,7 @@
 
 import re
 
-from .base import AgentPipelineError, AgentSpec
+from .base import AgentPipelineError, AgentSpec, cited_source_ids
 
 
 SPEC = AgentSpec(
@@ -27,7 +27,7 @@ def validate(
         raise AgentPipelineError("Researcher markdown 为空或格式错误")
     if re.search(r"^#{1,2}\s", markdown, re.MULTILINE) or "```" in markdown:
         raise AgentPipelineError("领域研究包含一、二级标题或代码围栏")
-    cited = set(re.findall(r"\[(R-\d{8}-\d{3})\]", markdown))
+    cited = cited_source_ids(markdown)
     if cited - allowed_source_ids:
         raise AgentPipelineError("领域研究引用未知记录来源")
     required_refs = {

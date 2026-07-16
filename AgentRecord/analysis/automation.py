@@ -92,10 +92,19 @@ def _automation_model() -> settings.ModelDict:
     return settings.ModelConfig.get_model()
 
 
-def _set_task_error(state: dict, task: str, message: str) -> None:
-    state.setdefault("errors", {})[task] = (
-        f"{datetime.datetime.now():%Y-%m-%d %H:%M} {message}"
+def _next_hour(now: datetime.datetime) -> datetime.datetime:
+    return now.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(
+        hours=1
     )
+
+
+def _set_task_error(state: dict, task: str, message: str) -> None:
+    now = datetime.datetime.now()
+    state.setdefault("errors", {})[task] = f"{now:%Y-%m-%d %H:%M} {message}"
+    if task in AUTOMATION_TASK_LABELS:
+        state.setdefault("retry_after", {})[task] = _next_hour(now).isoformat(
+            timespec="seconds"
+        )
 
 
 def _clear_task_error(state: dict, task: str) -> None:
@@ -103,6 +112,10 @@ def _clear_task_error(state: dict, task: str) -> None:
     errors.pop(task, None)
     if not errors:
         state.pop("errors", None)
+    retry_after = state.get("retry_after", {})
+    retry_after.pop(task, None)
+    if not retry_after:
+        state.pop("retry_after", None)
 
 
 def _acquire_automation_lock() -> _AutomationLock | None:
@@ -136,8 +149,24 @@ def _set_current_task(state: dict, task: str, detail: str) -> None:
     _save_automation_state(state)
 
 
-def _task_has_failure(state: dict, task: str) -> bool:
-    return task in state.get("errors", {})
+def _failure_retry_is_due(
+    state: dict, task: str, now: datetime.datetime
+) -> bool:
+    if task not in state.get("errors", {}):
+        return True
+    retry_text = str(state.get("retry_after", {}).get(task, ""))
+    if retry_text:
+        try:
+            return now >= datetime.datetime.fromisoformat(retry_text)
+        except ValueError:
+            return False
+
+    error_text = str(state.get("errors", {}).get(task, ""))
+    try:
+        failed_at = datetime.datetime.strptime(error_text[:16], "%Y-%m-%d %H:%M")
+    except ValueError:
+        return False
+    return now >= _next_hour(failed_at)
 
 
 def _run_daily_summaries(
@@ -207,29 +236,39 @@ def run_due_automatic_tasks() -> None:
             state.pop("deferred_reason", None)
             now = datetime.datetime.now()
             today = now.date()
-            if automation.get("daily_summary", True) and not _task_has_failure(
-                state, "daily_summary"
+            if automation.get("daily_summary", True) and _failure_retry_is_due(
+                state, "daily_summary", now
             ):
                 _run_daily_summaries(today, state, model_config)
 
             if (
                 not session_is_locked()
                 and automation.get("daily_information", True)
-                and not _task_has_failure(state, "daily_information")
+                and _failure_retry_is_due(state, "daily_information", now)
             ):
                 _run_daily_information(now, state, model_config)
             if (
                 not session_is_locked()
                 and automation.get("weekly_report", True)
-                and not _task_has_failure(state, "weekly_report")
+                and _failure_retry_is_due(state, "weekly_report", now)
             ):
-                _run_weekly_reports(today, state, model_config, trigger="scheduled")
+                trigger = (
+                    "retry"
+                    if "weekly_report" in state.get("errors", {})
+                    else "scheduled"
+                )
+                _run_weekly_reports(today, state, model_config, trigger=trigger)
             if (
                 not session_is_locked()
                 and automation.get("monthly_report", True)
-                and not _task_has_failure(state, "monthly_report")
+                and _failure_retry_is_due(state, "monthly_report", now)
             ):
-                _run_monthly_reports(today, state, model_config, trigger="scheduled")
+                trigger = (
+                    "retry"
+                    if "monthly_report" in state.get("errors", {})
+                    else "scheduled"
+                )
+                _run_monthly_reports(today, state, model_config, trigger=trigger)
             if session_is_locked():
                 _mark_lock_deferred(state)
     except Exception as error:
@@ -657,6 +696,7 @@ def automation_status_snapshot() -> dict:
         "last_information_date": state.get("last_information_date", ""),
         "last_week_end": state.get("last_week_end", ""),
         "last_month_end": state.get("last_month_end", ""),
+        "retry_after": dict(state.get("retry_after", {})),
         "errors": dict(state.get("errors", {})),
     }
 

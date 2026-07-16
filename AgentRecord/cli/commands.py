@@ -216,8 +216,14 @@ def _handle_status() -> None:
         )
     errors = status["errors"]
     if errors:
-        lines.append("  [yellow]当前失败（报告模式执行 /retry 可全部重试）：[/yellow]")
-        lines.extend(f"    - {task}: {message}" for task, message in errors.items())
+        lines.append(
+            "  [yellow]当前失败（到达下个整点自动重试；/retry 可立即全量重试）：[/yellow]"
+        )
+        retry_after = status.get("retry_after", {})
+        for task, message in errors.items():
+            deadline = retry_after.get(task, "")
+            suffix = f"；不早于 {deadline}" if deadline else ""
+            lines.append(f"    - {task}: {message}{suffix}")
     else:
         lines.append("  当前失败：无")
     console.print(Panel("\n".join(lines), title="[bold]自动任务状态[/bold]", border_style="cyan"))

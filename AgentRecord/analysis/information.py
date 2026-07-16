@@ -146,9 +146,6 @@ def _deduplicate_queries(queries: list[dict], history: list[dict]) -> list[dict]
 
 def _parse_queries(response: str) -> list[dict]:
     stripped = response.strip()
-    if stripped.startswith("```"):
-        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, count=1)
-        stripped = re.sub(r"\s*```$", "", stripped, count=1)
     payload = json.loads(stripped)
     if not isinstance(payload, dict) or not isinstance(payload.get("queries"), list):
         raise ValueError("定向信息查询格式无效")
@@ -193,25 +190,25 @@ def _targeted_queries(
 
 【本周已经使用的定向查询】
 {json.dumps(query_history, ensure_ascii=False)}"""
-    invalid_response = ""
-    for attempt in range(2):
-        current_prompt = prompt
-        if attempt:
-            current_prompt = (
-                "上次回答不是指定 JSON。仅修复格式，不增删查询；"
-                "只输出 {\"queries\":[{\"query\":\"...\",\"reason\":\"...\"}]}。\n"
-                f"待修复回答：{invalid_response}"
-            )
-        response, success, _, _, _ = call_ai(
-            current_prompt, model_config, allowed_tools=()
-        )
-        if not success:
-            return [], response
-        try:
-            return _deduplicate_queries(_parse_queries(response), query_history), ""
-        except (ValueError, json.JSONDecodeError):
-            invalid_response = response
-    return [], "定向信息查询连续两次未返回有效 JSON"
+    response, success, _, _, _ = call_ai(prompt, model_config, allowed_tools=())
+    if not success:
+        return [], response
+    try:
+        return _deduplicate_queries(_parse_queries(response), query_history), ""
+    except (ValueError, json.JSONDecodeError):
+        return [], "定向信息查询没有返回有效 JSON"
+
+
+def _has_five_daily_highlights(markdown: str) -> bool:
+    match = re.search(
+        r"^## 今日值得关注\s*$([\s\S]*?)(?=^##\s|\Z)",
+        markdown,
+        re.MULTILINE,
+    )
+    if not match:
+        return False
+    numbers = re.findall(r"^###\s+([1-5])[.、]\s+\S", match.group(1), re.MULTILINE)
+    return numbers == ["1", "2", "3", "4", "5"]
 
 
 def _web_search_available(model_config: settings.ModelDict) -> bool:
@@ -258,6 +255,8 @@ def generate_information_briefing(
 - 只收录具有较高信息量、可验证且对理解变化有价值的内容，不做热搜堆砌。
 - 优先一手、权威和多源可交叉验证的资料；区分事实、来源观点和 AI 推断。
 - 包含“今日值得关注”、“与本周思考相关的探索”、“可继续追踪”三个二级标题。
+- “今日值得关注”用于纯粹拓宽视野，固定选择五项彼此独立的重要信息，并严格使用“### 1. 标题”至“### 5. 标题”作为三级标题。
+- “与本周思考相关的探索”只对应定向查询；定向查询可以为零至三项，不得为了数量重复本周已有主题。
 - 每项关键信息就近附上 Markdown 来源链接和日期；无可靠来源时不要写成事实。
 - 定向查询是本周记录抽象后的研究方向，不得推测或还原私人细节。
 - 对照本周此前的信息简报，已经报道过的事件、背景和结论不得重复写入。只有出现实质性新事件、新数据、新来源或相反证据时才继续同一主题，并明确说明“新在哪里”。
@@ -292,6 +291,8 @@ def generate_information_briefing(
     )
     if any(section not in markdown for section in required_sections):
         return "信息简报缺少必需章节。", False, None
+    if not _has_five_daily_highlights(markdown):
+        return "信息简报的“今日值得关注”没有按要求生成固定五项。", False, None
 
     path = information_briefing_path(date)
     path.parent.mkdir(parents=True, exist_ok=True)

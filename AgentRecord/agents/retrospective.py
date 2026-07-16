@@ -2,7 +2,7 @@
 
 import re
 
-from .base import AgentPipelineError, AgentSpec, confidence
+from .base import AgentPipelineError, AgentSpec, cited_source_ids, confidence
 
 
 PROFILE_CATEGORIES = {
@@ -38,7 +38,7 @@ def section_errors(markdown: str, allowed_source_ids: set[str]) -> list[str]:
         errors.append("整理与回顾包含一、二级标题")
     if "```" in markdown:
         errors.append("整理与回顾包含代码围栏")
-    cited = set(re.findall(r"\[(R-\d{8}-\d{3})\]", markdown))
+    cited = cited_source_ids(markdown)
     unknown = cited - allowed_source_ids
     if unknown:
         errors.append("整理与回顾引用未知来源: " + ", ".join(sorted(unknown)))
@@ -46,7 +46,7 @@ def section_errors(markdown: str, allowed_source_ids: set[str]) -> list[str]:
         content = paragraph.strip()
         if not content or content.startswith("### "):
             continue
-        if not re.search(r"\[R-\d{8}-\d{3}\]", content):
+        if not cited_source_ids(content):
             preview = re.sub(r"\s+", " ", content)[:160]
             errors.append(f"整理与回顾存在没有来源引用的段落：{preview}")
             break
