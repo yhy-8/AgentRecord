@@ -1,212 +1,107 @@
 import unittest
 
-from AgentRecord.agents import AGENTS, explorer, extractor, report, world
+from AgentRecord.agents import (
+    AGENTS,
+    researcher,
+    research_planner,
+    retrospective,
+    reviewer,
+)
 from AgentRecord.agents.base import AgentPipelineError
-from AgentRecord.agents.graph import inherit_source_refs, replace_node_ids
 
 
 class AgentModuleTests(unittest.TestCase):
-    def test_six_agents_have_independent_registered_specs(self):
+    def test_four_agents_have_separate_responsibilities(self):
         self.assertEqual(
-            {"extractor", "cluster", "explorer", "world", "reviewer", "report"},
+            {"retrospective", "research_planner", "researcher", "reviewer"},
             set(AGENTS),
         )
-        self.assertEqual(frozenset({"web_search"}), AGENTS["world"].allowed_tools)
-        for name, spec in AGENTS.items():
-            if name != "world":
-                self.assertEqual(frozenset(), spec.allowed_tools)
+        self.assertEqual(
+            frozenset({"web_search"}), AGENTS["researcher"].allowed_tools
+        )
+        self.assertEqual(frozenset(), AGENTS["retrospective"].allowed_tools)
 
-    def test_explorer_removes_basic_private_data_from_search_queries(self):
-        queries = explorer.clean_research_queries(
+    def test_retrospective_requires_citations_in_each_content_paragraph(self):
+        with self.assertRaisesRegex(AgentPipelineError, "没有来源引用"):
+            retrospective.validate(
+                {
+                    "markdown": "第一段没有引用。\n\n第二段 [R-20260714-001]",
+                    "profile_entries": [],
+                },
+                allowed_source_ids={"R-20260714-001"},
+                current_source_ids={"R-20260714-001"},
+                visible_profile_ids=set(),
+            )
+
+    def test_profile_update_requires_current_period_evidence(self):
+        with self.assertRaisesRegex(AgentPipelineError, "本周期来源"):
+            retrospective.validate(
+                {
+                    "markdown": "整理内容 [R-20260714-001]",
+                    "profile_entries": [
+                        {
+                            "temp_id": "p1",
+                            "category": "viewpoint",
+                            "title": "观点",
+                            "statement": "一个观点",
+                            "confidence": 0.8,
+                            "source_refs": ["R-20260701-001"],
+                            "supersedes_id": None,
+                        }
+                    ],
+                },
+                allowed_source_ids={"R-20260701-001", "R-20260714-001"},
+                current_source_ids={"R-20260714-001"},
+                visible_profile_ids=set(),
+            )
+
+    def test_research_planner_sanitizes_private_query_data(self):
+        topics = research_planner.validate(
             {
-                "research_queries": [
+                "topics": [
                     {
-                        "target_id": "insight-1",
-                        "query": "查 user@example.com 13800138000 /home/user/private.txt /mnt/d/private.md",
-                        "reason": "核查",
+                        "topic_id": "Q001",
+                        "title": "公开研究问题",
+                        "query": "研究 /mnt/private/a 和 12345678",
+                        "reason": "拓宽视野",
+                        "origin": "records",
+                        "source_refs": ["R-20260714-001"],
                     }
                 ]
             },
-            {"insight-1"},
+            {"R-20260714-001"},
         )
+        self.assertNotIn("/mnt/private", topics[0]["query"])
+        self.assertNotIn("12345678", topics[0]["query"])
 
-        self.assertEqual(1, len(queries))
-        self.assertIn("[email]", queries[0]["query"])
-        self.assertIn("[number]", queries[0]["query"])
-        self.assertIn("[local-path]", queries[0]["query"])
-
-    def test_node_id_replacement_preserves_new_temporary_ids(self):
-        persistent = "a" * 32
-        payload = {
-            "nodes": [
+    def test_researcher_requires_external_url(self):
+        with self.assertRaisesRegex(AgentPipelineError, "外部来源"):
+            researcher.validate(
                 {
-                    "temp_id": "new-1",
-                    "source_refs": [persistent],
-                    "metadata": {"target_id": persistent},
-                }
-            ],
-            "edges": [{"source_id": "new-1", "target_id": persistent}],
-        }
-
-        replaced = replace_node_ids(payload, {persistent: "K001"})
-
-        self.assertEqual("new-1", replaced["nodes"][0]["temp_id"])
-        self.assertEqual("K001", replaced["nodes"][0]["source_refs"][0])
-        self.assertEqual("K001", replaced["nodes"][0]["metadata"]["target_id"])
-        self.assertEqual("new-1", replaced["edges"][0]["source_id"])
-
-    def test_extractor_accepts_methodology_evidence(self):
-        nodes, _ = extractor.validate(
-            {
-                "nodes": [
+                    "markdown": "研究内容 [R-20260714-001]",
+                    "sources": [],
+                },
+                [
                     {
-                        "temp_id": "method-1",
-                        "node_type": "evidence",
-                        "title": "一种复盘方法",
-                        "body": "用户记录了自己反复使用的复盘方法。",
-                        "confidence": 0.9,
+                        "topic_id": "Q001",
+                        "origin": "records",
                         "source_refs": ["R-20260714-001"],
-                        "metadata": {
-                            "kind": "methodology",
-                            "speaker": "user",
-                        },
                     }
                 ],
-                "edges": [],
-            },
-            allowed_source_ids={"R-20260714-001"},
-            visible_node_ids=set(),
-        )
-
-        self.assertEqual("methodology", nodes[0]["metadata"]["kind"])
-
-    def test_explorer_requires_query_for_research_needed_node(self):
-        payload = {
-            "nodes": [
-                {
-                    "temp_id": "insight-1",
-                    "node_type": "insight",
-                    "title": "一种问题分析方法",
-                    "body": "记录显示用户正在形成一种稳定的问题分析方法。",
-                    "confidence": 0.8,
-                    "source_refs": ["R-20260714-001"],
-                    "metadata": {
-                        "insight_type": "methodology",
-                        "evidence_for": ["evidence-1"],
-                        "evidence_against": [],
-                        "inference_level": "medium",
-                        "why_it_matters": "可以与外部方法比较并继续发展",
-                        "research_needed": True,
-                    },
-                }
-            ],
-            "edges": [],
-            "research_queries": [],
-        }
-
-        with self.assertRaisesRegex(AgentPipelineError, "缺少配套研究问题"):
-            explorer.validate(
-                payload,
-                allowed_source_ids={"R-20260714-001"},
-                visible_node_ids={"evidence-1"},
+                {"R-20260714-001"},
             )
 
-    def test_explorer_accepts_methodology_with_matching_research_query(self):
-        payload = {
-            "nodes": [
+    def test_reviewer_must_decide_every_profile_entry(self):
+        with self.assertRaisesRegex(AgentPipelineError, "未审查全部"):
+            reviewer.validate(
                 {
-                    "temp_id": "insight-1",
-                    "node_type": "insight",
-                    "title": "一种问题分析方法",
-                    "body": "记录显示用户正在形成一种稳定的问题分析方法。",
-                    "confidence": 0.8,
-                    "source_refs": ["R-20260714-001"],
-                    "metadata": {
-                        "insight_type": "methodology",
-                        "evidence_for": ["evidence-1"],
-                        "evidence_against": [],
-                        "inference_level": "medium",
-                        "why_it_matters": "可以与外部方法比较并继续发展",
-                        "research_needed": True,
-                    },
-                }
-            ],
-            "edges": [],
-            "research_queries": [
-                {
-                    "target_id": "insight-1",
-                    "query": "问题分析方法的验证、局限和相邻理论",
-                    "reason": "寻找反例和延伸方向",
-                }
-            ],
-        }
-
-        nodes, _ = explorer.validate(
-            payload,
-            allowed_source_ids={"R-20260714-001"},
-            visible_node_ids={"evidence-1"},
-        )
-
-        self.assertEqual("methodology", nodes[0]["metadata"]["insight_type"])
-
-    def test_visible_node_reference_inherits_original_source(self):
-        payload = {
-            "nodes": [
-                {
-                    "temp_id": "theme-1",
-                    "source_refs": ["evidence-1"],
-                    "metadata": {},
-                }
-            ],
-            "edges": [],
-        }
-
-        normalized = inherit_source_refs(
-            payload,
-            allowed_source_ids={"R-20260714-001"},
-            visible_nodes={
-                "evidence-1": {"source_refs": ["R-20260714-001"]}
-            },
-        )
-
-        self.assertEqual(
-            ["R-20260714-001"], normalized["nodes"][0]["source_refs"]
-        )
-        self.assertEqual(["evidence-1"], payload["nodes"][0]["source_refs"])
-
-    def test_world_rejects_verified_claim_without_external_url(self):
-        payload = {
-            "nodes": [
-                {
-                    "temp_id": "research-1",
-                    "node_type": "research",
-                    "title": "核查结果",
-                    "body": "声称已经核查。",
-                    "confidence": 0.8,
-                    "source_refs": [],
-                    "metadata": {
-                        "target_id": "insight-1",
-                        "result": "supported",
-                        "sources": [],
-                    },
-                }
-            ],
-            "edges": [],
-        }
-
-        with self.assertRaises(AgentPipelineError):
-            world.validate(
-                payload,
-                allowed_source_ids=set(),
-                visible_node_ids={"insight-1"},
+                    "pass": True,
+                    "entry_decisions": [],
+                    "unsupported_claims": [],
+                    "required_changes": [],
+                },
+                expected_entry_ids={"p1"},
             )
-
-    def test_report_rejects_unknown_source_reference(self):
-        errors = report.validation_errors(
-            "## 洞见\n\n内容 [R-20260714-999]", {"R-20260714-001"}
-        )
-
-        self.assertTrue(any("未知来源" in error for error in errors))
 
 
 if __name__ == "__main__":

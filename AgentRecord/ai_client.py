@@ -6,11 +6,47 @@
 
 import datetime
 import json
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Collection
 
 import requests
 
 from . import journal, settings
+
+
+_AUTOMATIC_REQUEST = ContextVar("agentrecord_automatic_request", default=False)
+
+
+@contextmanager
+def automatic_request_mode():
+    """Mark model/search calls as automatic so lock-screen deferral is enforced."""
+    token = _AUTOMATIC_REQUEST.set(True)
+    try:
+        yield
+    finally:
+        _AUTOMATIC_REQUEST.reset(token)
+
+
+def _automatic_request_deferred() -> bool:
+    if not _AUTOMATIC_REQUEST.get():
+        return False
+    from .analysis.session_state import session_is_locked
+
+    return session_is_locked()
+
+
+def _post_with_transient_retry(*args, **kwargs):
+    """Retry connect/DNS/timeout failures; HTTP responses are handled by callers."""
+    for attempt in range(3):
+        try:
+            return requests.post(*args, **kwargs)
+        except (requests.ConnectionError, requests.Timeout):
+            if attempt == 2:
+                raise
+            time.sleep(1 << attempt)
+    raise RuntimeError("unreachable")
 
 
 def _build_system_prompt() -> str:
@@ -121,8 +157,10 @@ def bocha_search(query: str, include: str = "", exclude: str = "") -> tuple[str,
     if exclude:
         body["exclude"] = exclude
 
+    if _automatic_request_deferred():
+        return "", 0
     try:
-        response = requests.post(
+        response = _post_with_transient_retry(
             config["api_url"],
             headers=headers,
             json=body,
@@ -247,7 +285,15 @@ def call_ai(
     try:
         message = {}
         for _ in range(5):
-            response = requests.post(
+            if _automatic_request_deferred():
+                return (
+                    "自动任务检测到会话已锁定，已延后网络请求。",
+                    False,
+                    web_searches,
+                    tool_calls,
+                    search_results,
+                )
+            response = _post_with_transient_retry(
                 model_config["api_url"], headers=headers, json=payload, timeout=60
             )
             response.raise_for_status()
@@ -265,6 +311,14 @@ def call_ai(
 
             messages.append(message)
             for tool_call in requested_tools:
+                if _automatic_request_deferred():
+                    return (
+                        "自动任务检测到会话已锁定，已延后网络请求。",
+                        False,
+                        web_searches,
+                        tool_calls,
+                        search_results,
+                    )
                 function_name = tool_call["function"]["name"]
                 tool_calls[function_name] = tool_calls.get(function_name, 0) + 1
                 arguments = json.loads(tool_call["function"]["arguments"])

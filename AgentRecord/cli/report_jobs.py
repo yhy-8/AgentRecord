@@ -34,9 +34,7 @@ class ManualReportJobs:
         generate_report: GenerateReport,
         notify: Notify,
     ) -> bool:
-        label = {"daily": "分析日报", "weekly": "分析周报", "monthly": "分析月报"}[
-            kind
-        ]
+        label = {"weekly": "分析周报", "monthly": "分析月报"}[kind]
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return False

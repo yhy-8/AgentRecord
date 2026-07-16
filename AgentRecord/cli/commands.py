@@ -11,6 +11,7 @@ from ..analysis import (
     analysis_report_path,
     automation_status_snapshot,
     generate_analysis_report,
+    launch_automation_retry,
     summarize_diary,
 )
 from ..analysis.store import AnalysisStore
@@ -55,15 +56,13 @@ def _handle_summary(user_input: str, model_config: settings.ModelDict) -> None:
 
 def _parse_analysis_arguments(user_input: str) -> tuple[str, str]:
     arguments = user_input.split()[1:]
-    kind = "daily"
+    kind = "weekly"
     date_argument = ""
     if not arguments:
         return kind, date_argument
 
     first = arguments[0].lower()
-    if first in ("daily", "day", "日报"):
-        date_argument = arguments[1] if len(arguments) > 1 else ""
-    elif first in ("weekly", "week", "周报"):
+    if first in ("weekly", "week", "周报"):
         kind = "weekly"
         date_argument = arguments[1] if len(arguments) > 1 else ""
     elif first in ("monthly", "month", "月报"):
@@ -157,7 +156,7 @@ def _handle_analysis(user_input: str, model_config: settings.ModelDict) -> bool:
         console.print(f"[yellow][!][/yellow] 无法解析日期: {date_argument}")
         return False
     anchor = datetime.datetime.strptime(date, "%Y-%m-%d").date()
-    label = {"daily": "日报", "weekly": "周报", "monthly": "月报"}[kind]
+    label = {"weekly": "周报", "monthly": "月报"}[kind]
     target_path = analysis_report_path(kind, anchor, origin="manual")
     if target_path and target_path.exists():
         confirmation = safe_input(
@@ -184,6 +183,14 @@ def _handle_analysis(user_input: str, model_config: settings.ModelDict) -> bool:
     return True
 
 
+def _handle_retry() -> bool:
+    started, message = launch_automation_retry()
+    color = "cyan" if started else "yellow"
+    marker = "*" if started else "!"
+    console.print(f"[{color}][{marker}][/{color}] {message}")
+    return started
+
+
 def _handle_status() -> None:
     status = automation_status_snapshot()
     installed = "已安装" if status["installed"] else "未完整安装"
@@ -191,14 +198,20 @@ def _handle_status() -> None:
         f"  系统自动任务：{installed}",
         f"  安装详情：{status['install_message']}",
         f"  最后完成检查：{status['last_check_completed_at'] or '尚未记录'}",
+        f"  最后手动重试：{status.get('last_retry_completed_at') or '尚未记录'}",
         f"  日总结进度：{status['last_daily_date'] or '尚无'}",
         f"  信息简报进度：{status['last_information_date'] or '尚无'}",
         f"  周报进度：{status['last_week_end'] or '尚无'}",
         f"  月报进度：{status['last_month_end'] or '尚无'}",
     ]
+    if status.get("deferred_reason"):
+        lines.append(
+            f"  [yellow]自动任务延后：{status['deferred_reason']}"
+            f"（{status.get('last_deferred_at', '')}）[/yellow]"
+        )
     errors = status["errors"]
     if errors:
-        lines.append("  [yellow]当前失败（下次每小时检查时会重试）：[/yellow]")
+        lines.append("  [yellow]当前失败（解锁状态下下一分钟会重试）：[/yellow]")
         lines.extend(f"    - {task}: {message}" for task, message in errors.items())
     else:
         lines.append("  当前失败：无")
@@ -209,9 +222,15 @@ def _handle_feedback() -> None:
     store = AnalysisStore()
     nodes = store.feedback_candidates()
     if not nodes:
-        console.print("[yellow][!][/yellow] 暂无可反馈的观念、假设或洞见节点。")
+        console.print("[yellow][!][/yellow] 暂无可反馈的人物画像条目。")
         return
-    type_labels = {"theme": "观念", "hypothesis": "假设", "insight": "洞见"}
+    type_labels = {
+        "viewpoint": "观点",
+        "principle": "理念",
+        "ideal": "理想",
+        "behavior_pattern": "行为模式",
+        "interest": "关注领域",
+    }
     content = "\n".join(
         f"  [cyan]{index}[/cyan]. [{type_labels.get(node['node_type'], node['node_type'])}] "
         f"{node['period_start']}  {node['title']}"
@@ -249,15 +268,6 @@ _REFERENCE_KIND_ALIASES = {
     "1": "diary",
     "diary": "diary",
     "日记": "diary",
-    "2": "daily",
-    "daily": "daily",
-    "日报": "daily",
-    "3": "weekly",
-    "weekly": "weekly",
-    "周报": "weekly",
-    "4": "monthly",
-    "monthly": "monthly",
-    "月报": "monthly",
 }
 
 
@@ -266,7 +276,7 @@ def _handle_reference(user_input: str) -> None:
     kind_text = arguments[0].lower() if arguments else ""
     if not kind_text:
         kind_text = safe_input(
-            "引用类型 [1=日记, 2=分析日报, 3=分析周报, 4=分析月报，空=取消] >> "
+            "引用类型 [1=日记，空=取消] >> "
         ).strip()
         if not kind_text:
             return

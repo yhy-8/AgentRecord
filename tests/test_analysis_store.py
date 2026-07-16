@@ -1,48 +1,39 @@
 import sqlite3
 import tempfile
 import unittest
-from contextlib import closing
 from pathlib import Path
 
-from AgentRecord.agents import cluster
-from AgentRecord.agents.base import AgentPipelineError
-from AgentRecord.analysis import orchestrator
-from AgentRecord.analysis.store import AnalysisStore
+from AgentRecord.analysis.store import AnalysisStore, SCHEMA_VERSION
 
 
 class AnalysisStoreTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.store = AnalysisStore(Path(self.temp_dir.name) / "analysis.sqlite3")
+        self.path = Path(self.temp_dir.name) / "analysis.sqlite3"
+        self.store = AnalysisStore(self.path)
 
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_completed_run_becomes_parent_of_same_period_rerun(self):
-        first, first_parent = self.store.start_run(
-            "weekly", "2026-07-06", "2026-07-12", "manual", "mock", "hash-1"
+    def start_run(self, *, trigger="manual"):
+        return self.store.start_run(
+            "weekly",
+            "2026-07-06",
+            "2026-07-12",
+            "manual" if trigger == "manual" else "auto",
+            "mock",
+            "hash",
+            trigger=trigger,
         )
-        self.assertIsNone(first_parent)
-        self.store.complete_run(first, Path("first.md"))
 
-        second, second_parent = self.store.start_run(
-            "weekly", "2026-07-06", "2026-07-12", "manual", "mock", "hash-2"
-        )
-
-        self.assertEqual(first, second_parent)
-        self.assertEqual("running", self.store.run_record(second)["status"])
-
-    def test_source_mapping_keeps_location_hash_and_bounded_excerpt(self):
-        run_id, _ = self.store.start_run(
-            "daily", "2026-07-14", "2026-07-14", "manual", "mock", "hash"
-        )
+    def save_source(self, run_id, source_id="R-20260707-001", date="2026-07-07"):
         self.store.save_sources(
             run_id,
             [
                 {
-                    "source_id": "R-20260714-001",
-                    "path": "2026-07-14.md",
-                    "date": "2026-07-14",
+                    "source_id": source_id,
+                    "path": f"{date}.md",
+                    "date": date,
                     "time": "09:00",
                     "record_index": 1,
                     "speaker": "user",
@@ -52,214 +43,133 @@ class AnalysisStoreTests(unittest.TestCase):
             ],
         )
 
-        source = self.store.sources_for_run(run_id)[0]
-        self.assertEqual("2026-07-14.md", source["relative_path"])
+    def test_new_schema_has_profile_store_and_no_generic_graph(self):
+        with sqlite3.connect(self.path) as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+        self.assertEqual(SCHEMA_VERSION, version)
+        self.assertIn("profile_entries", tables)
+        self.assertNotIn("knowledge_edges", tables)
+
+    def test_source_catalog_keeps_location_hash_and_excerpt(self):
+        run_id = self.start_run()
+        self.save_source(run_id)
+        source = self.store.source_records(["R-20260707-001"])[0]
+        self.assertEqual("2026-07-07.md", source["relative_path"])
         self.assertEqual(64, len(source["content_hash"]))
         self.assertEqual(500, len(source["excerpt"]))
 
-    def test_accepting_revision_supersedes_previous_accepted_node(self):
-        first, _ = self.store.start_run(
-            "daily", "2026-07-14", "2026-07-14", "manual", "mock", "hash-1"
-        )
-        first_ids = self.store.add_nodes(
+    def test_accepted_profile_revision_supersedes_previous(self):
+        first = self.start_run()
+        self.save_source(first)
+        old_id = self.store.save_profile_entries(
             first,
-            "extractor",
             [
                 {
-                    "temp_id": "old",
-                    "node_type": "evidence",
-                    "title": "旧判断",
-                    "body": "旧版本",
-                    "confidence": 0.7,
-                    "source_refs": ["R-20260714-001"],
-                    "metadata": {},
+                    "temp_id": "p1",
+                    "category": "principle",
+                    "title": "旧理念",
+                    "statement": "旧内容",
+                    "confidence": 0.8,
+                    "source_refs": ["R-20260707-001"],
+                    "first_observed": "2026-07-07",
+                    "last_observed": "2026-07-07",
+                    "supersedes_id": None,
                 }
             ],
-        )
-        old_id = first_ids["old"]
-        self.store.apply_node_decisions(
-            [{"node_id": old_id, "status": "accepted"}]
-        )
+            {"p1": "accepted"},
+        )["p1"]
         self.store.complete_run(first, Path("first.md"))
 
-        second, _ = self.store.start_run(
-            "daily", "2026-07-14", "2026-07-14", "manual", "mock", "hash-2"
+        second = self.store.start_run(
+            "weekly", "2026-07-13", "2026-07-19", "manual", "mock", "hash2"
         )
-        second_ids = self.store.add_nodes(
+        self.save_source(second, "R-20260714-001", "2026-07-14")
+        new_id = self.store.save_profile_entries(
             second,
-            "extractor",
             [
                 {
-                    "temp_id": "new",
-                    "node_type": "evidence",
-                    "title": "修订判断",
-                    "body": "保留历史的修订版本",
+                    "temp_id": "p2",
+                    "category": "principle",
+                    "title": "新理念",
+                    "statement": "修订内容",
                     "confidence": 0.9,
                     "source_refs": ["R-20260714-001"],
-                    "metadata": {},
+                    "first_observed": "2026-07-07",
+                    "last_observed": "2026-07-14",
                     "supersedes_id": old_id,
                 }
             ],
-        )
-        new_id = second_ids["new"]
-        self.store.apply_node_decisions(
-            [{"node_id": new_id, "status": "accepted"}]
-        )
+            {"p2": "accepted"},
+        )["p2"]
 
-        old = self.store.nodes_for_run(first)[0]
-        new = self.store.nodes_for_run(second)[0]
-        self.assertEqual("superseded", old["status"])
-        self.assertEqual("accepted", new["status"])
-        self.assertEqual(old_id, new["supersedes_id"])
-        self.assertEqual(2, new["revision"])
+        active = self.store.active_profiles("2026-07-19")
+        self.assertEqual([new_id], [item["id"] for item in active])
 
-    def test_relations_are_accepted_only_when_both_nodes_are_accepted(self):
-        run_id, _ = self.store.start_run(
-            "daily", "2026-07-14", "2026-07-14", "manual", "mock", "hash"
-        )
-        node_ids = self.store.add_nodes(
+    def test_profile_cutoff_blocks_future_information(self):
+        run_id = self.start_run()
+        self.save_source(run_id, "R-20260720-001", "2026-07-20")
+        self.store.save_profile_entries(
             run_id,
-            "cluster",
             [
                 {
-                    "temp_id": "a",
-                    "node_type": "evidence",
-                    "title": "A",
-                    "body": "A",
-                    "source_refs": ["R-20260714-001"],
-                },
-                {
-                    "temp_id": "b",
-                    "node_type": "theme",
-                    "title": "B",
-                    "body": "B",
-                    "source_refs": ["R-20260714-001"],
-                },
-            ],
-        )
-        self.store.add_edges(
-            run_id,
-            "cluster",
-            [
-                {
-                    "source_id": "a",
-                    "target_id": "b",
-                    "relation_type": "member_of",
-                }
-            ],
-            node_ids,
-        )
-        self.store.apply_node_decisions(
-            [
-                {"node_id": node_ids["a"], "status": "accepted"},
-                {"node_id": node_ids["b"], "status": "rejected"},
-            ]
-        )
-        self.store.accept_edges_for_run(run_id, {node_ids["a"]})
-
-        self.assertEqual("rejected", self.store.edges_for_run(run_id)[0]["status"])
-
-    def test_validation_failure_is_saved_as_failed_agent_artifact(self):
-        run_id, _ = self.store.start_run(
-            "daily", "2026-07-14", "2026-07-14", "manual", "mock", "hash"
-        )
-        payload = {
-            "nodes": [
-                {
-                    "temp_id": "theme-1",
-                    "node_type": "theme",
-                    "title": "主题",
-                    "body": "内容",
-                    "source_refs": ["unknown-source"],
-                    "metadata": {"trajectory": "new"},
-                }
-            ],
-            "edges": [],
-        }
-
-        with self.assertRaises(AgentPipelineError):
-            orchestrator._persist_graph_agent(
-                cluster.SPEC,
-                cluster.validate,
-                payload,
-                self.store,
-                run_id,
-                allowed_source_ids={"R-20260714-001"},
-                visible_nodes={},
-            )
-
-        connection = sqlite3.connect(self.store.path)
-        try:
-            status, error = connection.execute(
-                "SELECT status, error FROM agent_artifacts WHERE run_id = ?",
-                (run_id,),
-            ).fetchone()
-        finally:
-            connection.close()
-        self.assertEqual("failed", status)
-        self.assertIn("未知来源", error)
-
-    def _completed_theme(self) -> tuple[str, str]:
-        run_id, _ = self.store.start_run(
-            "daily", "2026-07-14", "2026-07-14", "manual", "mock", "hash"
-        )
-        node_id = self.store.add_nodes(
-            run_id,
-            "cluster",
-            [
-                {
-                    "temp_id": "theme",
-                    "node_type": "theme",
-                    "title": "原观念",
-                    "body": "原内容",
+                    "temp_id": "p1",
+                    "category": "interest",
+                    "title": "未来关注",
+                    "statement": "七月二十日才出现",
                     "confidence": 0.8,
-                    "source_refs": ["R-20260714-001"],
+                    "source_refs": ["R-20260720-001"],
+                    "first_observed": "2026-07-20",
+                    "last_observed": "2026-07-20",
+                    "supersedes_id": None,
                 }
             ],
-        )["theme"]
-        self.store.apply_node_decisions([{"node_id": node_id, "status": "accepted"}])
-        self.store.complete_run(run_id, Path("report.md"))
-        return run_id, node_id
-
-    def test_user_correction_creates_auditable_accepted_revision(self):
-        run_id, old_id = self._completed_theme()
-
-        new_id = self.store.record_user_feedback(
-            old_id, "correct", title="修正后观念", body="修正后内容"
+            {"p1": "accepted"},
         )
+        self.assertEqual([], self.store.active_profiles("2026-07-12"))
 
-        nodes = {node["id"]: node for node in self.store.nodes_for_run(run_id)}
-        self.assertEqual("superseded", nodes[old_id]["status"])
-        self.assertEqual("accepted", nodes[new_id]["status"])
-        self.assertEqual("user", nodes[new_id]["created_by"])
-        self.assertEqual(old_id, nodes[new_id]["supersedes_id"])
-        self.assertEqual(2, nodes[new_id]["revision"])
-        self.assertEqual("修正后观念", nodes[new_id]["title"])
+    def test_user_feedback_is_auditable(self):
+        run_id = self.start_run()
+        self.save_source(run_id)
+        entry_id = self.store.save_profile_entries(
+            run_id,
+            [
+                {
+                    "temp_id": "p1",
+                    "category": "viewpoint",
+                    "title": "原观点",
+                    "statement": "原内容",
+                    "confidence": 0.8,
+                    "source_refs": ["R-20260707-001"],
+                    "first_observed": "2026-07-07",
+                    "last_observed": "2026-07-07",
+                    "supersedes_id": None,
+                }
+            ],
+            {"p1": "accepted"},
+        )["p1"]
+        self.store.complete_run(run_id, Path("report.md"))
+        replacement = self.store.record_user_feedback(
+            entry_id, "correct", title="修正观点", body="修正内容"
+        )
+        candidates = self.store.feedback_candidates()
+        self.assertEqual(replacement, candidates[0]["id"])
+        self.assertEqual("修正观点", candidates[0]["title"])
 
-    def test_user_rejection_removes_node_from_feedback_candidates(self):
-        _, node_id = self._completed_theme()
-        self.assertEqual(node_id, self.store.feedback_candidates()[0]["id"])
-
-        self.store.record_user_feedback(node_id, "reject")
-
-        self.assertEqual([], self.store.feedback_candidates())
-
-    def test_v1_database_is_backed_up_and_migrated_to_v2(self):
-        with closing(sqlite3.connect(self.store.path)) as connection:
-            connection.execute("DROP TABLE node_feedback")
-            connection.execute("PRAGMA user_version = 1")
+    def test_v2_is_backed_up_then_replaced(self):
+        with sqlite3.connect(self.path) as connection:
+            connection.execute("PRAGMA user_version = 2")
             connection.commit()
-
-        AnalysisStore(self.store.path)
-
-        with closing(sqlite3.connect(self.store.path)) as connection:
+        AnalysisStore(self.path)
+        with sqlite3.connect(self.path) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            table = connection.execute(
-                "SELECT name FROM sqlite_master WHERE name = 'node_feedback'"
-            ).fetchone()
-        self.assertEqual(2, version)
-        self.assertIsNotNone(table)
-        self.assertTrue(Path(f"{self.store.path}.v1.bak").exists())
+        self.assertEqual(3, version)
+        self.assertTrue(Path(f"{self.path}.v2.legacy.bak").exists())
 
 
 if __name__ == "__main__":

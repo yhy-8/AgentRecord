@@ -9,6 +9,7 @@ from .commands import (
     _handle_analysis,
     _handle_feedback,
     _handle_reference,
+    _handle_retry,
     _handle_status,
     _handle_summary,
     _handle_view,
@@ -25,7 +26,7 @@ from .terminal import (
 
 MODE_COMMANDS = {
     RECORD_MODE: ("/h", "/mode", "/status", "/v", "/ref", "/d", "/c"),
-    REPORT_MODE: ("/h", "/mode", "/status", "/s", "/a", "/f", "/m"),
+    REPORT_MODE: ("/h", "/mode", "/status", "/s", "/a", "/retry", "/f", "/m"),
 }
 
 
@@ -96,6 +97,10 @@ def run_interactive() -> None:
                 user_input == "/a" or user_input.startswith("/a ")
             ):
                 if _handle_analysis(user_input, current_model):
+                    mode = RECORD_MODE
+                    console.print("[dim]已返回记录模式。[/dim]")
+            elif command == "/retry":
+                if _handle_retry():
                     mode = RECORD_MODE
                     console.print("[dim]已返回记录模式。[/dim]")
             elif command == "/f":

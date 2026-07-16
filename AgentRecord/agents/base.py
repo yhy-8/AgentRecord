@@ -110,19 +110,3 @@ def confidence(value: object, field: str) -> float:
     if not 0 <= number <= 1:
         raise AgentPipelineError(f"{field} 超出 0 到 1")
     return number
-
-
-def compact_nodes(nodes: list[dict]) -> list[dict]:
-    keys = (
-        "id",
-        "node_type",
-        "title",
-        "body",
-        "status",
-        "confidence",
-        "source_refs",
-        "metadata",
-        "revision",
-        "supersedes_id",
-    )
-    return [{key: node.get(key) for key in keys} for node in nodes]

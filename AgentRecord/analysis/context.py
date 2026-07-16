@@ -37,12 +37,12 @@ def _existing_logs(start: datetime.date, end: datetime.date) -> list[tuple[str, 
 
 
 def _referenced_source_context(logs: list[tuple[str, str]]) -> str:
-    """读取本周期标准引用指向的 Markdown；拒绝日记和报告目录以外的路径。"""
+    """读取本周期标准引用指向的日记；拒绝日记目录以外的路径。"""
     reference_pattern = re.compile(
         r"^\*\*\d{2}:\d{2} \[引用\]:\*\* \[[^\]]+\]\(<([^>]+)>\)",
         re.MULTILINE,
     )
-    allowed_roots = (settings.DIARY_DIR.resolve(), settings.ANALYSIS_DIR.resolve())
+    allowed_root = settings.DIARY_DIR.resolve()
     seen = set()
     sections = []
 
@@ -51,7 +51,7 @@ def _referenced_source_context(logs: list[tuple[str, str]]) -> str:
             source_path = (settings.DIARY_DIR / relative_path).resolve()
             if source_path in seen or source_path.suffix.lower() != ".md":
                 continue
-            if not any(source_path.is_relative_to(root) for root in allowed_roots):
+            if not source_path.is_relative_to(allowed_root):
                 continue
             if not source_path.is_file():
                 continue
@@ -83,8 +83,6 @@ def _analysis_report_path(
     kind: str, start: datetime.date, end: datetime.date, origin: str
 ) -> Path:
     suffix = {"manual": "manual", "auto": "auto"}[origin]
-    if kind == "daily":
-        return settings.ANALYSIS_DIR / "Daily" / f"{start:%Y-%m-%d}_{suffix}.md"
     if kind == "weekly":
         return (
             settings.ANALYSIS_DIR
@@ -100,9 +98,7 @@ def analysis_report_path(
     """返回报告确定路径，供生成前确认是否覆盖。"""
     if origin not in ("manual", "auto"):
         return None
-    if kind == "daily":
-        start = end = anchor
-    elif kind == "weekly":
+    if kind == "weekly":
         start = anchor - datetime.timedelta(days=anchor.weekday())
         end = start + datetime.timedelta(days=6)
     elif kind == "monthly":

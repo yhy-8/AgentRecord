@@ -234,10 +234,10 @@ def show_help(mode: str = RECORD_MODE) -> None:
             "  [cyan]/mode[/cyan]     → 切换到记录模式\n"
             "  [cyan]/status[/cyan]   → 查看自动任务安装、进度与失败状态\n"
             "  [cyan]/s [日期][/cyan] → 生成日记顶部总结（空=今天）\n"
-            "  [cyan]/a daily [日期][/cyan]  → 后台生成分析日报（空=今天）\n"
             "  [cyan]/a weekly [日期][/cyan] → 后台生成分析周报（空=快速选择自然周）\n"
             "  [cyan]/a monthly [日期][/cyan] → 后台生成分析月报（空=快速选择自然月）\n"
-            "  [cyan]/f[/cyan]        → 认可、否决或修正最近的观念节点\n"
+            "  [cyan]/retry[/cyan]    → 独立后台重试全部失败自动任务（产物仍为自动）\n"
+            "  [cyan]/f[/cyan]        → 认可、否决或修正最近的人物画像条目\n"
             "  [cyan]/m[/cyan]        → 永久切换总结和报告使用的模型"
         )
         title = "[bold]报告模式[/bold]"
@@ -248,7 +248,7 @@ def show_help(mode: str = RECORD_MODE) -> None:
             "  [cyan]/mode[/cyan]     → 切换到报告模式\n"
             "  [cyan]/status[/cyan]   → 查看自动任务安装、进度与失败状态\n"
             "  [cyan]/v [日期][/cyan] → 查看历史日记（[cyan]/v help[/cyan] 查看用法）\n"
-            "  [cyan]/ref [类型] [筛选][/cyan] → 引用日记或分析报告并继续记录\n"
+            "  [cyan]/ref [diary] [筛选][/cyan] → 引用日记并继续记录\n"
             "  [cyan]/d[/cyan]        → 删除今日最后一条记录\n"
             "  [cyan]/c[/cyan]        → 清空当前窗口"
         )

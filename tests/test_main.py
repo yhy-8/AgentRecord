@@ -26,24 +26,19 @@ class MainCommandTests(unittest.TestCase):
         settings.ANALYSIS_DIR = self.original_analysis_dir
         self.temp_dir.cleanup()
 
-    def test_reference_command_selects_report_and_records_note(self):
-        report = (
-            settings.ANALYSIS_DIR
-            / "Weekly"
-            / "2026-07-06_to_2026-07-12_auto.md"
-        )
-        report.parent.mkdir(parents=True)
-        report.write_text("报告", encoding="utf-8")
+    def test_reference_command_selects_diary_and_records_note(self):
+        report = settings.DIARY_DIR / "2026-07-14.md"
+        report.write_text("日记", encoding="utf-8")
 
         with patch(
             "AgentRecord.cli.commands.safe_input",
             side_effect=["1", "由周报展开的想法"],
         ):
-            commands._handle_reference("/ref weekly")
+            commands._handle_reference("/ref diary")
 
         content = next(settings.DIARY_DIR.glob("*.md")).read_text(encoding="utf-8")
         self.assertIn("[引用]", content)
-        self.assertIn("自动分析周报 | 2026-07-06 至 2026-07-12", content)
+        self.assertIn("日记 | 2026-07-14", content)
         self.assertIn("由周报展开的想法", content)
 
     def test_parses_monthly_analysis_command(self):
@@ -155,7 +150,7 @@ class MainCommandTests(unittest.TestCase):
         store.feedback_candidates.return_value = [
             {
                 "id": "node-1",
-                "node_type": "insight",
+                "node_type": "viewpoint",
                 "period_start": "2026-07-14",
                 "title": "原洞见",
                 "body": "原内容",
@@ -177,7 +172,7 @@ class MainCommandTests(unittest.TestCase):
             set(app.MODE_COMMANDS[terminal.RECORD_MODE]),
         )
         self.assertEqual(
-            {"/h", "/mode", "/status", "/s", "/a", "/f", "/m"},
+            {"/h", "/mode", "/status", "/s", "/a", "/retry", "/f", "/m"},
             set(app.MODE_COMMANDS[terminal.REPORT_MODE]),
         )
 
@@ -186,9 +181,18 @@ class MainCommandTests(unittest.TestCase):
             terminal.show_help(terminal.REPORT_MODE)
 
         content = str(console_print.call_args.args[0].renderable)
-        self.assertIn("/a daily [日期]", content)
+        self.assertNotIn("/a daily [日期]", content)
         self.assertIn("/a weekly [日期]", content)
         self.assertIn("/a monthly [日期]", content)
+        self.assertIn("/retry", content)
+
+    def test_retry_launches_all_failures_in_detached_process(self):
+        with patch(
+            "AgentRecord.cli.commands.launch_automation_retry",
+            return_value=(True, "已启动"),
+        ) as launch, patch("AgentRecord.cli.commands.console.print"):
+            self.assertTrue(commands._handle_retry())
+        launch.assert_called_once_with()
 
     def test_root_main_is_only_the_shared_entry(self):
         self.assertIs(root_main.main, entry.main)
