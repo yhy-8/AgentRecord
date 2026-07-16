@@ -160,9 +160,6 @@ def run_due_automatic_tasks() -> None:
     automation = settings.CONFIG.get("automation", {})
     if not automation.get("enabled", True):
         return
-    if session_is_locked():
-        _mark_lock_deferred(_load_automation_state())
-        return
     automation_lock = _acquire_automation_lock()
     if automation_lock is None:
         return
@@ -172,9 +169,12 @@ def run_due_automatic_tasks() -> None:
     )
     _save_automation_state(state)
     try:
+        if session_is_locked():
+            _mark_lock_deferred(state)
+            return
         with automatic_request_mode():
             model_config = _automation_model()
-            state.pop("last_error", None)
+            _clear_task_error(state, "scheduler")
             state.pop("deferred_reason", None)
             now = datetime.datetime.now()
             today = now.date()
@@ -304,7 +304,8 @@ def _run_weekly_reports(
             _set_task_error(
                 state,
                 "weekly_report",
-                f"自动生成截至 {current_week_end:%Y-%m-%d} 的周报失败",
+                f"自动生成截至 {current_week_end:%Y-%m-%d} 的周报失败: "
+                f"{message[:500]}",
             )
             _save_automation_state(state)
             break
@@ -359,7 +360,7 @@ def _run_monthly_reports(
             _set_task_error(
                 state,
                 "monthly_report",
-                f"自动生成 {current_month_start:%Y-%m} 月报失败",
+                f"自动生成 {current_month_start:%Y-%m} 月报失败: {message[:500]}",
             )
             _save_automation_state(state)
             break
@@ -401,13 +402,16 @@ def _retry_one_task(
 
 def retry_failed_automatic_tasks() -> tuple[str, bool]:
     """Retry every currently failed automatic task in an independent process."""
-    if session_is_locked():
-        _mark_lock_deferred(_load_automation_state())
-        return "会话已锁定，全部自动任务已延后。", False
     automation_lock = _acquire_automation_lock()
     if automation_lock is None:
         return "另一个自动任务正在运行，请稍后重试。", False
     state = _load_automation_state()
+    if session_is_locked():
+        try:
+            _mark_lock_deferred(state)
+            return "会话已锁定，全部自动任务已延后。", False
+        finally:
+            automation_lock.release()
     tasks = [task for task in AUTOMATION_TASK_LABELS if task in state.get("errors", {})]
     if not tasks:
         automation_lock.release()

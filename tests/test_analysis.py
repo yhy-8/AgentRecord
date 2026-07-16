@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 from AgentRecord import settings
 from AgentRecord.analysis import automation, context, orchestrator
+from AgentRecord.analysis import session_state
 from AgentRecord.analysis.store import AnalysisStore
 
 
@@ -149,6 +150,12 @@ class AnalysisWorkflowTests(unittest.TestCase):
         self.assertIn("https://example.com/source", content)
         self.assertEqual(original, diary.read_bytes())
         self.assertEqual(1, len(AnalysisStore().active_profiles("2026-07-20")))
+        retrospective_review = next(
+            prompt
+            for prompt in self.ai_calls
+            if "任务:reviewer]" in prompt and '"mode": "retrospective_review"' in prompt
+        )
+        self.assertIn("我开始重视记录是否可以验证", retrospective_review)
 
     def test_daily_analysis_is_removed(self):
         self.write_diary("2026-07-14")
@@ -222,6 +229,26 @@ class AnalysisWorkflowTests(unittest.TestCase):
             (settings.ANALYSIS_DIR / ".automation-state.json").read_text(encoding="utf-8")
         )
         self.assertIn("会话已锁定", state["deferred_reason"])
+        released = automation._acquire_automation_lock()
+        self.assertIsNotNone(released)
+        released.release()
+
+    def test_linux_session_lock_uses_logind_locked_hint(self):
+        results = [
+            Mock(returncode=0, stdout="2 1000 user seat0 tty2\n"),
+            Mock(returncode=0, stdout="yes\n"),
+            Mock(returncode=0, stdout="yes\n"),
+        ]
+        with patch.object(session_state.os, "getuid", return_value=1000), patch.object(
+            session_state.subprocess, "run", side_effect=results
+        ):
+            self.assertTrue(session_state._linux_locked())
+
+    def test_session_lock_environment_override_is_deterministic(self):
+        with patch.dict(session_state.os.environ, {"AGENTRECORD_SESSION_LOCKED": "1"}):
+            self.assertTrue(session_state.session_is_locked())
+        with patch.dict(session_state.os.environ, {"AGENTRECORD_SESSION_LOCKED": "0"}):
+            self.assertFalse(session_state.session_is_locked())
 
     def test_retry_runs_all_failed_tasks(self):
         settings.ANALYSIS_DIR.mkdir()
@@ -276,6 +303,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
             success, _ = automation.install_system_automation()
         self.assertTrue(success)
         cron_input = run.call_args_list[1].kwargs["input"]
+        self.assertIn("@reboot", cron_input)
         self.assertIn("* * * * *", cron_input)
         self.assertIn(" minute", cron_input)
 

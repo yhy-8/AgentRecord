@@ -173,6 +173,7 @@ def _review(
     mode: str,
     section_payload: dict,
     entry_ids: set[str],
+    review_context: dict,
     model_config: settings.ModelDict,
     store: AnalysisStore,
     run_id: str,
@@ -183,6 +184,7 @@ def _review(
             "mode": mode,
             "section": section_payload,
             "valid_profile_temp_ids": sorted(entry_ids),
+            "review_context": review_context,
         }
         if validation_error:
             review_input["previous_validation_error"] = validation_error
@@ -246,10 +248,24 @@ def _retrospective_section(
                 continue
             raise
         normalized_payload = {"markdown": markdown, "profile_entries": entries}
+        cited_source_ids = set(re.findall(r"\[(R-\d{8}-\d{3})\]", markdown))
+        cited_source_ids.update(
+            ref for entry in entries for ref in entry["source_refs"]
+        )
+        review_context = {
+            "period": base_input["period"],
+            "records": [
+                record
+                for record in base_input["records"]
+                if record["source_id"] in cited_source_ids
+            ],
+            "historical_profiles": base_input["historical_profiles"],
+        }
         passed, decisions, feedback = _review(
             "retrospective_review",
             normalized_payload,
             {entry["temp_id"] for entry in entries},
+            review_context,
             model_config,
             store,
             run_id,
@@ -350,6 +366,11 @@ def _research_section(
             "research_review",
             normalized_payload,
             set(),
+            {
+                "research_topics": topics,
+                "information_leads": information_leads,
+                "search_telemetry": telemetry,
+            },
             model_config,
             store,
             run_id,

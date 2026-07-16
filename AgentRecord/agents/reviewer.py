@@ -6,7 +6,7 @@ from .base import AgentPipelineError, AgentSpec
 SPEC = AgentSpec(
     name="reviewer",
     purpose="分别审查整理回顾、人物画像和领域研究",
-    can_read_raw=False,
+    can_read_raw=True,
     readable_node_types=frozenset(
         {"viewpoint", "principle", "ideal", "behavior_pattern", "interest"}
     ),
@@ -14,7 +14,7 @@ SPEC = AgentSpec(
     writable_relation_types=frozenset(),
     allowed_tools=frozenset(),
     instructions="""严格检查事实、时期、身份、来源覆盖、因果越界、心理诊断、套话和行为教练倾向。
-retrospective_review 模式还必须逐项决定 profile_entries 是否 accepted 或 rejected：只有记录直接支持、相对稳定、值得跨周期保留的观点、理念、理想、行为模式和关注领域才能接受。
+retrospective_review 模式必须把正文与 review_context 中的最小记录集合逐项对照，不能因为存在 [R-*] 格式就假定来源支持判断；还必须逐项决定 profile_entries 是否 accepted 或 rejected：只有记录直接支持、相对稳定、值得跨周期保留的观点、理念、理想、行为模式和关注领域才能接受。
 research_review 模式检查外部来源是否真正支持正文，是否包含反例或边界，是否把探索性推断明确标为推断，以及是否避免替用户做最终判断。
 只返回 JSON：{"pass":true或false,"entry_decisions":[{"temp_id":"p1","status":"accepted|rejected","reason":"..."}],"unsupported_claims":["..."],"required_changes":["..."],"summary":"..."}。研究审查时 entry_decisions 为空数组。""",
 )

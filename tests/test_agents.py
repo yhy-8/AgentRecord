@@ -20,6 +20,7 @@ class AgentModuleTests(unittest.TestCase):
             frozenset({"web_search"}), AGENTS["researcher"].allowed_tools
         )
         self.assertEqual(frozenset(), AGENTS["retrospective"].allowed_tools)
+        self.assertTrue(AGENTS["reviewer"].can_read_raw)
 
     def test_retrospective_requires_citations_in_each_content_paragraph(self):
         with self.assertRaisesRegex(AgentPipelineError, "没有来源引用"):

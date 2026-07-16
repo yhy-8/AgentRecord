@@ -1,6 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from AgentRecord.analysis.store import AnalysisStore, SCHEMA_VERSION
@@ -44,7 +45,7 @@ class AnalysisStoreTests(unittest.TestCase):
         )
 
     def test_new_schema_has_profile_store_and_no_generic_graph(self):
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             tables = {
                 row[0]
@@ -109,7 +110,58 @@ class AnalysisStoreTests(unittest.TestCase):
         )["p2"]
 
         active = self.store.active_profiles("2026-07-19")
+        self.assertEqual([old_id], [item["id"] for item in active])
+        self.store.complete_run(second, Path("second.md"))
+        active = self.store.active_profiles("2026-07-19")
         self.assertEqual([new_id], [item["id"] for item in active])
+
+    def test_failed_profile_revision_leaves_completed_version_active(self):
+        first = self.start_run()
+        self.save_source(first)
+        old_id = self.store.save_profile_entries(
+            first,
+            [
+                {
+                    "temp_id": "p1",
+                    "category": "viewpoint",
+                    "title": "已交付观点",
+                    "statement": "旧内容",
+                    "confidence": 0.8,
+                    "source_refs": ["R-20260707-001"],
+                    "first_observed": "2026-07-07",
+                    "last_observed": "2026-07-07",
+                    "supersedes_id": None,
+                }
+            ],
+            {"p1": "accepted"},
+        )["p1"]
+        self.store.complete_run(first, Path("first.md"))
+
+        failed = self.store.start_run(
+            "weekly", "2026-07-13", "2026-07-19", "manual", "mock", "hash2"
+        )
+        self.save_source(failed, "R-20260714-001", "2026-07-14")
+        self.store.save_profile_entries(
+            failed,
+            [
+                {
+                    "temp_id": "p2",
+                    "category": "viewpoint",
+                    "title": "未交付修订",
+                    "statement": "新内容",
+                    "confidence": 0.9,
+                    "source_refs": ["R-20260714-001"],
+                    "first_observed": "2026-07-07",
+                    "last_observed": "2026-07-14",
+                    "supersedes_id": old_id,
+                }
+            ],
+            {"p2": "accepted"},
+        )
+        self.store.fail_run(failed, "研究板块失败")
+
+        active = self.store.active_profiles("2026-07-19")
+        self.assertEqual([old_id], [item["id"] for item in active])
 
     def test_profile_cutoff_blocks_future_information(self):
         run_id = self.start_run()
@@ -131,6 +183,7 @@ class AnalysisStoreTests(unittest.TestCase):
             ],
             {"p1": "accepted"},
         )
+        self.store.complete_run(run_id, Path("future.md"))
         self.assertEqual([], self.store.active_profiles("2026-07-12"))
 
     def test_user_feedback_is_auditable(self):
@@ -162,11 +215,11 @@ class AnalysisStoreTests(unittest.TestCase):
         self.assertEqual("修正观点", candidates[0]["title"])
 
     def test_v2_is_backed_up_then_replaced(self):
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection:
             connection.execute("PRAGMA user_version = 2")
             connection.commit()
         AnalysisStore(self.path)
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
         self.assertEqual(3, version)
         self.assertTrue(Path(f"{self.path}.v2.legacy.bak").exists())

@@ -107,7 +107,7 @@ v3 删除旧版通用知识图谱，把数据库职责缩小为：
 | `supersedes_id` | 被当前版本替代的旧条目 |
 | `created_at/updated_at` | 本地时间戳 |
 
-Retrospective 的候选只有通过 Reviewer 才能为 `accepted`。新版本被接受时旧 accepted 版本变为 `superseded`；新候选被拒绝时旧版本仍有效。
+Retrospective 的候选只有通过 Reviewer 才能为 `accepted`，但只有整份报告成功交付并把运行标为 `completed` 后才进入历史上下文。完成运行与旧版本 `superseded` 在同一事务中生效；研究板块或交付失败时，新候选不激活，旧版本仍有效。
 
 历史上下文只读取 `status=accepted` 且 `last_observed <= 报告周期结束日` 的条目。这个日期截断是防止未来信息进入过去报告的硬边界。
 

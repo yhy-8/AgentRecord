@@ -251,6 +251,20 @@ class AnalysisStore:
         if status not in RUN_STATUSES:
             raise ValueError(f"无效运行状态: {status}")
         with self.transaction() as connection:
+            if status == "completed":
+                connection.execute(
+                    """
+                    UPDATE profile_entries
+                    SET status = 'superseded', updated_at = ?
+                    WHERE status = 'accepted' AND id IN (
+                        SELECT supersedes_id
+                        FROM profile_entries
+                        WHERE run_id = ? AND status = 'accepted'
+                          AND supersedes_id IS NOT NULL
+                    )
+                    """,
+                    (_now(), run_id),
+                )
             connection.execute(
                 """
                 UPDATE analysis_runs
@@ -358,9 +372,11 @@ class AnalysisStore:
         try:
             rows = connection.execute(
                 """
-                SELECT * FROM profile_entries
-                WHERE status = 'accepted' AND last_observed <= ?
-                ORDER BY updated_at DESC LIMIT ?
+                SELECT p.* FROM profile_entries AS p
+                JOIN analysis_runs AS r ON r.id = p.run_id
+                WHERE p.status = 'accepted' AND p.last_observed <= ?
+                  AND r.status = 'completed'
+                ORDER BY p.updated_at DESC LIMIT ?
                 """,
                 (period_end, limit),
             ).fetchall()
@@ -408,15 +424,6 @@ class AnalysisStore:
                         now,
                     ),
                 )
-                if status == "accepted" and supersedes_id:
-                    connection.execute(
-                        """
-                        UPDATE profile_entries
-                        SET status = 'superseded', updated_at = ?
-                        WHERE id = ? AND status = 'accepted'
-                        """,
-                        (now, supersedes_id),
-                    )
                 id_map[temp_id] = entry_id
         return id_map
 

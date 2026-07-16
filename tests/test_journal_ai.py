@@ -120,6 +120,33 @@ class JournalAITests(unittest.TestCase):
         self.assertIn("不承担日常聊天", prompt)
         self.assertNotIn("@AI 提问", prompt)
 
+    @patch("AgentRecord.ai_client.time.sleep")
+    @patch("AgentRecord.ai_client.requests.post")
+    def test_transient_connection_errors_use_bounded_retry(self, post, sleep):
+        expected = FakeResponse({"ok": True})
+        post.side_effect = [
+            ai_client.requests.ConnectionError("dns"),
+            ai_client.requests.Timeout("timeout"),
+            expected,
+        ]
+
+        response = ai_client._post_with_transient_retry("https://example.test")
+
+        self.assertIs(expected, response)
+        self.assertEqual(3, post.call_count)
+        self.assertEqual([1, 2], [call.args[0] for call in sleep.call_args_list])
+
+    @patch("AgentRecord.ai_client.requests.post")
+    def test_automatic_model_request_stops_if_session_locks(self, post):
+        with patch(
+            "AgentRecord.analysis.session_state.session_is_locked", return_value=True
+        ), ai_client.automatic_request_mode():
+            message, success, _, _, _ = ai_client.call_ai("自动任务", self.model)
+
+        self.assertFalse(success)
+        self.assertIn("会话已锁定", message)
+        post.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
