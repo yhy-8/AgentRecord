@@ -7,8 +7,6 @@
 import datetime
 import json
 import time
-from contextlib import contextmanager
-from contextvars import ContextVar
 from typing import Any, Collection
 
 import requests
@@ -16,36 +14,36 @@ import requests
 from . import journal, settings
 
 
-_AUTOMATIC_REQUEST = ContextVar("agentrecord_automatic_request", default=False)
+NETWORK_ERROR_MARKER = "网络异常:"
 
 
-@contextmanager
-def automatic_request_mode():
-    """Mark model/search calls as automatic so lock-screen deferral is enforced."""
-    token = _AUTOMATIC_REQUEST.set(True)
-    try:
-        yield
-    finally:
-        _AUTOMATIC_REQUEST.reset(token)
+def is_network_failure(message: str) -> bool:
+    """Return whether an automation error is safe to retry after five minutes."""
+    return NETWORK_ERROR_MARKER in str(message)
 
 
-def _automatic_request_deferred() -> bool:
-    if not _AUTOMATIC_REQUEST.get():
-        return False
-    from .analysis.session_state import session_is_locked
-
-    return session_is_locked()
+def _transient_http_error(error: requests.HTTPError) -> bool:
+    response = error.response
+    return response is not None and (
+        response.status_code == 408 or 500 <= response.status_code < 600
+    )
 
 
 def _post_with_transient_retry(*args, **kwargs):
-    """Retry connect/DNS/timeout failures; HTTP responses are handled by callers."""
+    """Retry connection failures and transient server responses at most twice."""
     for attempt in range(3):
         try:
-            return requests.post(*args, **kwargs)
+            response = requests.post(*args, **kwargs)
         except (requests.ConnectionError, requests.Timeout):
             if attempt == 2:
                 raise
             time.sleep(1 << attempt)
+            continue
+        if response.status_code == 408 or 500 <= response.status_code < 600:
+            if attempt < 2:
+                time.sleep(1 << attempt)
+                continue
+        return response
     raise RuntimeError("unreachable")
 
 
@@ -157,8 +155,6 @@ def bocha_search(query: str, include: str = "", exclude: str = "") -> tuple[str,
     if exclude:
         body["exclude"] = exclude
 
-    if _automatic_request_deferred():
-        return "", 0
     try:
         response = _post_with_transient_retry(
             config["api_url"],
@@ -166,6 +162,8 @@ def bocha_search(query: str, include: str = "", exclude: str = "") -> tuple[str,
             json=body,
             timeout=config.get("timeout", 30),
         )
+        if response.status_code == 408 or 500 <= response.status_code < 600:
+            response.raise_for_status()
         if response.status_code != 200:
             return "", 0
         data = response.json()
@@ -193,6 +191,12 @@ def bocha_search(query: str, include: str = "", exclude: str = "") -> tuple[str,
             if summary and summary != snippet:
                 lines.append(f"   全文概要：{summary}")
         return "\n".join(lines), len(results)
+    except (requests.ConnectionError, requests.Timeout):
+        raise
+    except requests.HTTPError as error:
+        if _transient_http_error(error):
+            raise
+        return "", 0
     except Exception:
         return "", 0
 
@@ -285,14 +289,6 @@ def call_ai(
     try:
         message = {}
         for _ in range(5):
-            if _automatic_request_deferred():
-                return (
-                    "自动任务检测到会话已锁定，已延后网络请求。",
-                    False,
-                    web_searches,
-                    tool_calls,
-                    search_results,
-                )
             response = _post_with_transient_retry(
                 model_config["api_url"], headers=headers, json=payload, timeout=60
             )
@@ -311,14 +307,6 @@ def call_ai(
 
             messages.append(message)
             for tool_call in requested_tools:
-                if _automatic_request_deferred():
-                    return (
-                        "自动任务检测到会话已锁定，已延后网络请求。",
-                        False,
-                        web_searches,
-                        tool_calls,
-                        search_results,
-                    )
                 function_name = tool_call["function"]["name"]
                 tool_calls[function_name] = tool_calls.get(function_name, 0) + 1
                 arguments = json.loads(tool_call["function"]["arguments"])
@@ -353,6 +341,20 @@ def call_ai(
 
         text = (message.get("content") or "").strip()
         return text or "(AI 未给出最终回答)", True, web_searches, tool_calls, search_results
+    except (requests.ConnectionError, requests.Timeout) as error:
+        return (
+            f"{NETWORK_ERROR_MARKER} {error}",
+            False,
+            web_searches,
+            tool_calls,
+            search_results,
+        )
+    except requests.HTTPError as error:
+        error_message = str(error)
+        if error.response is not None:
+            error_message += f" | {error.response.text}"
+        prefix = NETWORK_ERROR_MARKER if _transient_http_error(error) else "接口异常:"
+        return f"{prefix} {error_message}", False, web_searches, tool_calls, search_results
     except requests.RequestException as error:
         error_message = str(error)
         if error.response is not None:

@@ -7,7 +7,6 @@ from unittest.mock import Mock, patch
 
 from AgentRecord import settings
 from AgentRecord.analysis import automation, context, orchestrator
-from AgentRecord.analysis import session_state
 from AgentRecord.analysis.store import AnalysisStore
 from AgentRecord.agents.base import AgentPipelineError
 
@@ -220,21 +219,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
         second.release()
         self.assertTrue((settings.ANALYSIS_DIR / ".automation.lock").exists())
 
-    def test_locked_session_defers_without_model_calls(self):
-        with patch.object(automation, "session_is_locked", return_value=True), patch.object(
-            automation, "_automation_model"
-        ) as model:
-            automation.run_due_automatic_tasks()
-        model.assert_not_called()
-        state = json.loads(
-            (settings.ANALYSIS_DIR / ".automation-state.json").read_text(encoding="utf-8")
-        )
-        self.assertIn("会话已锁定", state["deferred_reason"])
-        released = automation._acquire_automation_lock()
-        self.assertIsNotNone(released)
-        released.release()
-
-    def test_placeholder_summary_is_reconciled_even_when_progress_is_ahead(self):
+    def test_placeholder_summary_is_detected_from_diary_content(self):
         today = datetime.date(2026, 7, 17)
         yesterday = today - datetime.timedelta(days=1)
         path = settings.DIARY_DIR / f"{yesterday}.md"
@@ -243,7 +228,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
             "---\n## 原始记录流\n\n**09:00:** 昨日记录\n",
             encoding="utf-8",
         )
-        state = {"last_daily_date": yesterday.isoformat()}
+        state = {}
 
         with patch.object(
             automation, "summarize_diary", return_value=("总结", True)
@@ -267,14 +252,50 @@ class AnalysisWorkflowTests(unittest.TestCase):
 
         summarize.assert_not_called()
 
-    def test_missing_latest_auto_reports_override_stale_success_progress(self):
+    def test_four_automatic_artifacts_include_daily_information(self):
+        now = datetime.datetime(2026, 7, 17, 9, 0)
+        yesterday = settings.DIARY_DIR / "2026-07-16.md"
+        yesterday.write_text(
+            "# 2026-07-16\n\n<summary>\n暂无今日总结。\n</summary>\n\n"
+            "---\n## 原始记录流\n\n**09:00:** 昨日记录\n",
+            encoding="utf-8",
+        )
+        self.write_diary("2026-07-10")
+        self.write_diary("2026-06-15")
+
+        self.assertTrue(automation._task_missing("daily_summary", now))
+        self.assertTrue(automation._task_missing("daily_information", now))
+        self.assertTrue(automation._task_missing("weekly_report", now))
+        self.assertTrue(automation._task_missing("monthly_report", now))
+
+        yesterday.write_text(
+            yesterday.read_text(encoding="utf-8").replace("暂无今日总结。", "已有总结。"),
+            encoding="utf-8",
+        )
+        info_path = automation.information_briefing_path(now.date())
+        info_path.parent.mkdir(parents=True, exist_ok=True)
+        info_path.write_text("简报", encoding="utf-8")
+        week_start, week_end = automation._latest_week_period(now.date())
+        month_start, month_end = automation._latest_month_period(now.date())
+        weekly_path = context._analysis_report_path(
+            "weekly", week_start, week_end, "auto"
+        )
+        monthly_path = context._analysis_report_path(
+            "monthly", month_start, month_end, "auto"
+        )
+        weekly_path.parent.mkdir(parents=True, exist_ok=True)
+        monthly_path.parent.mkdir(parents=True, exist_ok=True)
+        weekly_path.write_text("周报", encoding="utf-8")
+        monthly_path.write_text("月报", encoding="utf-8")
+
+        for task in automation.AUTOMATION_TASK_LABELS:
+            self.assertFalse(automation._task_missing(task, now), task)
+
+    def test_latest_auto_reports_are_detected_from_files(self):
         today = datetime.date(2026, 7, 17)
         self.write_diary("2026-07-10")
         self.write_diary("2026-06-15")
-        state = {
-            "last_week_end": "2026-07-12",
-            "last_month_end": "2026-06-30",
-        }
+        state = {}
 
         with patch.object(
             automation,
@@ -346,23 +367,6 @@ class AnalysisWorkflowTests(unittest.TestCase):
         self.assertEqual(1, saved_payload["_telemetry"]["tool_calls"]["web_search"])
         self.assertEqual(12, saved_payload["_telemetry"]["search_results"])
 
-    def test_linux_session_lock_uses_logind_locked_hint(self):
-        results = [
-            Mock(returncode=0, stdout="2 1000 user seat0 tty2\n"),
-            Mock(returncode=0, stdout="yes\n"),
-            Mock(returncode=0, stdout="yes\n"),
-        ]
-        with patch.object(session_state.os, "getuid", return_value=1000), patch.object(
-            session_state.subprocess, "run", side_effect=results
-        ):
-            self.assertTrue(session_state._linux_locked())
-
-    def test_session_lock_environment_override_is_deterministic(self):
-        with patch.dict(session_state.os.environ, {"AGENTRECORD_SESSION_LOCKED": "1"}):
-            self.assertTrue(session_state.session_is_locked())
-        with patch.dict(session_state.os.environ, {"AGENTRECORD_SESSION_LOCKED": "0"}):
-            self.assertFalse(session_state.session_is_locked())
-
     def test_retry_runs_all_failed_tasks(self):
         settings.ANALYSIS_DIR.mkdir()
         (settings.ANALYSIS_DIR / ".automation-state.json").write_text(
@@ -385,7 +389,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
             automation._clear_task_error(state, task)
             automation._save_automation_state(state)
 
-        with patch.object(automation, "session_is_locked", return_value=False), patch.object(
+        with patch.object(
             automation, "_automation_model", return_value={"name": "mock"}
         ), patch.object(automation, "_retry_one_task", side_effect=succeed):
             _, success = automation.retry_failed_automatic_tasks()
@@ -415,7 +419,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        with patch.object(automation, "session_is_locked", return_value=False), patch.object(
+        with patch.object(
             automation, "_automation_model", return_value={"name": "mock"}
         ), patch.object(automation, "_run_weekly_reports") as weekly, patch.object(
             automation, "_run_monthly_reports"
@@ -424,6 +428,41 @@ class AnalysisWorkflowTests(unittest.TestCase):
 
         weekly.assert_not_called()
         monthly.assert_not_called()
+
+    def test_first_minute_after_a_missed_hour_runs_detection(self):
+        class FixedDateTime(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 7, 17, 10, 23)
+
+        settings.CONFIG["automation"] = {
+            "enabled": True,
+            "daily_summary": False,
+            "daily_information": True,
+            "daily_information_time": "08:05",
+            "weekly_report": False,
+            "monthly_report": False,
+        }
+        settings.ANALYSIS_DIR.mkdir()
+        (settings.ANALYSIS_DIR / ".automation-state.json").write_text(
+            json.dumps({"last_detection_hour": "2026-07-17T08"}),
+            encoding="utf-8",
+        )
+
+        with patch.object(
+            automation.datetime, "datetime", FixedDateTime
+        ), patch.object(
+            automation,
+            "_task_missing",
+            side_effect=lambda task, now: task == "daily_information",
+        ), patch.object(
+            automation, "_automation_model", return_value={"name": "mock"}
+        ), patch.object(automation, "_run_daily_information") as run_information:
+            automation.run_due_automatic_tasks()
+
+        run_information.assert_called_once()
+        state = automation._load_automation_state()
+        self.assertEqual("2026-07-17T10", state["last_detection_hour"])
 
     def test_failed_task_becomes_due_at_the_next_clock_hour(self):
         state = {
@@ -455,9 +494,44 @@ class AnalysisWorkflowTests(unittest.TestCase):
         self.assertEqual(
             "2026-07-17T01:00:00", state["retry_after"]["weekly_report"]
         )
+        self.assertEqual("hourly", state["retry_kind"]["weekly_report"])
         automation._clear_task_error(state, "weekly_report")
         self.assertNotIn("errors", state)
         self.assertNotIn("retry_after", state)
+        self.assertNotIn("retry_kind", state)
+
+    def test_network_failure_sets_five_minute_retry_deadline(self):
+        class FixedDateTime(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 7, 17, 0, 25, 41)
+
+        state = {}
+        with patch.object(automation.datetime, "datetime", FixedDateTime):
+            automation._set_task_error(
+                state, "daily_information", "网络异常: DNS 解析失败"
+            )
+
+        self.assertEqual(
+            "2026-07-17T00:30:41",
+            state["retry_after"]["daily_information"],
+        )
+        self.assertEqual("network", state["retry_kind"]["daily_information"])
+
+    def test_legacy_completion_cursors_are_removed(self):
+        state = {
+            "last_daily_date": "2026-07-16",
+            "last_information_date": "2026-07-17",
+            "last_week_end": "2026-07-12",
+            "last_month_end": "2026-06-30",
+            "last_deferred_at": "old",
+            "deferred_reason": "old",
+            "errors": {"weekly_report": "失败"},
+        }
+
+        automation._remove_legacy_progress(state)
+
+        self.assertEqual({"errors": {"weekly_report": "失败"}}, state)
 
     def test_retry_command_launches_detached_process(self):
         settings.ANALYSIS_DIR.mkdir()

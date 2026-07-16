@@ -10,11 +10,10 @@ import sys
 from pathlib import Path
 
 from .. import journal, settings
-from ..ai_client import automatic_request_mode
+from ..ai_client import is_network_failure
 from .context import _analysis_report_path, _existing_logs
-from .information import generate_information_briefing
+from .information import generate_information_briefing, information_briefing_path
 from .orchestrator import generate_analysis_report, summarize_diary
-from .session_state import session_is_locked
 
 
 logger = logging.getLogger(__name__)
@@ -102,8 +101,15 @@ def _set_task_error(state: dict, task: str, message: str) -> None:
     now = datetime.datetime.now()
     state.setdefault("errors", {})[task] = f"{now:%Y-%m-%d %H:%M} {message}"
     if task in AUTOMATION_TASK_LABELS:
-        state.setdefault("retry_after", {})[task] = _next_hour(now).isoformat(
+        network_error = is_network_failure(message)
+        retry_at = (
+            now + datetime.timedelta(minutes=5) if network_error else _next_hour(now)
+        )
+        state.setdefault("retry_after", {})[task] = retry_at.isoformat(
             timespec="seconds"
+        )
+        state.setdefault("retry_kind", {})[task] = (
+            "network" if network_error else "hourly"
         )
 
 
@@ -116,20 +122,26 @@ def _clear_task_error(state: dict, task: str) -> None:
     retry_after.pop(task, None)
     if not retry_after:
         state.pop("retry_after", None)
+    retry_kind = state.get("retry_kind", {})
+    retry_kind.pop(task, None)
+    if not retry_kind:
+        state.pop("retry_kind", None)
 
 
 def _acquire_automation_lock() -> _AutomationLock | None:
     return _AutomationLock.acquire()
 
 
-def _mark_lock_deferred(state: dict) -> None:
-    state["last_deferred_at"] = datetime.datetime.now().isoformat(timespec="seconds")
-    state["deferred_reason"] = "会话已锁定；解锁后下一分钟内重新检查"
-    _save_automation_state(state)
-
-
-def _is_lock_deferral(message: str) -> bool:
-    return "会话已锁定" in message or "锁屏" in message
+def _remove_legacy_progress(state: dict) -> None:
+    for key in (
+        "last_daily_date",
+        "last_information_date",
+        "last_week_end",
+        "last_month_end",
+        "last_deferred_at",
+        "deferred_reason",
+    ):
+        state.pop(key, None)
 
 
 def _diary_summary_needs_generation(path: Path) -> bool:
@@ -169,48 +181,115 @@ def _failure_retry_is_due(
     return now >= _next_hour(failed_at)
 
 
+def _hour_key(now: datetime.datetime) -> str:
+    return now.strftime("%Y-%m-%dT%H")
+
+
+def _daily_information_scheduled_time() -> datetime.time:
+    time_text = str(
+        settings.CONFIG.get("automation", {}).get("daily_information_time", "08:05")
+    )
+    try:
+        return datetime.time.fromisoformat(time_text)
+    except ValueError:
+        return datetime.time(8, 5)
+
+
+def _latest_week_period(today: datetime.date) -> tuple[datetime.date, datetime.date]:
+    end = today - datetime.timedelta(days=today.weekday() + 1)
+    return end - datetime.timedelta(days=6), end
+
+
+def _latest_month_period(today: datetime.date) -> tuple[datetime.date, datetime.date]:
+    end = today.replace(day=1) - datetime.timedelta(days=1)
+    return end.replace(day=1), end
+
+
+def _task_missing(task: str, now: datetime.datetime) -> bool:
+    today = now.date()
+    if task == "daily_summary":
+        yesterday = today - datetime.timedelta(days=1)
+        path = settings.DIARY_DIR / f"{yesterday.isoformat()}.md"
+        return path.exists() and _diary_summary_needs_generation(path)
+    if task == "daily_information":
+        if now.time() < _daily_information_scheduled_time():
+            return False
+        return not information_briefing_path(today).exists()
+    if task == "weekly_report":
+        start, end = _latest_week_period(today)
+        path = _analysis_report_path("weekly", start, end, "auto")
+        return bool(_existing_logs(start, end)) and not path.exists()
+    if task == "monthly_report":
+        start, end = _latest_month_period(today)
+        path = _analysis_report_path("monthly", start, end, "auto")
+        return bool(_existing_logs(start, end)) and not path.exists()
+    return False
+
+
+def _task_artifact_status(task: str, now: datetime.datetime) -> str:
+    today = now.date()
+    if task == "daily_summary":
+        yesterday = today - datetime.timedelta(days=1)
+        path = settings.DIARY_DIR / f"{yesterday.isoformat()}.md"
+        if not path.exists():
+            return f"{yesterday} 无日记"
+        return f"{yesterday} {'缺失' if _diary_summary_needs_generation(path) else '已存在'}"
+    if task == "daily_information":
+        if now.time() < _daily_information_scheduled_time():
+            return f"{today} 未到生成时间"
+        return f"{today} {'缺失' if _task_missing(task, now) else '已存在'}"
+    if task == "weekly_report":
+        start, end = _latest_week_period(today)
+        if not _existing_logs(start, end):
+            return f"{start} 至 {end} 无记录"
+        return f"{start} 至 {end} {'缺失' if _task_missing(task, now) else '已存在'}"
+    if task == "monthly_report":
+        start, end = _latest_month_period(today)
+        if not _existing_logs(start, end):
+            return f"{start:%Y-%m} 无记录"
+        return f"{start:%Y-%m} {'缺失' if _task_missing(task, now) else '已存在'}"
+    return "未知"
+
+
+def _task_should_run(
+    state: dict,
+    task: str,
+    now: datetime.datetime,
+    *,
+    initial_detection_due: bool,
+) -> bool:
+    if task in state.get("errors", {}):
+        if not _failure_retry_is_due(state, task, now):
+            return False
+    elif not initial_detection_due:
+        return False
+    if _task_missing(task, now):
+        return True
+    _clear_task_error(state, task)
+    return False
+
+
 def _run_daily_summaries(
     today: datetime.date, state: dict, model_config: settings.ModelDict
 ) -> None:
     yesterday = today - datetime.timedelta(days=1)
-    last_daily_text = state.get("last_daily_date", "")
-    if last_daily_text:
-        try:
-            current = datetime.date.fromisoformat(last_daily_text) + datetime.timedelta(days=1)
-        except ValueError:
-            current = yesterday
-    else:
-        current = yesterday
-    yesterday_path = settings.DIARY_DIR / f"{yesterday.isoformat()}.md"
-    if (
-        current > yesterday
-        and yesterday_path.exists()
-        and _diary_summary_needs_generation(yesterday_path)
-    ):
-        current = yesterday
-    while current <= yesterday:
-        date_text = current.isoformat()
-        path = settings.DIARY_DIR / f"{date_text}.md"
-        if path.exists() and _diary_summary_needs_generation(path):
-            _set_current_task(state, "daily_summary", f"正在总结 {date_text} 日记")
-            message, success = summarize_diary(date_text, model_config)
-        else:
-            message, success = "", True
-        if not success:
-            if _is_lock_deferral(message):
-                _mark_lock_deferred(state)
-                break
-            _set_task_error(
-                state,
-                "daily_summary",
-                f"自动总结 {date_text} 失败: {message[:500]}",
-            )
-            _save_automation_state(state)
-            break
-        state["last_daily_date"] = date_text
+    date_text = yesterday.isoformat()
+    path = settings.DIARY_DIR / f"{date_text}.md"
+    if not path.exists() or not _diary_summary_needs_generation(path):
         _clear_task_error(state, "daily_summary")
         _save_automation_state(state)
-        current += datetime.timedelta(days=1)
+        return
+    _set_current_task(state, "daily_summary", f"正在总结 {date_text} 日记")
+    message, success = summarize_diary(date_text, model_config)
+    if success:
+        _clear_task_error(state, "daily_summary")
+    else:
+        _set_task_error(
+            state,
+            "daily_summary",
+            f"自动总结 {date_text} 失败: {message[:500]}",
+        )
+    _save_automation_state(state)
 
 
 def run_due_automatic_tasks() -> None:
@@ -222,55 +301,64 @@ def run_due_automatic_tasks() -> None:
     if automation_lock is None:
         return
     state = _load_automation_state()
-    state["last_check_started_at"] = datetime.datetime.now().isoformat(
-        timespec="seconds"
-    )
+    _remove_legacy_progress(state)
+    now = datetime.datetime.now()
+    state["last_check_started_at"] = now.isoformat(timespec="seconds")
     _save_automation_state(state)
     try:
-        if session_is_locked():
-            _mark_lock_deferred(state)
-            return
-        with automatic_request_mode():
-            model_config = _automation_model()
-            _clear_task_error(state, "scheduler")
-            state.pop("deferred_reason", None)
-            now = datetime.datetime.now()
-            today = now.date()
-            if automation.get("daily_summary", True) and _failure_retry_is_due(
-                state, "daily_summary", now
+        hourly_detection_due = state.get("last_detection_hour") != _hour_key(now)
+        daily_information_due = (
+            now.time() >= _daily_information_scheduled_time()
+            and _task_missing("daily_information", now)
+        )
+        due_tasks = []
+        task_settings = (
+            ("daily_summary", "daily_summary", hourly_detection_due),
+            (
+                "daily_information",
+                "daily_information",
+                hourly_detection_due or daily_information_due,
+            ),
+            ("weekly_report", "weekly_report", hourly_detection_due),
+            ("monthly_report", "monthly_report", hourly_detection_due),
+        )
+        for task, config_key, initial_due in task_settings:
+            if not automation.get(config_key, True):
+                _clear_task_error(state, task)
+                continue
+            if _task_should_run(
+                state, task, now, initial_detection_due=initial_due
             ):
-                _run_daily_summaries(today, state, model_config)
+                due_tasks.append(task)
+        _save_automation_state(state)
 
-            if (
-                not session_is_locked()
-                and automation.get("daily_information", True)
-                and _failure_retry_is_due(state, "daily_information", now)
-            ):
+        if due_tasks:
+            model_config = _automation_model()
+            today = now.date()
+            if "daily_summary" in due_tasks:
+                _run_daily_summaries(today, state, model_config)
+            if "daily_information" in due_tasks:
                 _run_daily_information(now, state, model_config)
-            if (
-                not session_is_locked()
-                and automation.get("weekly_report", True)
-                and _failure_retry_is_due(state, "weekly_report", now)
-            ):
+            if "weekly_report" in due_tasks:
                 trigger = (
                     "retry"
                     if "weekly_report" in state.get("errors", {})
                     else "scheduled"
                 )
                 _run_weekly_reports(today, state, model_config, trigger=trigger)
-            if (
-                not session_is_locked()
-                and automation.get("monthly_report", True)
-                and _failure_retry_is_due(state, "monthly_report", now)
-            ):
+            if "monthly_report" in due_tasks:
                 trigger = (
                     "retry"
                     if "monthly_report" in state.get("errors", {})
                     else "scheduled"
                 )
                 _run_monthly_reports(today, state, model_config, trigger=trigger)
-            if session_is_locked():
-                _mark_lock_deferred(state)
+        if hourly_detection_due:
+            # This is only a scheduler watermark. Writing it after the work means
+            # a killed process is detected again on the next minute invocation.
+            state["last_detection_hour"] = _hour_key(now)
+        _clear_task_error(state, "scheduler")
+        _save_automation_state(state)
     except Exception as error:
         state = _load_automation_state()
         _set_task_error(state, "scheduler", f"自动任务异常: {error}")
@@ -292,56 +380,28 @@ def _run_daily_information(
     state: dict,
     model_config: settings.ModelDict,
 ) -> None:
-    time_text = str(
-        settings.CONFIG.get("automation", {}).get("daily_information_time", "08:05")
-    )
-    try:
-        scheduled_time = datetime.time.fromisoformat(time_text)
-    except ValueError:
-        scheduled_time = datetime.time(8, 5)
-    last_date_text = state.get("last_information_date", "")
-    if last_date_text:
-        try:
-            current = datetime.date.fromisoformat(last_date_text) + datetime.timedelta(
-                days=1
-            )
-        except ValueError:
-            current = now.date()
-    else:
-        current = now.date()
-    last_due_date = (
-        now.date()
-        if now.time() >= scheduled_time
-        else now.date() - datetime.timedelta(days=1)
-    )
-    while current <= last_due_date:
-        date_text = current.isoformat()
-        try:
-            _set_current_task(state, "daily_information", f"正在收集 {date_text} 信息")
-            message, success, _ = generate_information_briefing(current, model_config)
-        except Exception as error:
-            _set_task_error(
-                state,
-                "daily_information",
-                f"自动收集 {date_text} 信息异常: {error}",
-            )
-            _save_automation_state(state)
-            break
-        if not success:
-            if _is_lock_deferral(message):
-                _mark_lock_deferred(state)
-                break
-            _set_task_error(
-                state,
-                "daily_information",
-                f"自动收集 {date_text} 信息失败: {message[:500]}",
-            )
-            _save_automation_state(state)
-            break
-        state["last_information_date"] = date_text
+    date = now.date()
+    date_text = date.isoformat()
+    if now.time() < _daily_information_scheduled_time() or information_briefing_path(
+        date
+    ).exists():
         _clear_task_error(state, "daily_information")
         _save_automation_state(state)
-        current += datetime.timedelta(days=1)
+        return
+    try:
+        _set_current_task(state, "daily_information", f"正在收集 {date_text} 信息")
+        message, success, _ = generate_information_briefing(date, model_config)
+    except Exception as error:
+        message, success = f"接口异常: {error}", False
+    if success:
+        _clear_task_error(state, "daily_information")
+    else:
+        _set_task_error(
+            state,
+            "daily_information",
+            f"自动收集 {date_text} 信息失败: {message[:500]}",
+        )
+    _save_automation_state(state)
 
 
 def _run_weekly_reports(
@@ -351,67 +411,29 @@ def _run_weekly_reports(
     *,
     trigger: str = "scheduled",
 ) -> None:
-    last_week_end = today - datetime.timedelta(days=today.weekday() + 1)
-    state_week = state.get("last_week_end", "")
-    if state_week:
-        try:
-            current_week_end = (
-                datetime.datetime.strptime(state_week, "%Y-%m-%d").date()
-                + datetime.timedelta(days=7)
-            )
-        except ValueError:
-            current_week_end = last_week_end
-    else:
-        current_week_end = last_week_end
-
-    latest_week_start = last_week_end - datetime.timedelta(days=6)
-    latest_week_path = _analysis_report_path(
-        "weekly", latest_week_start, last_week_end, "auto"
+    start, end = _latest_week_period(today)
+    path = _analysis_report_path("weekly", start, end, "auto")
+    if not _existing_logs(start, end) or path.exists():
+        _clear_task_error(state, "weekly_report")
+        _save_automation_state(state)
+        return
+    _set_current_task(
+        state,
+        "weekly_report",
+        f"正在生成 {start:%Y-%m-%d} 至 {end:%Y-%m-%d} 自动周报",
     )
-    if (
-        current_week_end > last_week_end
-        and _existing_logs(latest_week_start, last_week_end)
-        and not latest_week_path.exists()
-    ):
-        current_week_end = last_week_end
-
-    while current_week_end <= last_week_end:
-        current_week_start = current_week_end - datetime.timedelta(days=6)
-        logs = _existing_logs(current_week_start, current_week_end)
-        if logs:
-            _set_current_task(
-                state,
-                "weekly_report",
-                f"正在生成 {current_week_start:%Y-%m-%d} 至 "
-                f"{current_week_end:%Y-%m-%d} 自动周报",
-            )
-            message, success, _ = generate_analysis_report(
-                "weekly",
-                current_week_start,
-                model_config,
-                origin="auto",
-                trigger=trigger,
-            )
-        else:
-            message = ""
-            success = True
-        if success:
-            state["last_week_end"] = current_week_end.strftime("%Y-%m-%d")
-            _clear_task_error(state, "weekly_report")
-            _save_automation_state(state)
-            current_week_end += datetime.timedelta(days=7)
-        else:
-            if _is_lock_deferral(message):
-                _mark_lock_deferred(state)
-                break
-            _set_task_error(
-                state,
-                "weekly_report",
-                f"自动生成截至 {current_week_end:%Y-%m-%d} 的周报失败: "
-                f"{message[:500]}",
-            )
-            _save_automation_state(state)
-            break
+    message, success, _ = generate_analysis_report(
+        "weekly", start, model_config, origin="auto", trigger=trigger
+    )
+    if success:
+        _clear_task_error(state, "weekly_report")
+    else:
+        _set_task_error(
+            state,
+            "weekly_report",
+            f"自动生成截至 {end:%Y-%m-%d} 的周报失败: {message[:500]}",
+        )
+    _save_automation_state(state)
 
 
 def _run_monthly_reports(
@@ -421,68 +443,25 @@ def _run_monthly_reports(
     *,
     trigger: str = "scheduled",
 ) -> None:
-    this_month_start = today.replace(day=1)
-    last_month_end = this_month_start - datetime.timedelta(days=1)
-    state_month = state.get("last_month_end", "")
-    if state_month:
-        try:
-            current_month_start = (
-                datetime.date.fromisoformat(state_month) + datetime.timedelta(days=1)
-            ).replace(day=1)
-        except ValueError:
-            current_month_start = last_month_end.replace(day=1)
-    else:
-        current_month_start = last_month_end.replace(day=1)
-
-    latest_month_start = last_month_end.replace(day=1)
-    latest_month_path = _analysis_report_path(
-        "monthly", latest_month_start, last_month_end, "auto"
+    start, end = _latest_month_period(today)
+    path = _analysis_report_path("monthly", start, end, "auto")
+    if not _existing_logs(start, end) or path.exists():
+        _clear_task_error(state, "monthly_report")
+        _save_automation_state(state)
+        return
+    _set_current_task(state, "monthly_report", f"正在生成 {start:%Y-%m} 自动月报")
+    message, success, _ = generate_analysis_report(
+        "monthly", start, model_config, origin="auto", trigger=trigger
     )
-    if (
-        current_month_start > latest_month_start
-        and _existing_logs(latest_month_start, last_month_end)
-        and not latest_month_path.exists()
-    ):
-        current_month_start = latest_month_start
-
-    while current_month_start <= last_month_end:
-        next_month = (
-            current_month_start.replace(day=28) + datetime.timedelta(days=4)
-        ).replace(day=1)
-        current_month_end = next_month - datetime.timedelta(days=1)
-        logs = _existing_logs(current_month_start, current_month_end)
-        if logs:
-            _set_current_task(
-                state,
-                "monthly_report",
-                f"正在生成 {current_month_start:%Y-%m} 自动月报",
-            )
-            message, success, _ = generate_analysis_report(
-                "monthly",
-                current_month_start,
-                model_config,
-                origin="auto",
-                trigger=trigger,
-            )
-        else:
-            message = ""
-            success = True
-        if success:
-            state["last_month_end"] = current_month_end.strftime("%Y-%m-%d")
-            _clear_task_error(state, "monthly_report")
-            _save_automation_state(state)
-            current_month_start = next_month
-        else:
-            if _is_lock_deferral(message):
-                _mark_lock_deferred(state)
-                break
-            _set_task_error(
-                state,
-                "monthly_report",
-                f"自动生成 {current_month_start:%Y-%m} 月报失败: {message[:500]}",
-            )
-            _save_automation_state(state)
-            break
+    if success:
+        _clear_task_error(state, "monthly_report")
+    else:
+        _set_task_error(
+            state,
+            "monthly_report",
+            f"自动生成 {start:%Y-%m} 月报失败: {message[:500]}",
+        )
+    _save_automation_state(state)
 
 
 AUTOMATION_TASK_LABELS = {
@@ -525,12 +504,6 @@ def retry_failed_automatic_tasks() -> tuple[str, bool]:
     if automation_lock is None:
         return "另一个自动任务正在运行，请稍后重试。", False
     state = _load_automation_state()
-    if session_is_locked():
-        try:
-            _mark_lock_deferred(state)
-            return "会话已锁定，全部自动任务已延后。", False
-        finally:
-            automation_lock.release()
     tasks = [task for task in AUTOMATION_TASK_LABELS if task in state.get("errors", {})]
     if not tasks:
         automation_lock.release()
@@ -540,14 +513,10 @@ def retry_failed_automatic_tasks() -> tuple[str, bool]:
     _save_automation_state(state)
     logger.info("automation_retry_started tasks=%s", ",".join(tasks))
     try:
-        with automatic_request_mode():
-            model = _automation_model()
-            for task in tasks:
-                if session_is_locked():
-                    _mark_lock_deferred(state)
-                    break
-                _retry_one_task(task, now, state, model)
-                state = _load_automation_state()
+        model = _automation_model()
+        for task in tasks:
+            _retry_one_task(task, now, state, model)
+            state = _load_automation_state()
         state = _load_automation_state()
         remaining = [task for task in tasks if task in state.get("errors", {})]
         success = not remaining
@@ -559,7 +528,7 @@ def retry_failed_automatic_tasks() -> tuple[str, bool]:
         if success:
             return "全部失败自动任务重试成功。", True
         labels = "、".join(AUTOMATION_TASK_LABELS[task] for task in remaining)
-        return f"以下自动任务仍失败或被延后：{labels}", False
+        return f"以下自动任务仍失败：{labels}", False
     except Exception as error:
         state = _load_automation_state()
         _set_task_error(
@@ -645,7 +614,7 @@ def system_automation_status() -> tuple[bool, str]:
             ]
             installed_count = sum(result.returncode == 0 for result in results)
             if installed_count == len(results):
-                return True, "系统自动任务已安装；解锁状态下每分钟检查。"
+                return True, "系统自动任务已安装；每分钟唤醒调度器检查到期任务。"
             if installed_count:
                 return False, "系统自动任务安装不完整，请重新执行安装命令。"
             return False, "系统自动任务未安装；自动总结、信息简报和周期报告不会运行。"
@@ -668,18 +637,19 @@ def system_automation_status() -> tuple[bool, str]:
             for line in lines
         )
         if has_startup and has_minute:
-            return True, "系统自动任务已安装；解锁状态下每分钟检查。"
+            return True, "系统自动任务已安装；每分钟唤醒调度器检查到期任务。"
         if has_startup or has_minute:
             return False, "系统自动任务安装不完整，请重新执行安装命令。"
-        return False, "系统自动任务未安装；自动总结和周期报告不会运行。"
+        return False, "系统自动任务未安装；自动总结、信息简报和周期报告不会运行。"
     except (OSError, subprocess.SubprocessError) as error:
         return False, f"无法确认系统自动任务状态：{error}"
 
 
 def automation_status_snapshot() -> dict:
-    """汇总安装状态、最后检查、各类进度和当前失败。"""
+    """汇总安装状态、真实产物状态、调度时间和当前失败。"""
     installed, install_message = system_automation_status()
     state = _load_automation_state()
+    now = datetime.datetime.now()
     return {
         "installed": installed,
         "install_message": install_message,
@@ -687,22 +657,22 @@ def automation_status_snapshot() -> dict:
         "last_check_completed_at": state.get("last_check_completed_at", ""),
         "last_retry_started_at": state.get("last_retry_started_at", ""),
         "last_retry_completed_at": state.get("last_retry_completed_at", ""),
-        "last_deferred_at": state.get("last_deferred_at", ""),
-        "deferred_reason": state.get("deferred_reason", ""),
         "current_task": state.get("current_task", ""),
         "current_task_detail": state.get("current_task_detail", ""),
         "current_task_started_at": state.get("current_task_started_at", ""),
-        "last_daily_date": state.get("last_daily_date", ""),
-        "last_information_date": state.get("last_information_date", ""),
-        "last_week_end": state.get("last_week_end", ""),
-        "last_month_end": state.get("last_month_end", ""),
+        "daily_summary_status": _task_artifact_status("daily_summary", now),
+        "daily_information_status": _task_artifact_status("daily_information", now),
+        "weekly_report_status": _task_artifact_status("weekly_report", now),
+        "monthly_report_status": _task_artifact_status("monthly_report", now),
+        "last_detection_hour": state.get("last_detection_hour", ""),
         "retry_after": dict(state.get("retry_after", {})),
+        "retry_kind": dict(state.get("retry_kind", {})),
         "errors": dict(state.get("errors", {})),
     }
 
 
 def install_system_automation() -> tuple[bool, str]:
-    """安装每分钟检查锁屏与到期任务的用户级系统任务。"""
+    """安装每分钟唤醒调度器的用户级系统任务。"""
     try:
         command = _automation_command()
         if _is_windows():
@@ -763,7 +733,7 @@ def install_system_automation() -> tuple[bool, str]:
             )
         if result.returncode != 0:
             return False, result.stderr.strip() or result.stdout.strip() or "安装失败。"
-        return True, "系统后台任务已安装：锁屏时延后，解锁后下一分钟内检查。"
+        return True, "系统后台任务已安装：每分钟唤醒，并在重启后补检到期任务。"
     except (OSError, subprocess.SubprocessError) as error:
         return False, f"安装系统后台任务失败: {error}"
 

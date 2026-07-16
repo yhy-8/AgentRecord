@@ -135,16 +135,24 @@ class MainCommandTests(unittest.TestCase):
         self.assertTrue(started)
         self.assertEqual(datetime.date(2026, 7, 13), generate.call_args.args[1])
 
-    def test_status_command_displays_progress_and_failure(self):
+    def test_status_command_displays_artifacts_and_failure(self):
         snapshot = {
             "installed": True,
             "install_message": "已安装",
             "last_check_started_at": "2026-07-15T20:00:00",
             "last_check_completed_at": "2026-07-15T20:01:00",
-            "last_daily_date": "2026-07-14",
-            "last_information_date": "2026-07-15",
-            "last_week_end": "2026-07-12",
-            "last_month_end": "2026-06-30",
+            "last_retry_started_at": "",
+            "last_retry_completed_at": "",
+            "current_task": "",
+            "current_task_detail": "",
+            "current_task_started_at": "",
+            "daily_summary_status": "2026-07-14 已存在",
+            "daily_information_status": "2026-07-15 已存在",
+            "weekly_report_status": "2026-07-06 至 2026-07-12 缺失",
+            "monthly_report_status": "2026-06 已存在",
+            "last_detection_hour": "2026-07-15T20",
+            "retry_after": {"weekly_report": "2026-07-15T21:00:00"},
+            "retry_kind": {"weekly_report": "hourly"},
             "errors": {"weekly_report": "周报失败"},
         }
         with patch(

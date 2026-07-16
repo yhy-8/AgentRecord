@@ -68,7 +68,7 @@ def _show_automation_status() -> None:
     if status["errors"]:
         tasks = "、".join(status["errors"])
         console.print(
-            f"[yellow][!] 自动任务存在未恢复失败：{tasks}；系统会在下个整点重试，"
+            f"[yellow][!] 自动任务存在未恢复失败：{tasks}；网络错误会在 5 分钟后重试，其他错误在下个整点重试，"
             "也可用 /status 查看或在报告模式执行 /retry 立即全量重试。[/yellow]"
         )
 

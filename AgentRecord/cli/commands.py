@@ -198,31 +198,29 @@ def _handle_status() -> None:
         f"  系统自动任务：{installed}",
         f"  安装详情：{status['install_message']}",
         f"  最后完成检查：{status['last_check_completed_at'] or '尚未记录'}",
+        f"  最后缺漏检测小时：{status['last_detection_hour'] or '尚未记录'}",
         f"  最后手动重试：{status.get('last_retry_completed_at') or '尚未记录'}",
-        f"  日总结进度：{status['last_daily_date'] or '尚无'}",
-        f"  信息简报进度：{status['last_information_date'] or '尚无'}",
-        f"  周报进度：{status['last_week_end'] or '尚无'}",
-        f"  月报进度：{status['last_month_end'] or '尚无'}",
+        f"  昨日日记总结：{status['daily_summary_status']}",
+        f"  今日信息简报：{status['daily_information_status']}",
+        f"  上周自动周报：{status['weekly_report_status']}",
+        f"  上月自动月报：{status['monthly_report_status']}",
     ]
     if status.get("current_task"):
         lines.append(
             f"  [cyan]当前任务：{status.get('current_task_detail') or status['current_task']}"
             f"（{status.get('current_task_started_at', '')}）[/cyan]"
         )
-    if status.get("deferred_reason"):
-        lines.append(
-            f"  [yellow]自动任务延后：{status['deferred_reason']}"
-            f"（{status.get('last_deferred_at', '')}）[/yellow]"
-        )
     errors = status["errors"]
     if errors:
         lines.append(
-            "  [yellow]当前失败（到达下个整点自动重试；/retry 可立即全量重试）：[/yellow]"
+            "  [yellow]当前失败（网络错误 5 分钟后重试，其他错误下个整点重试；/retry 可立即全量重试）：[/yellow]"
         )
         retry_after = status.get("retry_after", {})
+        retry_kind = status.get("retry_kind", {})
         for task, message in errors.items():
             deadline = retry_after.get(task, "")
-            suffix = f"；不早于 {deadline}" if deadline else ""
+            kind = "网络" if retry_kind.get(task) == "network" else "整点"
+            suffix = f"；{kind}重试不早于 {deadline}" if deadline else ""
             lines.append(f"    - {task}: {message}{suffix}")
     else:
         lines.append("  当前失败：无")
