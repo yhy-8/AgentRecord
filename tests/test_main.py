@@ -29,14 +29,17 @@ class MainCommandTests(unittest.TestCase):
     def test_reference_command_selects_diary_and_records_note(self):
         diary = settings.DIARY_DIR / "2026-07-14.md"
         diary.write_text("日记", encoding="utf-8")
+        submitted_at = datetime.datetime(2026, 7, 15, 10, 30)
+        datetime_module = Mock()
+        datetime_module.datetime.now.return_value = submitted_at
 
         with patch(
             "AgentRecord.cli.commands.safe_input",
             side_effect=["1", "由旧日记展开的想法"],
-        ):
+        ), patch.object(commands, "datetime", datetime_module):
             commands._handle_reference("/ref 2026-07-14")
 
-        content = next(settings.DIARY_DIR.glob("*.md")).read_text(encoding="utf-8")
+        content = (settings.DIARY_DIR / "2026-07-15.md").read_text(encoding="utf-8")
         self.assertIn("[引用]", content)
         self.assertIn("日记 | 2026-07-14", content)
         self.assertIn("由旧日记展开的想法", content)
