@@ -136,7 +136,7 @@ automation:
 ```
 
 - `daily_summary` 是日记顶部摘要，不是分析日报。
-- `daily_information` 生成“高价值综合新闻 + 本周记录定向信息”简报，保存在 `AnalysisReports/Information/YYYY-MM-DD.md`，作为周报、月报研究选题的线索。没有可用联网能力时任务失败，不生成伪联网简报。
+- `daily_information` 生成“高价值综合新闻 + 本周记录定向信息”简报，保存在 `AnalysisReports/Information/YYYY-MM-DD.md`，作为周报、月报研究选题的线索。选题会对照本自然周此前的简报和定向查询去重；只有出现实质新进展时才继续追踪同一主题，没有新角度时定向查询可以为零。没有可用联网能力时任务失败，不生成伪联网简报。
 - `current_model` 用于手动总结、手动报告和自动任务；报告模式 `/m` 会永久更新该配置。
 - 相对目录以 `config.yaml` 所在目录为基准。
 - 第三方搜索只在所选模型没有原生搜索能力时使用。

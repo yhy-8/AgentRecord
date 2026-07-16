@@ -75,10 +75,85 @@ class InformationBriefingTests(unittest.TestCase):
             settings.ANALYSIS_DIR / "Information" / "2026-07-15.md", path
         )
         self.assertIn("# 2026-07-15 每日信息简报", path.read_text(encoding="utf-8"))
+        self.assertIn(
+            "agentrecord-targeted-queries", path.read_text(encoding="utf-8")
+        )
         self.assertNotIn("user@example.com", collector_prompts[0])
         self.assertNotIn("/mnt/private", collector_prompts[0])
         self.assertIn("[email]", collector_prompts[0])
         self.assertIn("[local-path]", collector_prompts[0])
+
+    def test_briefing_uses_same_week_reports_and_drops_repeated_queries(self):
+        date = datetime.date(2026, 7, 16)
+        (settings.DIARY_DIR / "2026-07-16.md").write_text(
+            "# 2026-07-16\n\n<summary>\n\n</summary>\n\n"
+            "---\n## 原始记录流\n\n"
+            "**09:00:** 继续考虑个人知识管理和本地优先软件。\n",
+            encoding="utf-8",
+        )
+        information_dir = settings.ANALYSIS_DIR / "Information"
+        information_dir.mkdir(parents=True)
+        (information_dir / "2026-07-15.md").write_text(
+            "# 2026-07-15 每日信息简报\n\n"
+            '<!-- agentrecord-targeted-queries: [{"query":"个人知识管理 方法研究",'
+            '"reason":"比较不同方法"}] -->\n\n'
+            "## 今日值得关注\n\n昨日已讨论知识管理方法。\n",
+            encoding="utf-8",
+        )
+        planner_prompts = []
+        collector_prompts = []
+
+        def fake_call_ai(prompt, model_config, *, allowed_tools=None):
+            if allowed_tools == ():
+                planner_prompts.append(prompt)
+                return (
+                    json.dumps(
+                        {
+                            "queries": [
+                                {
+                                    "query": "个人知识管理最新进展",
+                                    "reason": "继续搜索相同主题",
+                                },
+                                {
+                                    "query": "本地优先笔记软件数据迁移风险",
+                                    "reason": "核查一个尚未覆盖的新角度",
+                                },
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                    True,
+                    0,
+                    {},
+                    0,
+                )
+            collector_prompts.append(prompt)
+            return (
+                "## 今日值得关注\n\n新资料 [来源](https://example.com/news)\n\n"
+                "## 与本周思考相关的探索\n\n新增内容。\n\n"
+                "## 可继续追踪\n\n后续更新。",
+                True,
+                0,
+                {"web_search": 3},
+                8,
+            )
+
+        with patch.object(information, "call_ai", side_effect=fake_call_ai):
+            _, success, path = information.generate_information_briefing(
+                date, {"name": "mock", "search": False}
+            )
+
+        self.assertTrue(success)
+        self.assertIn("昨日已讨论知识管理方法", planner_prompts[0])
+        self.assertIn("个人知识管理 方法研究", planner_prompts[0])
+        query_block = collector_prompts[0].split("【已去隐私的查询】", 1)[1].split(
+            "【本周此前的信息简报", 1
+        )[0]
+        self.assertNotIn("个人知识管理最新进展", query_block)
+        self.assertIn("本地优先笔记软件数据迁移风险", query_block)
+        generated = path.read_text(encoding="utf-8")
+        self.assertNotIn("个人知识管理最新进展", generated)
+        self.assertIn("本地优先笔记软件数据迁移风险", generated)
 
     def test_briefing_fails_when_web_search_is_not_configured(self):
         settings.CONFIG["third_search"] = {"enabled": False, "api_key": ""}
@@ -90,6 +165,38 @@ class InformationBriefingTests(unittest.TestCase):
         self.assertFalse(success)
         self.assertIsNone(path)
         self.assertIn("未启用联网能力", message)
+
+    def test_query_dedup_allows_a_concrete_new_event_in_the_same_field(self):
+        result = information._deduplicate_queries(
+            [
+                {"query": "个人知识管理最新进展", "reason": "泛化重复"},
+                {
+                    "query": "个人知识管理 Obsidian 插件安全事件影响",
+                    "reason": "出现了具体的新事件",
+                },
+            ],
+            [{"query": "个人知识管理 方法研究", "reason": "已有主题"}],
+        )
+
+        self.assertEqual(
+            ["个人知识管理 Obsidian 插件安全事件影响"],
+            [item["query"] for item in result],
+        )
+
+    def test_prior_briefings_exclude_target_date_and_previous_week(self):
+        directory = settings.ANALYSIS_DIR / "Information"
+        directory.mkdir(parents=True)
+        (directory / "2026-07-12.md").write_text("上周简报", encoding="utf-8")
+        (directory / "2026-07-15.md").write_text("本周昨日简报", encoding="utf-8")
+        (directory / "2026-07-16.md").write_text("当天旧简报", encoding="utf-8")
+
+        context_text, _ = information._prior_week_briefings(
+            datetime.date(2026, 7, 16)
+        )
+
+        self.assertIn("本周昨日简报", context_text)
+        self.assertNotIn("上周简报", context_text)
+        self.assertNotIn("当天旧简报", context_text)
 
     def test_period_information_context_reads_only_matching_dates(self):
         directory = settings.ANALYSIS_DIR / "Information"
