@@ -9,6 +9,7 @@ from AgentRecord import settings
 from AgentRecord.analysis import automation, context, orchestrator
 from AgentRecord.analysis import session_state
 from AgentRecord.analysis.store import AnalysisStore
+from AgentRecord.agents.base import AgentPipelineError
 
 
 class AnalysisWorkflowTests(unittest.TestCase):
@@ -233,6 +234,128 @@ class AnalysisWorkflowTests(unittest.TestCase):
         self.assertIsNotNone(released)
         released.release()
 
+    def test_placeholder_summary_is_reconciled_even_when_progress_is_ahead(self):
+        today = datetime.date(2026, 7, 17)
+        yesterday = today - datetime.timedelta(days=1)
+        path = settings.DIARY_DIR / f"{yesterday}.md"
+        path.write_text(
+            f"# {yesterday}\n\n<summary>\n暂无今日总结。\n</summary>\n\n"
+            "---\n## 原始记录流\n\n**09:00:** 昨日记录\n",
+            encoding="utf-8",
+        )
+        state = {"last_daily_date": yesterday.isoformat()}
+
+        with patch.object(
+            automation, "summarize_diary", return_value=("总结", True)
+        ) as summarize:
+            automation._run_daily_summaries(today, state, {"name": "mock"})
+
+        summarize.assert_called_once_with(yesterday.isoformat(), {"name": "mock"})
+
+    def test_existing_summary_is_not_overwritten_on_first_automation_run(self):
+        today = datetime.date(2026, 7, 17)
+        yesterday = today - datetime.timedelta(days=1)
+        path = settings.DIARY_DIR / f"{yesterday}.md"
+        path.write_text(
+            f"# {yesterday}\n\n<summary>\n已有总结。\n</summary>\n\n"
+            "---\n## 原始记录流\n\n**09:00:** 昨日记录\n",
+            encoding="utf-8",
+        )
+
+        with patch.object(automation, "summarize_diary") as summarize:
+            automation._run_daily_summaries(today, {}, {"name": "mock"})
+
+        summarize.assert_not_called()
+
+    def test_missing_latest_auto_reports_override_stale_success_progress(self):
+        today = datetime.date(2026, 7, 17)
+        self.write_diary("2026-07-10")
+        self.write_diary("2026-06-15")
+        state = {
+            "last_week_end": "2026-07-12",
+            "last_month_end": "2026-06-30",
+        }
+
+        with patch.object(
+            automation,
+            "generate_analysis_report",
+            return_value=("完成", True, Path("auto.md")),
+        ) as generate:
+            automation._run_weekly_reports(today, state, {"name": "mock"})
+            automation._run_monthly_reports(today, state, {"name": "mock"})
+
+        self.assertEqual(
+            ["weekly", "monthly"],
+            [call.args[0] for call in generate.call_args_list],
+        )
+
+    def test_retrospective_keeps_separate_format_and_review_repairs(self):
+        source_id = "R-20260714-001"
+        base_input = {
+            "period": {"kind": "weekly", "start": "2026-07-13", "end": "2026-07-19"},
+            "records": [{"source_id": source_id, "text": "记录"}],
+            "historical_profiles": [],
+        }
+        invalid = {"markdown": "缺少引用", "profile_entries": []}
+        valid = {"markdown": f"有依据的回顾 [{source_id}]", "profile_entries": []}
+        revised = {"markdown": f"按审查意见修订 [{source_id}]", "profile_entries": []}
+        store = Mock()
+
+        with patch.object(
+            orchestrator, "_call_agent", side_effect=[invalid, valid, revised]
+        ) as call_agent, patch.object(
+            orchestrator,
+            "_review",
+            side_effect=[(False, {}, ["收紧事实表述"]), (True, {}, [])],
+        ):
+            markdown, _, _ = orchestrator._retrospective_section(
+                base_input,
+                {source_id},
+                {source_id},
+                {},
+                {"name": "mock"},
+                store,
+                "run-id",
+            )
+
+        self.assertEqual(f"按审查意见修订 [{source_id}]", markdown)
+        self.assertEqual(3, call_agent.call_count)
+
+    def test_json_format_repair_preserves_first_search_telemetry(self):
+        parse_error = AgentPipelineError(
+            "Agent JSON 无法解析: test",
+            response="invalid",
+            telemetry={
+                "web_citations": 0,
+                "tool_calls": {"web_search": 1},
+                "search_results": 12,
+            },
+        )
+        repaired = {
+            "markdown": "repaired",
+            "_telemetry": {
+                "web_citations": 0,
+                "tool_calls": {},
+                "search_results": 0,
+            },
+        }
+        store = Mock()
+
+        with patch.object(
+            orchestrator, "invoke_agent", side_effect=[parse_error, repaired]
+        ):
+            payload = orchestrator._call_agent(
+                orchestrator.researcher.SPEC,
+                "研究",
+                {},
+                {"name": "mock"},
+                store,
+                "run-id",
+            )
+
+        self.assertEqual(1, payload["_telemetry"]["tool_calls"]["web_search"])
+        self.assertEqual(12, payload["_telemetry"]["search_results"])
+
     def test_linux_session_lock_uses_logind_locked_hint(self):
         results = [
             Mock(returncode=0, stdout="2 1000 user seat0 tty2\n"),
@@ -280,6 +403,37 @@ class AnalysisWorkflowTests(unittest.TestCase):
         self.assertEqual(
             ["daily_information", "weekly_report", "monthly_report"], calls
         )
+
+    def test_minute_scheduler_does_not_repeat_recorded_failures(self):
+        settings.CONFIG["automation"] = {
+            "enabled": True,
+            "daily_summary": False,
+            "daily_information": False,
+            "weekly_report": True,
+            "monthly_report": True,
+        }
+        settings.ANALYSIS_DIR.mkdir()
+        (settings.ANALYSIS_DIR / ".automation-state.json").write_text(
+            json.dumps(
+                {
+                    "errors": {
+                        "weekly_report": "失败",
+                        "monthly_report": "失败",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(automation, "session_is_locked", return_value=False), patch.object(
+            automation, "_automation_model", return_value={"name": "mock"}
+        ), patch.object(automation, "_run_weekly_reports") as weekly, patch.object(
+            automation, "_run_monthly_reports"
+        ) as monthly:
+            automation.run_due_automatic_tasks()
+
+        weekly.assert_not_called()
+        monthly.assert_not_called()
 
     def test_retry_command_launches_detached_process(self):
         settings.ANALYSIS_DIR.mkdir()

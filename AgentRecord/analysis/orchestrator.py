@@ -116,18 +116,42 @@ def _call_agent(
     logger.info("agent_start run=%s agent=%s", run_id, spec.name)
     current_task = task
     current_input = input_data
+    accumulated_telemetry = {
+        "web_citations": 0,
+        "tool_calls": {},
+        "search_results": 0,
+    }
+
+    def merge_telemetry(telemetry: dict) -> None:
+        accumulated_telemetry["web_citations"] += int(
+            telemetry.get("web_citations", 0) or 0
+        )
+        accumulated_telemetry["search_results"] += int(
+            telemetry.get("search_results", 0) or 0
+        )
+        for name, count in telemetry.get("tool_calls", {}).items():
+            accumulated_telemetry["tool_calls"][name] = (
+                accumulated_telemetry["tool_calls"].get(name, 0) + int(count or 0)
+            )
+
     for attempt in range(2):
         try:
             payload = invoke_agent(
                 spec, current_task, current_input, model_config, call_ai
             )
+            merge_telemetry(payload.get("_telemetry", {}))
+            payload["_telemetry"] = accumulated_telemetry
             logger.info("agent_completed run=%s agent=%s", run_id, spec.name)
             return payload
         except AgentPipelineError as error:
+            merge_telemetry(error.telemetry)
             store.save_artifact(
                 run_id,
                 spec.name,
-                {"response": error.response},
+                {
+                    "response": error.response,
+                    "_telemetry": accumulated_telemetry,
+                },
                 status="failed",
                 error=str(error),
             )
@@ -219,7 +243,10 @@ def _retrospective_section(
     run_id: str,
 ) -> tuple[str, list[dict], dict[str, str]]:
     feedback: list[str] = []
-    for attempt in range(2):
+    validation_repairs = 0
+    review_repairs = 0
+    attempt = 0
+    while True:
         current_input = dict(base_input)
         if feedback:
             current_input["required_changes"] = feedback
@@ -243,8 +270,10 @@ def _retrospective_section(
             )
         except AgentPipelineError as error:
             _save_validation_failure(store, run_id, retrospective.SPEC.name, payload, error)
-            if attempt == 0:
+            if validation_repairs == 0:
+                validation_repairs += 1
                 feedback = [str(error)]
+                attempt += 1
                 continue
             raise
         normalized_payload = {"markdown": markdown, "profile_entries": entries}
@@ -273,7 +302,11 @@ def _retrospective_section(
         if passed:
             store.save_artifact(run_id, retrospective.SPEC.name, normalized_payload)
             return markdown, entries, decisions
-    raise AgentPipelineError("整理与回顾连续两次未通过审查: " + "; ".join(feedback))
+        if review_repairs == 0:
+            review_repairs += 1
+            attempt += 1
+            continue
+        raise AgentPipelineError("整理与回顾修订后仍未通过审查: " + "; ".join(feedback))
 
 
 def _research_topics(
@@ -320,7 +353,10 @@ def _research_section(
     run_id: str,
 ) -> str:
     feedback: list[str] = []
-    for attempt in range(2):
+    validation_repairs = 0
+    review_repairs = 0
+    attempt = 0
+    while True:
         research_input = {
             "research_topics": topics,
             "information_leads": information_leads,
@@ -343,8 +379,10 @@ def _research_section(
             )
         except AgentPipelineError as error:
             _save_validation_failure(store, run_id, researcher.SPEC.name, payload, error)
-            if attempt == 0:
+            if validation_repairs == 0:
+                validation_repairs += 1
                 feedback = [str(error)]
+                attempt += 1
                 continue
             raise
         telemetry = payload.get("_telemetry", {})
@@ -357,8 +395,10 @@ def _research_section(
         if not used_search:
             error = AgentPipelineError("领域研究没有实际执行联网搜索")
             _save_validation_failure(store, run_id, researcher.SPEC.name, payload, error)
-            if attempt == 0:
+            if validation_repairs == 0:
+                validation_repairs += 1
                 feedback = [str(error)]
+                attempt += 1
                 continue
             raise error
         normalized_payload = {"markdown": markdown, "sources": sources}
@@ -378,7 +418,11 @@ def _research_section(
         if passed:
             store.save_artifact(run_id, researcher.SPEC.name, normalized_payload)
             return markdown
-    raise AgentPipelineError("领域研究连续两次未通过审查: " + "; ".join(feedback))
+        if review_repairs == 0:
+            review_repairs += 1
+            attempt += 1
+            continue
+        raise AgentPipelineError("领域研究修订后仍未通过审查: " + "; ".join(feedback))
 
 
 def _observed_dates(

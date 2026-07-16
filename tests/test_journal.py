@@ -27,11 +27,11 @@ class JournalTests(unittest.TestCase):
         latest = settings.DIARY_DIR / "2026-07-14.md"
         old.write_text("旧日记", encoding="utf-8")
         latest.write_text("新日记", encoding="utf-8")
-        sources = journal.list_reference_sources("diary")
-        filtered = journal.list_reference_sources("diary", "2026-07-13")
+        sources = journal.list_reference_sources()
+        filtered = journal.list_reference_sources("2026-07-13")
         self.assertEqual(("日记 | 2026-07-14", latest), sources[0])
         self.assertEqual([("日记 | 2026-07-13", old)], filtered)
-        self.assertEqual([], journal.list_reference_sources("weekly"))
+        self.assertEqual([], journal.list_reference_sources("2026-06"))
 
     def test_appends_portable_reference_with_note_and_timestamp(self):
         report = settings.DIARY_DIR / "2026-07-14.md"

@@ -21,9 +21,16 @@ class AgentSpec:
 class AgentPipelineError(RuntimeError):
     """A validated multi-agent analysis run could not be completed."""
 
-    def __init__(self, message: str, *, response: str = ""):
+    def __init__(
+        self,
+        message: str,
+        *,
+        response: str = "",
+        telemetry: dict | None = None,
+    ):
         super().__init__(message)
         self.response = response
+        self.telemetry = telemetry or {}
 
 
 def _parse_json(text: str) -> dict:
@@ -89,16 +96,21 @@ def invoke_agent(
         model_config,
         allowed_tools=spec.allowed_tools,
     )
-    if not success:
-        raise AgentPipelineError(
-            f"{spec.name} 调用失败: {text}", response=text
-        )
-    payload = _parse_json(text)
-    payload["_telemetry"] = {
+    telemetry = {
         "web_citations": web_count,
         "tool_calls": tool_counts,
         "search_results": result_count,
     }
+    if not success:
+        raise AgentPipelineError(
+            f"{spec.name} 调用失败: {text}", response=text, telemetry=telemetry
+        )
+    try:
+        payload = _parse_json(text)
+    except AgentPipelineError as error:
+        error.telemetry = telemetry
+        raise
+    payload["_telemetry"] = telemetry
     return payload
 
 

@@ -204,6 +204,11 @@ def _handle_status() -> None:
         f"  周报进度：{status['last_week_end'] or '尚无'}",
         f"  月报进度：{status['last_month_end'] or '尚无'}",
     ]
+    if status.get("current_task"):
+        lines.append(
+            f"  [cyan]当前任务：{status.get('current_task_detail') or status['current_task']}"
+            f"（{status.get('current_task_started_at', '')}）[/cyan]"
+        )
     if status.get("deferred_reason"):
         lines.append(
             f"  [yellow]自动任务延后：{status['deferred_reason']}"
@@ -211,7 +216,7 @@ def _handle_status() -> None:
         )
     errors = status["errors"]
     if errors:
-        lines.append("  [yellow]当前失败（解锁状态下下一分钟会重试）：[/yellow]")
+        lines.append("  [yellow]当前失败（报告模式执行 /retry 可全部重试）：[/yellow]")
         lines.extend(f"    - {task}: {message}" for task, message in errors.items())
     else:
         lines.append("  当前失败：无")
@@ -264,32 +269,25 @@ def _handle_feedback() -> None:
     console.print("[cyan][*][/cyan] 反馈已记录；将影响以后的分析，不会改写已有报告。")
 
 
-_REFERENCE_KIND_ALIASES = {
-    "1": "diary",
-    "diary": "diary",
-    "日记": "diary",
-}
-
-
 def _handle_reference(user_input: str) -> None:
     arguments = user_input.split()[1:]
-    kind_text = arguments[0].lower() if arguments else ""
-    if not kind_text:
-        kind_text = safe_input(
-            "引用类型 [1=日记，空=取消] >> "
-        ).strip()
-        if not kind_text:
-            return
-    kind = _REFERENCE_KIND_ALIASES.get(kind_text)
-    if not kind:
-        console.print(f"[yellow][!][/yellow] 未知引用类型: {kind_text}")
+    date_argument = arguments[0] if arguments else ""
+    if len(arguments) > 1:
+        console.print("[yellow][!][/yellow] /ref 只接受一个日期参数。")
         return
-
-    keyword = arguments[1] if len(arguments) > 1 else ""
-    sources = journal.list_reference_sources(kind, keyword=keyword)
+    if re.fullmatch(r"\d{4}-\d{2}", date_argument):
+        date_filter = date_argument
+    elif date_argument:
+        date_filter = journal.resolve_date(date_argument)
+        if not date_filter:
+            console.print(f"[yellow][!][/yellow] 无法解析日期: {date_argument}")
+            return
+    else:
+        date_filter = ""
+    sources = journal.list_reference_sources(date_filter=date_filter)
     if not sources:
-        suffix = f"（筛选: {keyword}）" if keyword else ""
-        console.print(f"[yellow][!][/yellow] 没有可引用的文件{suffix}。")
+        suffix = f"（日期: {date_argument}）" if date_argument else ""
+        console.print(f"[yellow][!][/yellow] 没有可引用的日记{suffix}。")
         return
 
     choices = "\n".join(

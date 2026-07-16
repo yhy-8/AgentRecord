@@ -14,6 +14,23 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 
 
+def _configure_utf8_stdio() -> None:
+    """Keep Windows CI and legacy consoles from encoding Chinese as cp1252."""
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            continue
+
+
+_configure_utf8_stdio()
+
+
 try:
     import msvcrt
 
@@ -248,7 +265,7 @@ def show_help(mode: str = RECORD_MODE) -> None:
             "  [cyan]/mode[/cyan]     → 切换到报告模式\n"
             "  [cyan]/status[/cyan]   → 查看自动任务安装、进度与失败状态\n"
             "  [cyan]/v [日期][/cyan] → 查看历史日记（[cyan]/v help[/cyan] 查看用法）\n"
-            "  [cyan]/ref [diary] [筛选][/cyan] → 引用日记并继续记录\n"
+            "  [cyan]/ref [日期][/cyan] → 按日期选择日记并继续记录\n"
             "  [cyan]/d[/cyan]        → 删除今日最后一条记录\n"
             "  [cyan]/c[/cyan]        → 清空当前窗口"
         )

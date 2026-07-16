@@ -27,19 +27,31 @@ class MainCommandTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_reference_command_selects_diary_and_records_note(self):
-        report = settings.DIARY_DIR / "2026-07-14.md"
-        report.write_text("日记", encoding="utf-8")
+        diary = settings.DIARY_DIR / "2026-07-14.md"
+        diary.write_text("日记", encoding="utf-8")
 
         with patch(
             "AgentRecord.cli.commands.safe_input",
-            side_effect=["1", "由周报展开的想法"],
+            side_effect=["1", "由旧日记展开的想法"],
         ):
-            commands._handle_reference("/ref diary")
+            commands._handle_reference("/ref 2026-07-14")
 
         content = next(settings.DIARY_DIR.glob("*.md")).read_text(encoding="utf-8")
         self.assertIn("[引用]", content)
         self.assertIn("日记 | 2026-07-14", content)
-        self.assertIn("由周报展开的想法", content)
+        self.assertIn("由旧日记展开的想法", content)
+
+    def test_reference_without_date_selects_diary_without_type_prompt(self):
+        diary = settings.DIARY_DIR / "2026-07-14.md"
+        diary.write_text("日记", encoding="utf-8")
+
+        with patch(
+            "AgentRecord.cli.commands.safe_input", side_effect=["1", ""]
+        ) as safe_input:
+            commands._handle_reference("/ref")
+
+        self.assertEqual(2, safe_input.call_count)
+        self.assertIn("选择编号", safe_input.call_args_list[0].args[0])
 
     def test_parses_monthly_analysis_command(self):
         self.assertEqual(
@@ -228,6 +240,22 @@ class MainCommandTests(unittest.TestCase):
             entry._hide_background_console()
 
         windll.user32.ShowWindow.assert_called_once_with(123, 0)
+
+    def test_windows_terminal_reconfigures_stdio_as_utf8(self):
+        stdout_bytes = io.BytesIO()
+        stderr_bytes = io.BytesIO()
+        stdout = io.TextIOWrapper(stdout_bytes, encoding="cp1252")
+        stderr = io.TextIOWrapper(stderr_bytes, encoding="cp1252")
+        with patch.object(terminal.sys, "platform", "win32"), patch.object(
+            terminal.sys, "stdout", stdout
+        ), patch.object(terminal.sys, "stderr", stderr):
+            terminal._configure_utf8_stdio()
+            stdout.write("选择日记")
+            stdout.flush()
+
+        self.assertEqual("utf-8", stdout.encoding.lower())
+        self.assertEqual("utf-8", stderr.encoding.lower())
+        self.assertEqual("选择日记", stdout_bytes.getvalue().decode("utf-8"))
 
     @patch("AgentRecord.cli.app.journal.append_log")
     @patch("AgentRecord.cli.app.show_help")

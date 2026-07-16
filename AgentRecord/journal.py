@@ -153,28 +153,20 @@ def append_log(
             file.write(f"**{submitted_time}:** {content}\n\n")
 
 
-REFERENCE_KINDS = {
-    "diary": ("日记", lambda: settings.DIARY_DIR),
-}
-
 def list_reference_sources(
-    kind: str, keyword: str = "", limit: int = 20
+    date_filter: str = "", limit: int = 20
 ) -> list[tuple[str, Path]]:
     """列出可引用的日记，按文件名倒序返回。"""
-    if kind not in REFERENCE_KINDS:
-        return []
-    type_label, directory_factory = REFERENCE_KINDS[kind]
-    files = sorted(directory_factory().glob("*.md"), reverse=True)
-    if keyword:
-        files = [path for path in files if keyword in path.stem]
+    files = sorted(settings.DIARY_DIR.glob("*.md"), reverse=True)
+    if date_filter:
+        files = [path for path in files if path.stem.startswith(date_filter)]
     if limit > 0:
         files = files[:limit]
 
     sources = []
     for path in files:
         period = path.stem
-        label = type_label
-        sources.append((f"{label} | {period}", path))
+        sources.append((f"日记 | {period}", path))
     return sources
 
 

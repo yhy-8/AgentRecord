@@ -47,7 +47,8 @@ def section_errors(markdown: str, allowed_source_ids: set[str]) -> list[str]:
         if not content or content.startswith("### "):
             continue
         if not re.search(r"\[R-\d{8}-\d{3}\]", content):
-            errors.append("整理与回顾存在没有来源引用的段落")
+            preview = re.sub(r"\s+", " ", content)[:160]
+            errors.append(f"整理与回顾存在没有来源引用的段落：{preview}")
             break
     return errors
 
