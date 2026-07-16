@@ -162,6 +162,17 @@ class AnalysisStoreTests(unittest.TestCase):
 
         active = self.store.active_profiles("2026-07-19")
         self.assertEqual([old_id], [item["id"] for item in active])
+        with closing(sqlite3.connect(self.path)) as connection:
+            failed_candidates = connection.execute(
+                """
+                SELECT p.status, r.status
+                FROM profile_entries AS p
+                JOIN analysis_runs AS r ON r.id = p.run_id
+                WHERE r.id = ?
+                """,
+                (failed,),
+            ).fetchall()
+        self.assertEqual([("accepted", "failed")], failed_candidates)
 
     def test_profile_cutoff_blocks_future_information(self):
         run_id = self.start_run()
@@ -214,15 +225,20 @@ class AnalysisStoreTests(unittest.TestCase):
         self.assertEqual(replacement, candidates[0]["id"])
         self.assertEqual("修正观点", candidates[0]["title"])
 
-    def test_v2_is_backed_up_then_replaced(self):
+    def test_incompatible_schema_fails_without_replacing_database(self):
         with closing(sqlite3.connect(self.path)) as connection:
             connection.execute("PRAGMA user_version = 2")
             connection.commit()
-        AnalysisStore(self.path)
+        original = self.path.read_bytes()
+
+        with self.assertRaisesRegex(RuntimeError, "尚不提供数据库升级兼容"):
+            AnalysisStore(self.path)
+
+        self.assertEqual(original, self.path.read_bytes())
         with closing(sqlite3.connect(self.path)) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(3, version)
-        self.assertTrue(Path(f"{self.path}.v2.legacy.bak").exists())
+        self.assertEqual(2, version)
+        self.assertFalse(Path(f"{self.path}.v2.legacy.bak").exists())
 
 
 if __name__ == "__main__":

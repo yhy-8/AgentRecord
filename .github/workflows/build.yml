@@ -1,6 +1,7 @@
 name: Build Executables
 
 on:
+  push:
   workflow_dispatch:
 
 jobs:

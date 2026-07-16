@@ -1,5 +1,7 @@
 # AgentRecord
 
+> **开发状态：** 项目仍处于产品定位和数据结构快速迭代阶段，不承诺 SQLite 分析数据库的向后兼容、自动迁移或旧库备份。数据库结构变化后，开发者需要在确认数据无需保留或已另行备份后，手动删除 `.analysis.sqlite3` 及同名 `-wal`、`-shm` 再启动。程序不会自动改写不兼容数据库；`Records/` 中的 Markdown 日记不受影响。
+
 AgentRecord 是一个本地优先的个人记录、整理回顾与领域研究系统。用户每天自由记录事实、行动、观点、理念、理想、问题和兴趣，程序不要求预先分类，也不把记录过程变成与 AI 对话。系统每天收集“综合新闻雷达 + 记录驱动信息”，每周、每月生成一份由两个独立板块组成的报告：
 
 1. **整理与回顾**：回顾做过什么，并根据可追溯记录整理观点、理念、理想与行为模式的形成、延续和变化。
@@ -224,7 +226,7 @@ AnalysisReports/
 Log/AgentRecord.log
 ```
 
-旧版 SQLite 会先备份为 `.analysis.sqlite3.v<旧版本>.legacy.bak`，再建立 v3 数据库。原始 Markdown 日记及其标准格式不会迁移或删除。
+当前开发版本只接受空数据库或 schema v3。遇到其他版本时程序直接报错，不自动备份、迁移、覆盖或删除数据库；确认可丢弃后由开发者手动重建。原始 Markdown 日记及其标准格式不会迁移或删除。
 
 ## 测试
 
@@ -233,6 +235,8 @@ python -m unittest discover -s tests -v
 ```
 
 ## 构建 Windows EXE
+
+GitHub Actions 在每次 `push` 时自动运行测试并构建 Windows 产物，也保留手动 `workflow_dispatch` 入口。
 
 ```powershell
 pyinstaller --onefile --name AgentRecord main.py

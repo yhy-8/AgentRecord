@@ -72,15 +72,20 @@ class AnalysisStore:
             connection.close()
 
     def _initialize(self) -> None:
-        connection = self._connect()
+        # Read the version before enabling WAL or other runtime pragmas so an
+        # incompatible development database is rejected without modification.
+        connection = sqlite3.connect(self.path, timeout=10)
         try:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
         finally:
             connection.close()
 
         if version not in (0, SCHEMA_VERSION):
-            self._replace_legacy_database(version)
-            version = 0
+            raise RuntimeError(
+                f"分析数据库版本为 {version}，当前开发版本要求 {SCHEMA_VERSION}。"
+                "本项目尚不提供数据库升级兼容；请确认无需保留后，手动删除 "
+                f"{self.path} 及同名 -wal、-shm 文件再启动。"
+            )
 
         if version == SCHEMA_VERSION:
             return
@@ -171,27 +176,6 @@ class AnalysisStore:
                 """
             )
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-
-    def _replace_legacy_database(self, version: int) -> None:
-        """Back up an obsolete derived database, then create a clean v3 store."""
-        backup_path = Path(f"{self.path}.v{version}.legacy.bak")
-        if not backup_path.exists():
-            temp_path = Path(f"{backup_path}.tmp")
-            temp_path.unlink(missing_ok=True)
-            source = sqlite3.connect(self.path, timeout=10)
-            target = sqlite3.connect(temp_path)
-            try:
-                source.backup(target)
-            finally:
-                target.close()
-                source.close()
-            temp_path.replace(backup_path)
-        for candidate in (
-            self.path,
-            Path(f"{self.path}-wal"),
-            Path(f"{self.path}-shm"),
-        ):
-            candidate.unlink(missing_ok=True)
 
     def start_run(
         self,
