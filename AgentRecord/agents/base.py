@@ -2,6 +2,7 @@
 
 import json
 import re
+import inspect
 from dataclasses import dataclass
 from typing import Callable
 
@@ -39,6 +40,13 @@ class AgentOutputError(AgentPipelineError):
 
 def _parse_json(text: str) -> dict:
     stripped = text.strip()
+    fenced = re.fullmatch(
+        r"```(?:json)?\s*\n?(.*?)\n?```",
+        stripped,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if fenced:
+        stripped = fenced.group(1).strip()
     try:
         value = json.loads(stripped)
     except json.JSONDecodeError as error:
@@ -105,17 +113,42 @@ def invoke_agent(
     call_model: Callable,
     *,
     revision_context: dict | None = None,
+    allowed_search_queries: list[str] | None = None,
 ) -> dict:
     """Invoke one Agent with centrally supplied model access and tool permissions."""
-    text, success, web_count, tool_counts, result_count = call_model(
+    optional_kwargs = {
+        "allowed_search_queries": allowed_search_queries,
+        "structured_output": True,
+    }
+    try:
+        parameters = inspect.signature(call_model).parameters.values()
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        if not accepts_kwargs:
+            accepted_names = {parameter.name for parameter in parameters}
+            optional_kwargs = {
+                key: value
+                for key, value in optional_kwargs.items()
+                if key in accepted_names
+            }
+    except (TypeError, ValueError):
+        pass
+    response = call_model(
         _prompt(spec, task, input_data, revision_context),
         model_config,
         allowed_tools=spec.allowed_tools,
+        **optional_kwargs,
     )
+    text, success, web_count, tool_counts, result_count = response
+    from ..ai_client import response_telemetry
+
     telemetry = {
         "web_citations": web_count,
         "tool_calls": tool_counts,
         "search_results": result_count,
+        **response_telemetry(response),
     }
     if not success:
         raise AgentPipelineError(

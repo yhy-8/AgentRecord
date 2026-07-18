@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 
 from .. import settings
-from ..ai_client import call_ai
+from ..ai_client import call_ai, web_search_available
 from .context import _existing_logs, _period_records
 
 
@@ -168,6 +168,11 @@ def _deduplicate_queries(queries: list[dict], history: list[dict]) -> list[dict]
 
 def _parse_queries(response: str) -> list[dict]:
     stripped = response.strip()
+    fenced = re.fullmatch(
+        r"```(?:json)?\s*\n?(.*?)\n?```", stripped, re.DOTALL | re.IGNORECASE
+    )
+    if fenced:
+        stripped = fenced.group(1).strip()
     payload = json.loads(stripped)
     if not isinstance(payload, dict) or not isinstance(payload.get("queries"), list):
         raise ValueError("定向信息查询格式无效")
@@ -266,23 +271,12 @@ def _briefing_errors(markdown: str, used_search: bool) -> list[str]:
     return errors
 
 
-def _web_search_available(model_config: settings.ModelDict) -> bool:
-    third_search = settings.CONFIG.get("third_search", {})
-    return bool(
-        model_config.get("search", False)
-        or (
-            third_search.get("enabled", False)
-            and third_search.get("api_key", "")
-        )
-    )
-
-
 def generate_information_briefing(
     date: datetime.date,
     model_config: settings.ModelDict,
 ) -> tuple[str, bool, Path | None]:
     """Search current information and atomically save one briefing for ``date``."""
-    if not _web_search_available(model_config):
+    if not web_search_available(model_config):
         return "当前模型和第三方搜索都未启用联网能力。", False, None
 
     week_context = _week_record_context(date)
@@ -327,16 +321,24 @@ def generate_information_briefing(
     citations = result_count = 0
     tool_counts: dict[str, int] = {}
     for attempt in range(1, _MAX_MODEL_ATTEMPTS + 1):
-        markdown, success, citations, tool_counts, result_count = call_ai(
-            current_prompt, model_config, allowed_tools={"web_search"}
-        )
+        try:
+            response = call_ai(
+                current_prompt,
+                model_config,
+                allowed_tools={"web_search"},
+                allowed_search_queries=[item["query"] for item in queries],
+            )
+        except TypeError as error:
+            if "allowed_search_queries" not in str(error):
+                raise
+            response = call_ai(
+                current_prompt, model_config, allowed_tools={"web_search"}
+            )
+        markdown, success, citations, tool_counts, result_count = response
         if not success:
             return markdown, False, None
         used_search = bool(
-            model_config.get("search", False)
-            or citations
-            or tool_counts.get("web_search", 0)
-            or result_count
+            citations or result_count
         )
         errors = _briefing_errors(markdown, used_search)
         if not errors:
@@ -362,7 +364,9 @@ def generate_information_briefing(
         f"{json.dumps(targeted, ensure_ascii=False, separators=(',', ':'))} -->\n\n"
         f"{markdown.strip()}\n"
     )
-    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path = path.with_suffix(
+        path.suffix + f".{datetime.datetime.now():%Y%m%d%H%M%S%f}.tmp"
+    )
     temp_path.write_text(final_content, encoding="utf-8")
     temp_path.replace(path)
     logger.info(

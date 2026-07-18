@@ -217,10 +217,20 @@ def _handle_status() -> None:
         retry_kind = status.get("retry_kind", {})
         for task, message in errors.items():
             deadline = retry_after.get(task, "")
-            is_network = retry_kind.get(task) == "network"
-            failure_type = "网络错误" if is_network else "非网络错误"
-            retry_policy = "5 分钟重试" if is_network else "下个整点重试"
+            kind = retry_kind.get(task)
+            failure_type = {
+                "network": "网络错误",
+                "rate_limit": "接口限流",
+                "blocked": "配置/鉴权错误",
+            }.get(kind, "非网络错误（内容或格式错误）")
+            retry_policy = {
+                "network": "5 分钟后重试",
+                "rate_limit": "5 分钟后重试",
+                "blocked": "修正配置后用 /retry 重试",
+            }.get(kind, "下个整点重试")
             suffix = f"；{retry_policy}不早于 {deadline}" if deadline else ""
+            if kind == "blocked":
+                suffix = f"；{retry_policy}"
             lines.append(
                 f"    - {task} [{failure_type}]: {message}{suffix}"
             )

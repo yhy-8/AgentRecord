@@ -157,6 +157,33 @@ class AnalysisWorkflowTests(unittest.TestCase):
         )
         self.assertIn("我开始重视记录是否可以验证", retrospective_review)
 
+    def test_retry_reuses_reviewed_stages_from_equivalent_failed_run(self):
+        day = datetime.date(2026, 7, 14)
+        self.write_diary(day.isoformat())
+        with patch.object(
+            orchestrator,
+            "_research_section",
+            side_effect=AgentPipelineError("模拟 Researcher 失败"),
+        ):
+            _, first_success, _ = orchestrator.generate_analysis_report(
+                "weekly", day, {"name": "mock"}
+            )
+        self.assertFalse(first_success)
+
+        self.ai_calls.clear()
+        _, second_success, _ = orchestrator.generate_analysis_report(
+            "weekly", day, {"name": "mock"}
+        )
+
+        self.assertTrue(second_success)
+        self.assertFalse(
+            any("任务:retrospective]" in prompt for prompt in self.ai_calls)
+        )
+        self.assertFalse(
+            any("任务:research_planner]" in prompt for prompt in self.ai_calls)
+        )
+        self.assertTrue(any("任务:researcher]" in prompt for prompt in self.ai_calls))
+
     def test_daily_analysis_is_removed(self):
         self.write_diary("2026-07-14")
         message, success, path = orchestrator.generate_analysis_report(
@@ -595,6 +622,67 @@ class AnalysisWorkflowTests(unittest.TestCase):
             state["retry_after"]["daily_information"],
         )
         self.assertEqual("network", state["retry_kind"]["daily_information"])
+
+    def test_auth_failure_waits_for_manual_retry_after_configuration_fix(self):
+        state = {}
+        automation._set_task_error(
+            state, "weekly_report", "配置异常: HTTP 401"
+        )
+
+        self.assertEqual("blocked", state["retry_kind"]["weekly_report"])
+        self.assertNotIn("weekly_report", state.get("retry_after", {}))
+        self.assertFalse(
+            automation._failure_retry_is_due(
+                state, "weekly_report", datetime.datetime(2026, 7, 17, 12, 0)
+            )
+        )
+
+    def test_retry_stops_after_global_provider_failure(self):
+        settings.ANALYSIS_DIR.mkdir()
+        automation._save_automation_state(
+            {
+                "errors": {
+                    "daily_information": "失败",
+                    "weekly_report": "失败",
+                    "monthly_report": "失败",
+                }
+            }
+        )
+        calls = []
+
+        def fail_network(task, now, state, model):
+            calls.append(task)
+            automation._set_task_error(state, task, "网络异常: DNS")
+            automation._save_automation_state(state)
+
+        with patch.object(
+            automation, "_automation_model", return_value={"name": "mock"}
+        ), patch.object(automation, "_retry_one_task", side_effect=fail_network):
+            _, success = automation.retry_failed_automatic_tasks()
+
+        self.assertFalse(success)
+        self.assertEqual(["daily_information"], calls)
+
+    def test_monthly_context_excludes_cross_month_weeks_and_deduplicates_origin(self):
+        weekly = settings.ANALYSIS_DIR / "Weekly"
+        weekly.mkdir(parents=True)
+        (weekly / "2026-06-29_to_2026-07-05_auto.md").write_text(
+            "跨月内容", encoding="utf-8"
+        )
+        (weekly / "2026-07-06_to_2026-07-12_auto.md").write_text(
+            "自动版", encoding="utf-8"
+        )
+        (weekly / "2026-07-06_to_2026-07-12_manual.md").write_text(
+            "手动版", encoding="utf-8"
+        )
+
+        value = context._monthly_supporting_reports(
+            datetime.date(2026, 7, 1), datetime.date(2026, 7, 31)
+        )
+
+        self.assertNotIn("跨月内容", value)
+        self.assertNotIn("自动版", value)
+        self.assertIn("手动版", value)
 
     def test_legacy_completion_cursors_are_removed(self):
         state = {

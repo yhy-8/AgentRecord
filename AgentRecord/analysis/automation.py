@@ -7,10 +7,15 @@ import os
 import shlex
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 from .. import journal, settings
-from ..ai_client import is_network_failure
+from ..ai_client import (
+    is_config_failure,
+    is_network_failure,
+    is_rate_limit_failure,
+)
 from .context import _analysis_report_path, _existing_logs
 from .information import generate_information_briefing, information_briefing_path
 from .orchestrator import generate_analysis_report, summarize_diary
@@ -80,7 +85,7 @@ def _load_automation_state() -> dict:
 def _save_automation_state(state: dict) -> None:
     settings.ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
     state_path = settings.ANALYSIS_DIR / ".automation-state.json"
-    temp_path = settings.ANALYSIS_DIR / ".automation-state.tmp"
+    temp_path = settings.ANALYSIS_DIR / f".automation-state.{uuid.uuid4().hex}.tmp"
     temp_path.write_text(
         json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -101,16 +106,30 @@ def _set_task_error(state: dict, task: str, message: str) -> None:
     now = datetime.datetime.now()
     state.setdefault("errors", {})[task] = f"{now:%Y-%m-%d %H:%M} {message}"
     if task in AUTOMATION_TASK_LABELS:
-        network_error = is_network_failure(message)
-        retry_at = (
-            now + datetime.timedelta(minutes=5) if network_error else _next_hour(now)
-        )
-        state.setdefault("retry_after", {})[task] = retry_at.isoformat(
-            timespec="seconds"
-        )
-        state.setdefault("retry_kind", {})[task] = (
-            "network" if network_error else "hourly"
-        )
+        if is_config_failure(message):
+            state.setdefault("retry_kind", {})[task] = "blocked"
+            retry_after = state.get("retry_after", {})
+            retry_after.pop(task, None)
+            if not retry_after:
+                state.pop("retry_after", None)
+        else:
+            network_error = is_network_failure(message)
+            rate_limited = is_rate_limit_failure(message)
+            retry_at = (
+                now + datetime.timedelta(minutes=5)
+                if network_error or rate_limited
+                else _next_hour(now)
+            )
+            state.setdefault("retry_after", {})[task] = retry_at.isoformat(
+                timespec="seconds"
+            )
+            if network_error:
+                retry_kind = "network"
+            elif rate_limited:
+                retry_kind = "rate_limit"
+            else:
+                retry_kind = "hourly"
+            state.setdefault("retry_kind", {})[task] = retry_kind
 
 
 def _clear_task_error(state: dict, task: str) -> None:
@@ -166,6 +185,8 @@ def _failure_retry_is_due(
 ) -> bool:
     if task not in state.get("errors", {}):
         return True
+    if state.get("retry_kind", {}).get(task) == "blocked":
+        return False
     retry_text = str(state.get("retry_after", {}).get(task, ""))
     if retry_text:
         try:
@@ -335,18 +356,22 @@ def run_due_automatic_tasks() -> None:
         if due_tasks:
             model_config = _automation_model()
             today = now.date()
-            if "daily_summary" in due_tasks:
+            halt = False
+            if "daily_summary" in due_tasks and not halt:
                 _run_daily_summaries(today, state, model_config)
-            if "daily_information" in due_tasks:
+                halt = _global_failure(state, "daily_summary")
+            if "daily_information" in due_tasks and not halt:
                 _run_daily_information(now, state, model_config)
-            if "weekly_report" in due_tasks:
+                halt = _global_failure(state, "daily_information")
+            if "weekly_report" in due_tasks and not halt:
                 trigger = (
                     "retry"
                     if "weekly_report" in state.get("errors", {})
                     else "scheduled"
                 )
                 _run_weekly_reports(today, state, model_config, trigger=trigger)
-            if "monthly_report" in due_tasks:
+                halt = _global_failure(state, "weekly_report")
+            if "monthly_report" in due_tasks and not halt:
                 trigger = (
                     "retry"
                     if "monthly_report" in state.get("errors", {})
@@ -498,6 +523,15 @@ def _retry_one_task(
         _run_monthly_reports(now.date(), state, model, trigger="retry")
 
 
+def _global_failure(state: dict, task: str) -> bool:
+    """全局网络、限流或鉴权故障时，避免后续 Agent 重复消耗。"""
+    return state.get("retry_kind", {}).get(task) in {
+        "network",
+        "rate_limit",
+        "blocked",
+    }
+
+
 def retry_failed_automatic_tasks() -> tuple[str, bool]:
     """Retry every currently failed automatic task in an independent process."""
     automation_lock = _acquire_automation_lock()
@@ -517,6 +551,8 @@ def retry_failed_automatic_tasks() -> tuple[str, bool]:
         for task in tasks:
             _retry_one_task(task, now, state, model)
             state = _load_automation_state()
+            if _global_failure(state, task):
+                break
         state = _load_automation_state()
         remaining = [task for task in tasks if task in state.get("errors", {})]
         success = not remaining

@@ -7,9 +7,18 @@
 import datetime
 import os
 import re
+import uuid
 from pathlib import Path
 
 from . import settings
+from .file_lock import FileLock
+
+
+def _acquire_journal_lock() -> FileLock:
+    lock = FileLock.acquire(settings.DIARY_DIR / ".journal.lock", blocking=True)
+    if lock is None:
+        raise RuntimeError("日记文件锁获取失败")
+    return lock
 
 
 def resolve_date(arg: str) -> str:
@@ -144,13 +153,17 @@ def append_log(
 ) -> None:
     """按回车提交时间追加记录；一次写入只使用一个时间值。"""
     submitted_at = submitted_at or datetime.datetime.now()
-    file_path = init_file_if_not_exists(submitted_at)
-    submitted_time = submitted_at.strftime("%H:%M")
-    with file_path.open("a", encoding="utf-8") as file:
-        if tag:
-            file.write(f"**{submitted_time} {tag}:** {content}\n\n")
-        else:
-            file.write(f"**{submitted_time}:** {content}\n\n")
+    lock = _acquire_journal_lock()
+    try:
+        file_path = init_file_if_not_exists(submitted_at)
+        submitted_time = submitted_at.strftime("%H:%M")
+        with file_path.open("a", encoding="utf-8") as file:
+            if tag:
+                file.write(f"**{submitted_time} {tag}:** {content}\n\n")
+            else:
+                file.write(f"**{submitted_time}:** {content}\n\n")
+    finally:
+        lock.release()
 
 
 def list_reference_sources(
@@ -189,35 +202,45 @@ def append_reference(
 
 def update_summary_for_date(date: str, summary_text: str) -> str:
     file_path = settings.DIARY_DIR / f"{date}.md"
-    if not file_path.exists():
-        return f"找不到 {date} 的记录。"
-    content = file_path.read_text(encoding="utf-8")
-    if not re.search(r"<summary>.*?</summary>", content, re.DOTALL):
-        return f"{date} 的记录缺少 <summary> 区域。"
+    lock = _acquire_journal_lock()
+    try:
+        if not file_path.exists():
+            return f"找不到 {date} 的记录。"
+        content = file_path.read_text(encoding="utf-8")
+        if not re.search(r"<summary>.*?</summary>", content, re.DOTALL):
+            return f"{date} 的记录缺少 <summary> 区域。"
 
-    new_content = re.sub(
-        r"<summary>.*?</summary>",
-        f"<summary>\n{summary_text}\n</summary>",
-        content,
-        count=1,
-        flags=re.DOTALL,
-    )
-    temp_path = file_path.with_suffix(file_path.suffix + ".tmp")
-    temp_path.write_text(new_content, encoding="utf-8")
-    temp_path.replace(file_path)
-    return f"{date} 的总结已写入文档顶部。"
+        new_content = re.sub(
+            r"<summary>.*?</summary>",
+            f"<summary>\n{summary_text}\n</summary>",
+            content,
+            count=1,
+            flags=re.DOTALL,
+        )
+        temp_path = file_path.with_suffix(
+            file_path.suffix + f".{uuid.uuid4().hex}.tmp"
+        )
+        temp_path.write_text(new_content, encoding="utf-8")
+        temp_path.replace(file_path)
+        return f"{date} 的总结已写入文档顶部。"
+    finally:
+        lock.release()
 
 
 def delete_last_record() -> bool:
     file_path = get_today_file()
-    if not file_path.exists():
-        return False
-    content = file_path.read_text(encoding="utf-8")
-    matches = list(re.finditer(r"^\*\*\d{2}:\d{2}", content, re.MULTILINE))
-    if not matches:
-        return False
-    start = matches[-1].start()
-    if start > 0 and content[start - 1] == "\n":
-        start -= 1
-    file_path.write_text(content[:start].rstrip() + "\n\n", encoding="utf-8")
-    return True
+    lock = _acquire_journal_lock()
+    try:
+        if not file_path.exists():
+            return False
+        content = file_path.read_text(encoding="utf-8")
+        matches = list(re.finditer(r"^\*\*\d{2}:\d{2}", content, re.MULTILINE))
+        if not matches:
+            return False
+        start = matches[-1].start()
+        if start > 0 and content[start - 1] == "\n":
+            start -= 1
+        file_path.write_text(content[:start].rstrip() + "\n\n", encoding="utf-8")
+        return True
+    finally:
+        lock.release()

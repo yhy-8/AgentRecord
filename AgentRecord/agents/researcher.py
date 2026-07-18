@@ -61,4 +61,10 @@ def validate(
         )
     if not sources or not re.search(r"https?://", markdown):
         raise AgentPipelineError("领域研究没有可验证的外部来源")
+    covered_topic_ids = {source["topic_id"] for source in sources}
+    if covered_topic_ids != topic_ids:
+        raise AgentPipelineError("领域研究没有为每个中控选题提供来源")
+    missing_links = [source["url"] for source in sources if source["url"] not in markdown]
+    if missing_links:
+        raise AgentPipelineError("领域研究 sources 中的 URL 没有在正文就近引用")
     return markdown.strip(), sources

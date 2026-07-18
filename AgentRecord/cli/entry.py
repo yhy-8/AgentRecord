@@ -67,8 +67,13 @@ def _show_automation_status() -> None:
     console.print(f"[{color}][{marker}] {status['install_message']}[/{color}]")
     if status["errors"]:
         retry_kind = status.get("retry_kind", {})
+        failure_labels = {
+            "network": "网络错误",
+            "rate_limit": "接口限流",
+            "blocked": "配置/鉴权错误",
+        }
         tasks = "、".join(
-            f"{task}（{'网络错误' if retry_kind.get(task) == 'network' else '非网络错误'}）"
+            f"{task}（{failure_labels.get(retry_kind.get(task), '内容或格式错误')}）"
             for task in status["errors"]
         )
         console.print(

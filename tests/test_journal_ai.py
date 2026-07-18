@@ -14,7 +14,10 @@ class FakeResponse:
         self.response = None
 
     def raise_for_status(self):
-        return None
+        if self.status_code >= 400:
+            raise ai_client.requests.HTTPError(
+                str(self.status_code), response=self
+            )
 
     def json(self):
         return self.data
@@ -41,12 +44,21 @@ class JournalAITests(unittest.TestCase):
     @patch("AgentRecord.ai_client.requests.post")
     def test_returns_complete_openai_compatible_response(self, post):
         post.return_value = FakeResponse(
-            {"choices": [{"message": {"role": "assistant", "content": "最终回答"}}]}
+            {
+                "choices": [{"message": {"role": "assistant", "content": "最终回答"}}],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 20,
+                    "total_tokens": 120,
+                    "prompt_tokens_details": {"cached_tokens": 80},
+                },
+            }
         )
 
-        answer, success, web_count, tool_counts, result_count = ai_client.call_ai(
+        response = ai_client.call_ai(
             "问题", self.model
         )
+        answer, success, web_count, tool_counts, result_count = response
 
         self.assertTrue(success)
         self.assertEqual("最终回答", answer)
@@ -54,6 +66,57 @@ class JournalAITests(unittest.TestCase):
         payload = post.call_args.kwargs["json"]
         self.assertEqual("test-model-id", payload["model"])
         self.assertNotIn("web_search", payload)
+        self.assertEqual(120, response.telemetry["usage"]["total_tokens"])
+        self.assertEqual(80, response.telemetry["usage"]["cached_tokens"])
+        self.assertEqual(1, response.telemetry["http_attempts"])
+
+    @patch("AgentRecord.ai_client.execute_tool")
+    @patch("AgentRecord.ai_client.requests.post")
+    def test_search_query_must_match_central_allowlist(self, post, execute_tool):
+        settings.CONFIG["third_search"] = {
+            "enabled": True,
+            "api_key": "search-key",
+            "max_rounds": 3,
+        }
+        post.side_effect = [
+            FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "search-1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "web_search",
+                                            "arguments": '{"query":"私自改写的查询"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            ),
+            FakeResponse(
+                {"choices": [{"message": {"role": "assistant", "content": "{}"}}]}
+            ),
+        ]
+
+        response = ai_client.call_ai(
+            "研究",
+            self.model,
+            allowed_tools={"web_search"},
+            allowed_search_queries=["中控给定的查询"],
+        )
+
+        self.assertTrue(response.success)
+        execute_tool.assert_not_called()
+        self.assertEqual(["私自改写的查询"], response.telemetry["rejected_search_queries"])
+        self.assertEqual(0, response.search_results)
 
     @patch("AgentRecord.ai_client.requests.post")
     def test_central_permission_can_remove_all_tools(self, post):
@@ -163,6 +226,27 @@ class JournalAITests(unittest.TestCase):
         self.assertTrue(ai_client.is_network_failure(message))
         self.assertEqual(3, post.call_count)
         self.assertEqual([1, 2], [call.args[0] for call in sleep.call_args_list])
+
+    @patch("AgentRecord.ai_client.time.sleep")
+    @patch("AgentRecord.ai_client.requests.post")
+    def test_rate_limit_and_auth_errors_are_classified_separately(self, post, sleep):
+        rate_limited = FakeResponse({})
+        rate_limited.status_code = 429
+        post.return_value = rate_limited
+
+        message, success, _, _, _ = ai_client.call_ai("自动任务", self.model)
+        self.assertFalse(success)
+        self.assertTrue(ai_client.is_rate_limit_failure(message))
+        self.assertEqual(3, post.call_count)
+
+        post.reset_mock()
+        unauthorized = FakeResponse({})
+        unauthorized.status_code = 401
+        post.return_value = unauthorized
+        message, success, _, _, _ = ai_client.call_ai("自动任务", self.model)
+        self.assertFalse(success)
+        self.assertTrue(ai_client.is_config_failure(message))
+        self.assertEqual(1, post.call_count)
 
 
 if __name__ == "__main__":

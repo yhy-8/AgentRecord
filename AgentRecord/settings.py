@@ -6,6 +6,7 @@
 import json
 import re
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -102,7 +103,9 @@ class ModelConfig:
             separator = "" if not content or content.endswith("\n") else "\n"
             updated = f"{content}{separator}{selected_line}\n"
 
-        temp_path = config_path.with_suffix(config_path.suffix + ".tmp")
+        temp_path = config_path.with_suffix(
+            config_path.suffix + f".{uuid.uuid4().hex}.tmp"
+        )
         temp_path.write_text(updated, encoding="utf-8")
         temp_path.replace(config_path)
         CONFIG["current_model"] = model["name"]

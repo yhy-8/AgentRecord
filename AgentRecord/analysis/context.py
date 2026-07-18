@@ -36,7 +36,9 @@ def _existing_logs(start: datetime.date, end: datetime.date) -> list[tuple[str, 
     return logs
 
 
-def _referenced_source_context(logs: list[tuple[str, str]]) -> str:
+def _referenced_source_context(
+    logs: list[tuple[str, str]], max_characters: int = 30000
+) -> str:
     """读取本周期标准引用指向的日记；拒绝日记目录以外的路径。"""
     reference_pattern = re.compile(
         r"^\*\*\d{2}:\d{2} \[引用\]:\*\* \[[^\]]+\]\(<([^>]+)>\)",
@@ -45,6 +47,7 @@ def _referenced_source_context(logs: list[tuple[str, str]]) -> str:
     allowed_root = settings.DIARY_DIR.resolve()
     seen = set()
     sections = []
+    size = 0
 
     for _, content in logs:
         for relative_path in reference_pattern.findall(content):
@@ -59,23 +62,36 @@ def _referenced_source_context(logs: list[tuple[str, str]]) -> str:
                 source_content = source_path.read_text(encoding="utf-8")
             except OSError:
                 continue
+            section = f"### {source_path.name}\n{source_content[:12000]}"
+            if size + len(section) > max_characters:
+                return "\n\n".join(sections) or "（本周期没有可读取的显式引用来源）"
             seen.add(source_path)
-            sections.append(f"### {source_path.name}\n{source_content[:12000]}")
+            sections.append(section)
+            size += len(section)
             if len(sections) == 10:
                 return "\n\n".join(sections)
     return "\n\n".join(sections) or "（本周期没有可读取的显式引用来源）"
 
 
-def _recent_summary_context(before: datetime.date, days: int = 30) -> str:
+def _recent_summary_context(
+    before: datetime.date, days: int = 30, max_characters: int = 20000
+) -> str:
     start = before - datetime.timedelta(days=days)
     sections = []
-    for date in _date_span(start, before - datetime.timedelta(days=1)):
+    size = 0
+    dates = _date_span(start, before - datetime.timedelta(days=1))
+    for date in reversed(dates):
         path = settings.DIARY_DIR / f"{date}.md"
         if not path.exists():
             continue
         summary = journal.extract_summary(path.read_text(encoding="utf-8"))
         if summary not in ("(无总结)", "暂无今日总结。"):
-            sections.append(f"### {date}\n{summary}")
+            section = f"### {date}\n{summary}"
+            if size + len(section) > max_characters:
+                break
+            sections.append(section)
+            size += len(section)
+    sections.reverse()
     return "\n\n".join(sections) or "（没有可用的历史总结）"
 
 
@@ -110,9 +126,11 @@ def analysis_report_path(
     return _analysis_report_path(kind, start, end, origin)
 
 
-def _monthly_supporting_reports(start: datetime.date, end: datetime.date) -> str:
-    """为月报读取与该月相交的周报，作为已完成分析而非用户原始观点。"""
-    sections = []
+def _monthly_supporting_reports(
+    start: datetime.date, end: datetime.date, max_characters: int = 30000
+) -> str:
+    """只读取完整位于该月内的周报，且同周只保留一份。"""
+    candidates: dict[tuple[datetime.date, datetime.date], Path] = {}
     weekly_dir = settings.ANALYSIS_DIR / "Weekly"
     for path in sorted(weekly_dir.glob("*.md")):
         match = re.fullmatch(
@@ -126,13 +144,25 @@ def _monthly_supporting_reports(start: datetime.date, end: datetime.date) -> str
             report_end = datetime.date.fromisoformat(match.group(2))
         except ValueError:
             continue
-        if report_end < start or report_start > end:
+        if report_start < start or report_end > end:
             continue
+        period = (report_start, report_end)
+        previous = candidates.get(period)
+        if previous is None or path.stem.endswith("_manual"):
+            candidates[period] = path
+
+    sections = []
+    size = 0
+    for path in (candidates[period] for period in sorted(candidates)):
         try:
             content = path.read_text(encoding="utf-8")
         except OSError:
             continue
-        sections.append(f"### {path.name}\n{content[:12000]}")
+        section = f"### {path.name}\n{content[:12000]}"
+        if size + len(section) > max_characters:
+            break
+        sections.append(section)
+        size += len(section)
     return "\n\n".join(sections) or "（没有可用的同期周报）"
 
 

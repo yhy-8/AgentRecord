@@ -6,7 +6,9 @@
 
 import datetime
 import json
+import re
 import time
+from dataclasses import dataclass, field
 from typing import Any, Collection
 
 import requests
@@ -15,6 +17,38 @@ from . import journal, settings
 
 
 NETWORK_ERROR_MARKER = "网络异常:"
+RATE_LIMIT_ERROR_MARKER = "限流异常:"
+CONFIG_ERROR_MARKER = "配置异常:"
+
+
+@dataclass
+class AIResponse:
+    """Five-value compatible response with additional audit telemetry."""
+
+    text: str
+    success: bool
+    web_searches: int
+    tool_calls: dict[str, int]
+    search_results: int
+    telemetry: dict[str, Any] = field(default_factory=dict)
+
+    def __iter__(self):
+        yield self.text
+        yield self.success
+        yield self.web_searches
+        yield self.tool_calls
+        yield self.search_results
+
+
+@dataclass
+class ToolResult:
+    content: str
+    result_count: int = 0
+    evidence: list[dict[str, str]] = field(default_factory=list)
+
+    def __iter__(self):
+        yield self.content
+        yield self.result_count
 
 
 def is_network_failure(message: str) -> bool:
@@ -22,16 +56,40 @@ def is_network_failure(message: str) -> bool:
     return NETWORK_ERROR_MARKER in str(message)
 
 
+def is_rate_limit_failure(message: str) -> bool:
+    return RATE_LIMIT_ERROR_MARKER in str(message)
+
+
+def is_config_failure(message: str) -> bool:
+    return CONFIG_ERROR_MARKER in str(message)
+
+
+def response_telemetry(response: object) -> dict[str, Any]:
+    value = getattr(response, "telemetry", {})
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def web_search_available(model_config: settings.ModelDict) -> bool:
+    third = settings.CONFIG.get("third_search", {})
+    return bool(
+        model_config.get("search", False)
+        or (third.get("enabled", False) and third.get("api_key", ""))
+    )
+
+
 def _transient_http_error(error: requests.HTTPError) -> bool:
     response = error.response
     return response is not None and (
-        response.status_code == 408 or 500 <= response.status_code < 600
+        response.status_code in (408, 429) or 500 <= response.status_code < 600
     )
 
 
 def _post_with_transient_retry(*args, **kwargs):
     """Retry connection failures and transient server responses at most twice."""
+    attempt_observer = kwargs.pop("attempt_observer", None)
     for attempt in range(3):
+        if attempt_observer:
+            attempt_observer(attempt + 1)
         try:
             response = requests.post(*args, **kwargs)
         except (requests.ConnectionError, requests.Timeout):
@@ -39,7 +97,7 @@ def _post_with_transient_retry(*args, **kwargs):
                 raise
             time.sleep(1 << attempt)
             continue
-        if response.status_code == 408 or 500 <= response.status_code < 600:
+        if response.status_code in (408, 429) or 500 <= response.status_code < 600:
             if attempt < 2:
                 time.sleep(1 << attempt)
                 continue
@@ -134,11 +192,11 @@ TOOLS = [
 ]
 
 
-def bocha_search(query: str, include: str = "", exclude: str = "") -> tuple[str, int]:
+def bocha_search(query: str, include: str = "", exclude: str = "") -> ToolResult:
     """调用博查搜索 API，返回格式化文本和结果数量。"""
     config = settings.CONFIG.get("third_search", {})
     if not config.get("enabled") or not config.get("api_key") or not query:
-        return "", 0
+        return ToolResult("")
 
     headers = {
         "Content-Type": "application/json",
@@ -162,18 +220,22 @@ def bocha_search(query: str, include: str = "", exclude: str = "") -> tuple[str,
             json=body,
             timeout=config.get("timeout", 30),
         )
-        if response.status_code == 408 or 500 <= response.status_code < 600:
+        if (
+            response.status_code in (401, 403, 408, 429)
+            or 500 <= response.status_code < 600
+        ):
             response.raise_for_status()
         if response.status_code != 200:
-            return "", 0
+            return ToolResult("")
         data = response.json()
         if data.get("code") != 200:
-            return "", 0
+            return ToolResult("")
         results = data.get("data", {}).get("webPages", {}).get("value", [])
         if not results:
-            return "", 0
+            return ToolResult("")
 
         lines = ["[网络搜索结果]"]
+        evidence = []
         for index, item in enumerate(results, 1):
             title = item.get("name", "").strip()
             url = item.get("url", "").strip()
@@ -190,39 +252,105 @@ def bocha_search(query: str, include: str = "", exclude: str = "") -> tuple[str,
                 lines.append(f"   摘要：{snippet}")
             if summary and summary != snippet:
                 lines.append(f"   全文概要：{summary}")
-        return "\n".join(lines), len(results)
+            evidence.append(
+                {
+                    "query": query,
+                    "title": title,
+                    "url": url,
+                    "snippet": (summary or snippet)[:500],
+                    "published": published,
+                }
+            )
+        return ToolResult("\n".join(lines), len(results), evidence)
     except (requests.ConnectionError, requests.Timeout):
         raise
     except requests.HTTPError as error:
-        if _transient_http_error(error):
+        if _transient_http_error(error) or (
+            error.response is not None
+            and error.response.status_code in (401, 403)
+        ):
             raise
-        return "", 0
+        return ToolResult("")
     except Exception:
-        return "", 0
+        return ToolResult("")
 
 
-def execute_tool(function_name: str, arguments: dict) -> tuple[str, int]:
+def execute_tool(function_name: str, arguments: dict) -> ToolResult:
     if function_name == "read_daily_log":
-        return journal.read_daily_log(
+        return ToolResult(journal.read_daily_log(
             date=arguments.get("date", ""),
             start_date=arguments.get("start_date", ""),
             end_date=arguments.get("end_date", ""),
             summary_only=arguments.get("summary_only", False),
-        ), 0
+        ))
     if function_name == "search_history":
-        return journal.search_history(
+        return ToolResult(journal.search_history(
             arguments.get("keyword", ""),
             arguments.get("days_limit", 0),
             arguments.get("summary_only", False),
-        ), 0
+        ))
     if function_name == "web_search":
-        result, count = bocha_search(
+        result = bocha_search(
             arguments.get("query", ""),
             arguments.get("include", ""),
             arguments.get("exclude", ""),
         )
-        return result or "搜索无结果", count
-    return f"未知工具: {function_name}", 0
+        if not result.content:
+            result.content = "搜索无结果"
+        return result
+    return ToolResult(f"未知工具: {function_name}")
+
+
+def _normalized_query(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def _usage_values(data: dict) -> dict[str, int]:
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    details = (
+        usage.get("prompt_tokens_details")
+        or usage.get("input_tokens_details")
+        or {}
+    )
+    return {
+        "prompt_tokens": int(
+            usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
+        ),
+        "completion_tokens": int(
+            usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
+        ),
+        "total_tokens": int(usage.get("total_tokens", 0) or 0),
+        "cached_tokens": int(details.get("cached_tokens", 0) or 0),
+    }
+
+
+def _native_evidence(data: dict, message: dict) -> list[dict[str, str]]:
+    values = []
+    for candidate in (data.get("citations", []), message.get("annotations", [])):
+        if isinstance(candidate, list):
+            values.extend(candidate)
+    evidence = []
+    for value in values:
+        if isinstance(value, str):
+            url = value if value.startswith(("http://", "https://")) else ""
+            title = ""
+        elif isinstance(value, dict):
+            source = value.get("url_citation", value)
+            url = str(source.get("url", ""))
+            title = str(source.get("title", ""))
+        else:
+            continue
+        if url:
+            evidence.append(
+                {
+                    "query": "",
+                    "title": title,
+                    "url": url,
+                    "snippet": "",
+                    "published": "",
+                }
+            )
+    return evidence
 
 
 def call_ai(
@@ -230,7 +358,9 @@ def call_ai(
     model_config: settings.ModelDict,
     *,
     allowed_tools: Collection[str] | None = None,
-) -> tuple[str, bool, int, dict[str, int], int]:
+    allowed_search_queries: Collection[str] | None = None,
+    structured_output: bool = False,
+) -> AIResponse:
     """调用 OpenAI 兼容接口，并只开放中控授权的工具。"""
     messages = [
         {"role": "system", "content": _build_system_prompt()},
@@ -258,6 +388,12 @@ def call_ai(
         "model": model_config.get("model_id") or model_config["name"],
         "messages": messages,
     }
+    if "temperature" in model_config:
+        payload["temperature"] = model_config["temperature"]
+    if "max_tokens" in model_config:
+        payload["max_tokens"] = model_config["max_tokens"]
+    if structured_output and model_config.get("json_mode", False):
+        payload["response_format"] = {"type": "json_object"}
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -285,33 +421,100 @@ def call_ai(
     tool_calls: dict[str, int] = {}
     search_rounds = 0
     max_search_rounds = third_search.get("max_rounds", 3)
+    allowed_query_set = (
+        {_normalized_query(query) for query in allowed_search_queries}
+        if allowed_search_queries is not None
+        else None
+    )
+    started_at = time.perf_counter()
+    http_attempts = 0
+    usage = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "cached_tokens": 0,
+    }
+    search_evidence: list[dict[str, str]] = []
+    search_queries: list[str] = []
+    rejected_search_queries: list[str] = []
+
+    def observe_attempt(_attempt: int) -> None:
+        nonlocal http_attempts
+        http_attempts += 1
+
+    def finish(text: str, success: bool) -> AIResponse:
+        return AIResponse(
+            text,
+            success,
+            web_searches,
+            tool_calls,
+            search_results,
+            {
+                "duration_ms": round((time.perf_counter() - started_at) * 1000),
+                "http_attempts": http_attempts,
+                "usage": usage,
+                "search_queries": search_queries,
+                "rejected_search_queries": rejected_search_queries,
+                "search_evidence": search_evidence,
+            },
+        )
 
     try:
         message = {}
         for _ in range(5):
             response = _post_with_transient_retry(
-                model_config["api_url"], headers=headers, json=payload, timeout=60
+                model_config["api_url"],
+                headers=headers,
+                json=payload,
+                timeout=60,
+                attempt_observer=observe_attempt,
             )
             response.raise_for_status()
             data = response.json()
             message = data["choices"][0]["message"]
+            for key, value in _usage_values(data).items():
+                usage[key] += value
 
             citations = data.get("citations", [])
             if citations:
                 web_searches += len(citations)
+            native_evidence = _native_evidence(data, message)
+            search_evidence.extend(native_evidence)
+            if native_evidence and not citations:
+                web_searches += len(native_evidence)
 
             requested_tools = message.get("tool_calls", [])
             if not requested_tools:
                 text = (message.get("content") or "").strip()
-                return text or "(AI 未给出最终回答)", True, web_searches, tool_calls, search_results
+                if not text:
+                    return finish("(AI 未给出最终回答)", False)
+                return finish(text, True)
 
             messages.append(message)
             for tool_call in requested_tools:
                 function_name = tool_call["function"]["name"]
                 tool_calls[function_name] = tool_calls.get(function_name, 0) + 1
                 arguments = json.loads(tool_call["function"]["arguments"])
-                result, result_count = execute_tool(function_name, arguments)
+                query = str(arguments.get("query", "")).strip()
+                if function_name == "web_search":
+                    search_queries.append(query)
+                if (
+                    function_name == "web_search"
+                    and allowed_query_set is not None
+                    and _normalized_query(query) not in allowed_query_set
+                ):
+                    rejected_search_queries.append(query)
+                    tool_result = ToolResult("搜索查询未获中控授权，请使用原样给定的查询。")
+                else:
+                    raw_result = execute_tool(function_name, arguments)
+                    if isinstance(raw_result, ToolResult):
+                        tool_result = raw_result
+                    else:
+                        content, count = raw_result
+                        tool_result = ToolResult(content, count)
+                result, result_count = tool_result
                 search_results += result_count
+                search_evidence.extend(tool_result.evidence)
                 messages.append(
                     {
                         "role": "tool",
@@ -340,25 +543,25 @@ def call_ai(
                     )
 
         text = (message.get("content") or "").strip()
-        return text or "(AI 未给出最终回答)", True, web_searches, tool_calls, search_results
+        return finish(text or "工具调用轮次已用尽，模型未给出最终回答。", False)
     except (requests.ConnectionError, requests.Timeout) as error:
-        return (
-            f"{NETWORK_ERROR_MARKER} {error}",
-            False,
-            web_searches,
-            tool_calls,
-            search_results,
-        )
+        return finish(f"{NETWORK_ERROR_MARKER} {error}", False)
     except requests.HTTPError as error:
         error_message = str(error)
         if error.response is not None:
             error_message += f" | {error.response.text}"
-        prefix = NETWORK_ERROR_MARKER if _transient_http_error(error) else "接口异常:"
-        return f"{prefix} {error_message}", False, web_searches, tool_calls, search_results
+        status = error.response.status_code if error.response is not None else None
+        if status == 429:
+            prefix = RATE_LIMIT_ERROR_MARKER
+        elif status in (401, 403):
+            prefix = CONFIG_ERROR_MARKER
+        else:
+            prefix = NETWORK_ERROR_MARKER if _transient_http_error(error) else "接口异常:"
+        return finish(f"{prefix} {error_message}", False)
     except requests.RequestException as error:
         error_message = str(error)
         if error.response is not None:
             error_message += f" | {error.response.text}"
-        return f"接口异常: {error_message}", False, web_searches, tool_calls, search_results
+        return finish(f"接口异常: {error_message}", False)
     except Exception as error:
-        return f"接口异常: {error}", False, web_searches, tool_calls, search_results
+        return finish(f"接口异常: {error}", False)

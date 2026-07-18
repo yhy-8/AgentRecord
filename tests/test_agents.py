@@ -11,9 +11,15 @@ from AgentRecord.agents.base import AgentPipelineError, _parse_json, _prompt
 
 
 class AgentModuleTests(unittest.TestCase):
-    def test_json_parser_rejects_markdown_fences_without_repairing(self):
+    def test_json_parser_accepts_one_outer_markdown_fence(self):
+        self.assertEqual(
+            {"markdown": "内容"},
+            _parse_json('```json\n{"markdown":"内容"}\n```'),
+        )
+
+    def test_json_parser_does_not_extract_json_from_explanatory_prose(self):
         with self.assertRaisesRegex(AgentPipelineError, "JSON 无法解析"):
-            _parse_json('```json\n{"markdown":"内容"}\n```')
+            _parse_json('我已经完成了：\n{"markdown":"内容"}')
 
     def test_four_agents_have_separate_responsibilities(self):
         self.assertEqual(

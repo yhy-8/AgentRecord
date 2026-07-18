@@ -15,7 +15,8 @@ from ..agents.base import (
     cited_source_ids,
     invoke_agent,
 )
-from ..ai_client import call_ai
+from ..ai_client import call_ai, web_search_available
+from ..file_lock import FileLock
 from .context import (
     _analysis_report_path,
     _existing_logs,
@@ -32,6 +33,7 @@ from .store import AnalysisStore
 logger = logging.getLogger(__name__)
 _LONG_ID_PATTERN = re.compile(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])")
 _MAX_AGENT_ATTEMPTS = 3
+_PIPELINE_VERSION = 2
 
 
 def _replace_id_substrings(value: object, replacements: dict[str, str]) -> object:
@@ -102,9 +104,27 @@ def summarize_diary(date: str, model_config: settings.ModelDict) -> tuple[str, b
 
 【{date} 原始日记】
 {content}"""
-    summary, success, _, _, _ = call_ai(prompt, model_config, allowed_tools=())
-    if not success:
-        return summary, False
+    current_prompt = prompt
+    summary = ""
+    for attempt in range(1, _MAX_AGENT_ATTEMPTS + 1):
+        summary, success, _, _, _ = call_ai(
+            current_prompt, model_config, allowed_tools=()
+        )
+        if not success:
+            return summary, False
+        errors = []
+        if not summary.strip() or summary.strip() == "(AI 未给出最终回答)":
+            errors.append("总结为空")
+        if summary.lstrip().startswith(("```", "# ")) or "<summary>" in summary:
+            errors.append("总结包含标题、代码围栏或 summary 标签")
+        if not errors:
+            break
+        if attempt == _MAX_AGENT_ATTEMPTS:
+            return f"日记总结连续 {_MAX_AGENT_ATTEMPTS} 次未通过校验: {'；'.join(errors)}", False
+        current_prompt = prompt + "\n\n【中控修订请求】\n" + json.dumps(
+            _revision_context(attempt + 1, summary, errors, source="中控确定性校验"),
+            ensure_ascii=False,
+        )
     result = journal.update_summary_for_date(date, summary)
     if not result.endswith("总结已写入文档顶部。"):
         return result, False
@@ -120,6 +140,7 @@ def _call_agent(
     run_id: str,
     *,
     revision_context: dict | None = None,
+    allowed_search_queries: list[str] | None = None,
 ) -> dict:
     logger.info("agent_start run=%s agent=%s", run_id, spec.name)
     try:
@@ -130,6 +151,7 @@ def _call_agent(
             model_config,
             call_ai,
             revision_context=revision_context,
+            allowed_search_queries=allowed_search_queries,
         )
     except AgentPipelineError as error:
         store.save_artifact(
@@ -146,7 +168,16 @@ def _call_agent(
             error.__class__.__name__,
         )
         raise
-    logger.info("agent_completed run=%s agent=%s", run_id, spec.name)
+    telemetry = payload.get("_telemetry", {})
+    logger.info(
+        "agent_completed run=%s agent=%s duration_ms=%s total_tokens=%s cached_tokens=%s search_results=%s",
+        run_id,
+        spec.name,
+        telemetry.get("duration_ms", 0),
+        telemetry.get("usage", {}).get("total_tokens", 0),
+        telemetry.get("usage", {}).get("cached_tokens", 0),
+        telemetry.get("search_results", 0),
+    )
     return payload
 
 
@@ -355,7 +386,15 @@ def _retrospective_section(
             attempt_budget=review_attempt_budget,
         )
         if passed:
-            store.save_artifact(run_id, retrospective.SPEC.name, normalized_payload)
+            store.save_artifact(
+                run_id,
+                retrospective.SPEC.name,
+                {
+                    **normalized_payload,
+                    "entry_decisions": decisions,
+                    "_telemetry": payload.get("_telemetry", {}),
+                },
+            )
             return markdown, entries, decisions
 
         error = AgentPipelineError(
@@ -382,7 +421,7 @@ def _research_topics(
     store: AnalysisStore,
     run_id: str,
 ) -> list[dict]:
-    _, topics = _validated_agent_call(
+    payload, topics = _validated_agent_call(
         research_planner.SPEC,
         "选择少量记录驱动或信息雷达驱动的公开研究主题。",
         planner_input,
@@ -393,7 +432,11 @@ def _research_topics(
         store,
         run_id,
     )
-    store.save_artifact(run_id, research_planner.SPEC.name, {"topics": topics})
+    store.save_artifact(
+        run_id,
+        research_planner.SPEC.name,
+        {"topics": topics, "_telemetry": payload.get("_telemetry", {})},
+    )
     return topics
 
 
@@ -422,6 +465,7 @@ def _research_section(
                 store,
                 run_id,
                 revision_context=revision_context,
+                allowed_search_queries=[topic["query"] for topic in topics],
             )
         except AgentOutputError as error:
             if attempt == _MAX_AGENT_ATTEMPTS:
@@ -439,13 +483,28 @@ def _research_section(
             )
             telemetry = payload.get("_telemetry", {})
             used_search = bool(
-                model_config.get("search", False)
-                or telemetry.get("web_citations", 0)
+                telemetry.get("web_citations", 0)
                 or telemetry.get("search_results", 0)
-                or telemetry.get("tool_calls", {}).get("web_search", 0)
+                or telemetry.get("search_evidence", [])
             )
             if not used_search:
                 raise AgentPipelineError("领域研究没有实际执行联网搜索")
+            evidence_urls = {
+                str(item.get("url", "")).rstrip("/")
+                for item in telemetry.get("search_evidence", [])
+                if isinstance(item, dict) and item.get("url")
+            }
+            if evidence_urls:
+                unsupported_urls = [
+                    source["url"]
+                    for source in sources
+                    if source["url"].rstrip("/") not in evidence_urls
+                ]
+                if unsupported_urls:
+                    raise AgentPipelineError(
+                        "领域研究声明的来源未出现在实际搜索结果中: "
+                        + "、".join(unsupported_urls[:3])
+                    )
         except AgentPipelineError as error:
             _save_validation_failure(
                 store, run_id, researcher.SPEC.name, payload, error
@@ -476,7 +535,11 @@ def _research_section(
             attempt_budget=review_attempt_budget,
         )
         if passed:
-            store.save_artifact(run_id, researcher.SPEC.name, normalized_payload)
+            store.save_artifact(
+                run_id,
+                researcher.SPEC.name,
+                {**normalized_payload, "_telemetry": telemetry},
+            )
             return markdown
 
         error = AgentPipelineError(
@@ -564,8 +627,13 @@ def generate_analysis_report(
     records = _period_records(logs)
     if not records:
         return "日记中没有可识别的标准记录。", False, None
+    if model_config.get("api_url") and not web_search_available(model_config):
+        return "当前模型和第三方搜索都未启用联网能力，报告必然无法完成领域研究。", False, None
 
     report_path = _analysis_report_path(kind, start, end, origin)
+    report_lock = FileLock.acquire(settings.ANALYSIS_DIR / ".report.lock")
+    if report_lock is None:
+        return "另一个分析报告正在生成，请稍后重试。", False, None
     store: AnalysisStore | None = None
     run_id: str | None = None
     try:
@@ -586,6 +654,7 @@ def generate_analysis_report(
         )
         information_leads = _information_briefings(start, end)
         snapshot = {
+            "pipeline_version": _PIPELINE_VERSION,
             "records": records,
             "profiles": profiles,
             "referenced_sources": referenced_sources,
@@ -616,6 +685,15 @@ def generate_analysis_report(
         )
         store.save_sources(run_id, records)
 
+        cache_arguments = (
+            input_hash,
+            kind,
+            start.isoformat(),
+            end.isoformat(),
+            origin,
+            model_config.get("name", ""),
+        )
+
         compact_profiles, profile_aliases = _profile_input(profiles)
         retrospective_input = {
             "period": {"kind": kind, "start": start.isoformat(), "end": end.isoformat()},
@@ -625,15 +703,46 @@ def generate_analysis_report(
             "recent_summaries": recent_summaries,
             "supporting_reports": supporting_reports,
         }
-        retrospective_markdown, entries, decisions = _retrospective_section(
-            retrospective_input,
-            allowed_source_ids,
-            current_source_ids,
-            profile_aliases,
-            model_config,
-            store,
-            run_id,
+        cached_retrospective = store.reusable_artifact(
+            *cache_arguments, retrospective.SPEC.name
         )
+        cache_run_id = None
+        if cached_retrospective and isinstance(
+            cached_retrospective[1].get("entry_decisions"), dict
+        ):
+            cache_run_id, cached_payload = cached_retrospective
+            retrospective_markdown = str(cached_payload.get("markdown", "")).strip()
+            entries = cached_payload.get("profile_entries", [])
+            decisions = cached_payload["entry_decisions"]
+            if not retrospective_markdown or not isinstance(entries, list):
+                cache_run_id = None
+        if cache_run_id is None:
+            retrospective_markdown, entries, decisions = _retrospective_section(
+                retrospective_input,
+                allowed_source_ids,
+                current_source_ids,
+                profile_aliases,
+                model_config,
+                store,
+                run_id,
+            )
+        else:
+            store.save_artifact(
+                run_id,
+                retrospective.SPEC.name,
+                {
+                    "markdown": retrospective_markdown,
+                    "profile_entries": entries,
+                    "entry_decisions": decisions,
+                    "_cache": {"hit": True, "source_run_id": cache_run_id},
+                },
+            )
+            logger.info(
+                "agent_cache_hit run=%s agent=%s source_run=%s",
+                run_id,
+                retrospective.SPEC.name,
+                cache_run_id,
+            )
         _observed_dates(entries, profiles_by_id, store)
         store.save_profile_entries(run_id, entries, decisions)
 
@@ -643,17 +752,64 @@ def generate_analysis_report(
             "retrospective": retrospective_markdown,
             "daily_information_briefings": information_leads,
         }
-        topics = _research_topics(
-            planner_input, current_source_ids, model_config, store, run_id
+        cached_planner = store.reusable_artifact(
+            *cache_arguments, research_planner.SPEC.name
         )
-        research_markdown = _research_section(
-            topics,
-            information_leads,
-            current_source_ids,
-            model_config,
-            store,
-            run_id,
+        if cached_planner and cached_planner[0] == cache_run_id and isinstance(
+            cached_planner[1].get("topics"), list
+        ):
+            topics = cached_planner[1]["topics"]
+            store.save_artifact(
+                run_id,
+                research_planner.SPEC.name,
+                {
+                    "topics": topics,
+                    "_cache": {"hit": True, "source_run_id": cache_run_id},
+                },
+            )
+            logger.info(
+                "agent_cache_hit run=%s agent=%s source_run=%s",
+                run_id,
+                research_planner.SPEC.name,
+                cache_run_id,
+            )
+        else:
+            cache_run_id = None
+            topics = _research_topics(
+                planner_input, current_source_ids, model_config, store, run_id
+            )
+
+        cached_research = store.reusable_artifact(
+            *cache_arguments, researcher.SPEC.name
         )
+        if cached_research and cached_research[0] == cache_run_id:
+            research_markdown = str(cached_research[1].get("markdown", "")).strip()
+        else:
+            research_markdown = ""
+        if research_markdown:
+            store.save_artifact(
+                run_id,
+                researcher.SPEC.name,
+                {
+                    **cached_research[1],
+                    "_cache": {"hit": True, "source_run_id": cache_run_id},
+                },
+            )
+            logger.info(
+                "agent_cache_hit run=%s agent=%s source_run=%s",
+                run_id,
+                researcher.SPEC.name,
+                cache_run_id,
+            )
+        else:
+            research_markdown = _research_section(
+                topics,
+                information_leads,
+                current_source_ids,
+                model_config,
+                store,
+                run_id,
+            )
 
         body = (
             "## 一、整理与回顾\n\n"
@@ -680,7 +836,7 @@ def generate_analysis_report(
             + "\n"
         )
         report_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = report_path.with_suffix(report_path.suffix + ".tmp")
+        temp_path = report_path.with_suffix(report_path.suffix + f".{run_id}.tmp")
         previous_content = report_path.read_bytes() if report_path.exists() else None
         temp_path.write_text(final_content, encoding="utf-8")
         temp_path.replace(report_path)
@@ -690,7 +846,7 @@ def generate_analysis_report(
             if previous_content is None:
                 report_path.unlink(missing_ok=True)
             else:
-                restore = report_path.with_suffix(report_path.suffix + ".restore.tmp")
+                restore = report_path.with_suffix(report_path.suffix + f".{run_id}.restore.tmp")
                 restore.write_bytes(previous_content)
                 restore.replace(report_path)
             raise
@@ -709,3 +865,5 @@ def generate_analysis_report(
             error.__class__.__name__,
         )
         return f"分析失败: {message}", False, None
+    finally:
+        report_lock.release()

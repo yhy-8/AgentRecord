@@ -236,6 +236,22 @@ class AnalysisStore:
             raise ValueError(f"无效运行状态: {status}")
         with self.transaction() as connection:
             if status == "completed":
+                stale = connection.execute(
+                    """
+                    SELECT child.supersedes_id
+                    FROM profile_entries AS child
+                    JOIN profile_entries AS parent ON parent.id = child.supersedes_id
+                    WHERE child.run_id = ? AND child.status = 'accepted'
+                      AND child.supersedes_id IS NOT NULL
+                      AND parent.status != 'accepted'
+                    LIMIT 1
+                    """,
+                    (run_id,),
+                ).fetchone()
+                if stale:
+                    raise RuntimeError(
+                        "报告生成期间人物画像已被其他操作更新，本次候选不能覆盖新状态"
+                    )
                 connection.execute(
                     """
                     UPDATE profile_entries
@@ -294,6 +310,49 @@ class AnalysisStore:
                 ),
             )
         return artifact_id
+
+    def reusable_artifact(
+        self,
+        input_hash: str,
+        kind: str,
+        period_start: str,
+        period_end: str,
+        origin: str,
+        model_name: str,
+        agent: str,
+    ) -> tuple[str, dict] | None:
+        """Return the latest fully validated stage from an equivalent failed run."""
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT a.run_id, a.payload_json
+                FROM agent_artifacts AS a
+                JOIN analysis_runs AS r ON r.id = a.run_id
+                WHERE r.input_hash = ? AND r.kind = ?
+                  AND r.period_start = ? AND r.period_end = ?
+                  AND r.origin = ? AND r.model_name = ?
+                  AND r.status = 'failed'
+                  AND a.agent = ? AND a.status = 'completed'
+                ORDER BY r.completed_at DESC, a.revision DESC
+                LIMIT 1
+                """,
+                (
+                    input_hash,
+                    kind,
+                    period_start,
+                    period_end,
+                    origin,
+                    model_name,
+                    agent,
+                ),
+            ).fetchone()
+        finally:
+            connection.close()
+        if not row:
+            return None
+        payload = _loads(row["payload_json"])
+        return (row["run_id"], payload) if isinstance(payload, dict) else None
 
     def save_sources(self, run_id: str, records: Sequence[dict]) -> None:
         now = _now()
