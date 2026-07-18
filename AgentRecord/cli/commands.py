@@ -212,16 +212,18 @@ def _handle_status() -> None:
         )
     errors = status["errors"]
     if errors:
-        lines.append(
-            "  [yellow]当前失败（网络错误 5 分钟后重试，其他错误下个整点重试；/retry 可立即全量重试）：[/yellow]"
-        )
+        lines.append("  [yellow]当前失败（/retry 可立即全量重试）：[/yellow]")
         retry_after = status.get("retry_after", {})
         retry_kind = status.get("retry_kind", {})
         for task, message in errors.items():
             deadline = retry_after.get(task, "")
-            kind = "网络" if retry_kind.get(task) == "network" else "整点"
-            suffix = f"；{kind}重试不早于 {deadline}" if deadline else ""
-            lines.append(f"    - {task}: {message}{suffix}")
+            is_network = retry_kind.get(task) == "network"
+            failure_type = "网络错误" if is_network else "非网络错误"
+            retry_policy = "5 分钟重试" if is_network else "下个整点重试"
+            suffix = f"；{retry_policy}不早于 {deadline}" if deadline else ""
+            lines.append(
+                f"    - {task} [{failure_type}]: {message}{suffix}"
+            )
     else:
         lines.append("  当前失败：无")
     console.print(Panel("\n".join(lines), title="[bold]自动任务状态[/bold]", border_style="cyan"))

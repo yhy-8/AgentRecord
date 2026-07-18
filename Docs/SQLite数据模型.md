@@ -56,13 +56,13 @@ v3 删除旧版通用知识图谱，把数据库职责缩小为：
 | `id` | 产物 ID |
 | `run_id` | 所属运行 |
 | `agent` | Agent 或审查阶段名 |
-| `revision` | 同运行、同 Agent 从 1 递增的调用次数 |
+| `revision` | 同运行、同 Agent 的审计产物从 1 递增的版本号 |
 | `status` | 通常为 `completed` 或 `failed` |
 | `payload_json` | 结构化载荷 |
 | `error` | 解析、校验或调用错误 |
 | `created_at` | 创建时间 |
 
-唯一约束为 `(run_id, agent, revision)`。模型回答格式错误、结构校验失败或 Reviewer 输出不完整时，也保存失败产物以便定位具体阶段。
+唯一约束为 `(run_id, agent, revision)`。模型回答格式错误、结构校验失败、Reviewer 输出不完整或审查未通过时，也保存失败产物；同阶段修订产生后续版本，便于还原原稿、反馈与最终结果。
 
 ## 5. source_catalog 与 run_sources
 

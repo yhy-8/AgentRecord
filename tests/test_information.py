@@ -163,7 +163,7 @@ class InformationBriefingTests(unittest.TestCase):
         self.assertNotIn("个人知识管理最新进展", generated)
         self.assertIn("本地优先笔记软件数据迁移风险", generated)
 
-    def test_invalid_query_json_fails_without_a_second_model_call(self):
+    def test_invalid_query_json_uses_bounded_correction(self):
         date = datetime.date(2026, 7, 15)
         (settings.DIARY_DIR / "2026-07-15.md").write_text(
             "# 2026-07-15\n\n<summary>\n\n</summary>\n\n"
@@ -183,7 +183,10 @@ class InformationBriefingTests(unittest.TestCase):
         self.assertFalse(success)
         self.assertIsNone(path)
         self.assertIn("没有返回有效 JSON", message)
-        self.assertEqual(1, call.call_count)
+        self.assertEqual(3, call.call_count)
+        retry_prompt = call.call_args.args[0]
+        self.assertIn("【中控修订请求】", retry_prompt)
+        self.assertIn("不是 JSON", retry_prompt)
 
     def test_today_highlights_require_exactly_five_numbered_items(self):
         self.assertTrue(information._has_five_daily_highlights(self.valid_briefing()))
@@ -191,6 +194,27 @@ class InformationBriefingTests(unittest.TestCase):
             "### 5. 事项 5\n\n新资料 [来源](https://example.com/5)\n\n", ""
         )
         self.assertFalse(information._has_five_daily_highlights(only_four))
+
+    def test_invalid_briefing_is_revised_with_original_draft_and_reason(self):
+        date = datetime.date(2026, 7, 15)
+        responses = [
+            ("缺少章节和链接", True, 0, {"web_search": 1}, 5),
+            (self.valid_briefing(), True, 0, {"web_search": 2}, 8),
+        ]
+
+        with patch.object(information, "call_ai", side_effect=responses) as call:
+            _, success, path = information.generate_information_briefing(
+                date, {"name": "mock", "search": False}
+            )
+
+        self.assertTrue(success)
+        self.assertTrue(path.exists())
+        self.assertEqual(2, call.call_count)
+        original_prompt = call.call_args_list[0].args[0]
+        revision_prompt = call.call_args_list[1].args[0]
+        self.assertTrue(revision_prompt.startswith(original_prompt))
+        self.assertIn("缺少章节和链接", revision_prompt)
+        self.assertIn("缺少必需章节", revision_prompt)
 
     def test_briefing_fails_when_web_search_is_not_configured(self):
         settings.CONFIG["third_search"] = {"enabled": False, "api_key": ""}

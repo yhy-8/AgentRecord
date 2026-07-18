@@ -15,6 +15,28 @@ from .context import _existing_logs, _period_records
 logger = logging.getLogger(__name__)
 
 _QUERY_HISTORY_MARKER = "agentrecord-targeted-queries"
+_MAX_MODEL_ATTEMPTS = 3
+
+
+def _revision_prompt(
+    original_prompt: str,
+    attempt: int,
+    previous_output: str,
+    errors: list[str],
+) -> str:
+    """Append correction data after the unchanged original prompt for cache reuse."""
+    context = {
+        "attempt": attempt,
+        "maximum_attempts": _MAX_MODEL_ATTEMPTS,
+        "problems_to_fix": errors,
+        "rejected_previous_output": previous_output,
+    }
+    return (
+        original_prompt
+        + "\n\n【中控修订请求】\n"
+        + "这是同一任务的有限修订。保留正确内容，只修正列出的问题，并重新输出完整结果；不要解释修改过程。\n"
+        + json.dumps(context, ensure_ascii=False)
+    )
 
 
 def information_briefing_path(date: datetime.date) -> Path:
@@ -190,13 +212,25 @@ def _targeted_queries(
 
 【本周已经使用的定向查询】
 {json.dumps(query_history, ensure_ascii=False)}"""
-    response, success, _, _, _ = call_ai(prompt, model_config, allowed_tools=())
-    if not success:
-        return [], response
-    try:
-        return _deduplicate_queries(_parse_queries(response), query_history), ""
-    except (ValueError, json.JSONDecodeError):
-        return [], "定向信息查询没有返回有效 JSON"
+    current_prompt = prompt
+    for attempt in range(1, _MAX_MODEL_ATTEMPTS + 1):
+        response, success, _, _, _ = call_ai(
+            current_prompt, model_config, allowed_tools=()
+        )
+        if not success:
+            return [], response
+        try:
+            return _deduplicate_queries(_parse_queries(response), query_history), ""
+        except (ValueError, json.JSONDecodeError) as error:
+            if attempt == _MAX_MODEL_ATTEMPTS:
+                return [], f"定向信息查询连续 {_MAX_MODEL_ATTEMPTS} 次没有返回有效 JSON"
+            current_prompt = _revision_prompt(
+                prompt,
+                attempt + 1,
+                response,
+                [f"定向信息查询格式无效: {error}"],
+            )
+    return [], "定向信息查询格式无效"
 
 
 def _has_five_daily_highlights(markdown: str) -> bool:
@@ -209,6 +243,27 @@ def _has_five_daily_highlights(markdown: str) -> bool:
         return False
     numbers = re.findall(r"^###\s+([1-5])[.、]\s+\S", match.group(1), re.MULTILINE)
     return numbers == ["1", "2", "3", "4", "5"]
+
+
+def _briefing_errors(markdown: str, used_search: bool) -> list[str]:
+    errors = []
+    if not used_search:
+        errors.append("没有实际执行联网搜索")
+    if not re.search(r"https?://", markdown):
+        errors.append("没有可验证的来源链接")
+    if markdown.lstrip().startswith(("```", "# ")):
+        errors.append("输出包含代码围栏或一级标题")
+    required_sections = (
+        "## 今日值得关注",
+        "## 与本周思考相关的探索",
+        "## 可继续追踪",
+    )
+    missing = [section for section in required_sections if section not in markdown]
+    if missing:
+        errors.append("缺少必需章节: " + "、".join(missing))
+    if not _has_five_daily_highlights(markdown):
+        errors.append("“今日值得关注”没有严格生成编号 1 至 5 的五项")
+    return errors
 
 
 def _web_search_available(model_config: settings.ModelDict) -> bool:
@@ -267,32 +322,35 @@ def generate_information_briefing(
 
 【本周此前的信息简报，仅用于查重，不得直接当作新事实复述】
 {prior_briefings}"""
-    markdown, success, citations, tool_counts, result_count = call_ai(
-        prompt, model_config, allowed_tools={"web_search"}
-    )
-    if not success:
-        return markdown, False, None
-    used_search = bool(
-        model_config.get("search", False)
-        or citations
-        or tool_counts.get("web_search", 0)
-        or result_count
-    )
-    if not used_search:
-        return "信息收集没有实际执行联网搜索。", False, None
-    if not re.search(r"https?://", markdown):
-        return "信息简报没有可验证的来源链接。", False, None
-    if markdown.lstrip().startswith(("```", "# ")):
-        return "信息简报格式无效。", False, None
-    required_sections = (
-        "## 今日值得关注",
-        "## 与本周思考相关的探索",
-        "## 可继续追踪",
-    )
-    if any(section not in markdown for section in required_sections):
-        return "信息简报缺少必需章节。", False, None
-    if not _has_five_daily_highlights(markdown):
-        return "信息简报的“今日值得关注”没有按要求生成固定五项。", False, None
+    current_prompt = prompt
+    markdown = ""
+    citations = result_count = 0
+    tool_counts: dict[str, int] = {}
+    for attempt in range(1, _MAX_MODEL_ATTEMPTS + 1):
+        markdown, success, citations, tool_counts, result_count = call_ai(
+            current_prompt, model_config, allowed_tools={"web_search"}
+        )
+        if not success:
+            return markdown, False, None
+        used_search = bool(
+            model_config.get("search", False)
+            or citations
+            or tool_counts.get("web_search", 0)
+            or result_count
+        )
+        errors = _briefing_errors(markdown, used_search)
+        if not errors:
+            break
+        if attempt == _MAX_MODEL_ATTEMPTS:
+            return (
+                f"信息简报连续 {_MAX_MODEL_ATTEMPTS} 次未通过校验: "
+                + "；".join(errors),
+                False,
+                None,
+            )
+        current_prompt = _revision_prompt(
+            prompt, attempt + 1, markdown, errors
+        )
 
     path = information_briefing_path(date)
     path.parent.mkdir(parents=True, exist_ok=True)

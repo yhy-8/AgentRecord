@@ -9,7 +9,12 @@ from pathlib import Path
 
 from .. import journal, settings
 from ..agents import researcher, research_planner, retrospective, reviewer
-from ..agents.base import AgentPipelineError, cited_source_ids, invoke_agent
+from ..agents.base import (
+    AgentOutputError,
+    AgentPipelineError,
+    cited_source_ids,
+    invoke_agent,
+)
 from ..ai_client import call_ai
 from .context import (
     _analysis_report_path,
@@ -26,6 +31,7 @@ from .store import AnalysisStore
 
 logger = logging.getLogger(__name__)
 _LONG_ID_PATTERN = re.compile(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])")
+_MAX_AGENT_ATTEMPTS = 3
 
 
 def _replace_id_substrings(value: object, replacements: dict[str, str]) -> object:
@@ -112,10 +118,19 @@ def _call_agent(
     model_config: settings.ModelDict,
     store: AnalysisStore,
     run_id: str,
+    *,
+    revision_context: dict | None = None,
 ) -> dict:
     logger.info("agent_start run=%s agent=%s", run_id, spec.name)
     try:
-        payload = invoke_agent(spec, task, input_data, model_config, call_ai)
+        payload = invoke_agent(
+            spec,
+            task,
+            input_data,
+            model_config,
+            call_ai,
+            revision_context=revision_context,
+        )
     except AgentPipelineError as error:
         store.save_artifact(
             run_id,
@@ -149,6 +164,86 @@ def _save_validation_failure(
     )
 
 
+def _revision_context(
+    attempt: int,
+    previous_output: object,
+    feedback: object,
+    *,
+    source: str,
+) -> dict:
+    """Build the common correction suffix while keeping the original prompt stable."""
+    return {
+        "attempt": attempt,
+        "maximum_attempts": _MAX_AGENT_ATTEMPTS,
+        "feedback_source": source,
+        "problems_to_fix": feedback,
+        "rejected_previous_output": previous_output,
+    }
+
+
+def _validated_agent_call(
+    spec,
+    task: str,
+    input_data: dict,
+    validator,
+    model_config: settings.ModelDict,
+    store: AnalysisStore,
+    run_id: str,
+    *,
+    attempt_budget: list[int] | None = None,
+):
+    """Run one non-reviewed Agent stage with bounded output correction."""
+    budget = attempt_budget if attempt_budget is not None else [_MAX_AGENT_ATTEMPTS]
+    revision_context = None
+    while budget[0] > 0:
+        attempt = _MAX_AGENT_ATTEMPTS - budget[0] + 1
+        budget[0] -= 1
+        try:
+            payload = _call_agent(
+                spec,
+                task,
+                input_data,
+                model_config,
+                store,
+                run_id,
+                revision_context=revision_context,
+            )
+        except AgentOutputError as error:
+            if budget[0] == 0:
+                raise
+            revision_context = _revision_context(
+                attempt + 1,
+                error.response,
+                [str(error)],
+                source="中控 JSON 解析",
+            )
+            continue
+        try:
+            result = validator(payload)
+        except AgentPipelineError as error:
+            _save_validation_failure(store, run_id, spec.name, payload, error)
+            if budget[0] == 0:
+                raise
+            revision_context = _revision_context(
+                attempt + 1,
+                payload,
+                [str(error)],
+                source="中控确定性校验",
+            )
+            continue
+        return payload, result
+    raise RuntimeError("unreachable")
+
+
+def _review_feedback(payload: dict) -> dict:
+    return {
+        "summary": payload.get("summary", ""),
+        "required_changes": payload.get("required_changes", []),
+        "unsupported_claims": payload.get("unsupported_claims", []),
+        "entry_decisions": payload.get("entry_decisions", []),
+    }
+
+
 def _review(
     mode: str,
     section_payload: dict,
@@ -157,28 +252,29 @@ def _review(
     model_config: settings.ModelDict,
     store: AnalysisStore,
     run_id: str,
-) -> tuple[bool, dict[str, str], list[str]]:
+    *,
+    attempt_budget: list[int] | None = None,
+) -> tuple[bool, dict[str, str], list[str], dict]:
     review_input = {
         "mode": mode,
         "section": section_payload,
         "valid_profile_temp_ids": sorted(entry_ids),
         "review_context": review_context,
     }
-    payload = _call_agent(
+    payload, result = _validated_agent_call(
         reviewer.SPEC,
-        "审查该板块；逐项检查核心判断和来源，不要因为文风流畅而放行。",
+        "审查该板块；逐项检查核心判断和来源，只报告会影响真实性、可追溯性或交付质量的实质问题。",
         review_input,
+        lambda candidate: reviewer.validate(
+            candidate, expected_entry_ids=entry_ids
+        ),
         model_config,
         store,
         run_id,
+        attempt_budget=attempt_budget,
     )
-    try:
-        result = reviewer.validate(payload, expected_entry_ids=entry_ids)
-    except AgentPipelineError as error:
-        _save_validation_failure(store, run_id, "reviewer", payload, error)
-        raise
     store.save_artifact(run_id, f"reviewer_{mode}", payload)
-    return result
+    return (*result, payload)
 
 
 def _retrospective_section(
@@ -190,50 +286,93 @@ def _retrospective_section(
     store: AnalysisStore,
     run_id: str,
 ) -> tuple[str, list[dict], dict[str, str]]:
-    payload = _call_agent(
-        retrospective.SPEC,
-        "生成整理与回顾板块和人物画像候选。",
-        base_input,
-        model_config,
-        store,
-        run_id,
-    )
-    payload = _replace_profile_aliases(payload, profile_aliases)
-    try:
-        markdown, entries = retrospective.validate(
-            payload,
-            allowed_source_ids=allowed_source_ids,
-            current_source_ids=current_source_ids,
-            visible_profile_ids=set(profile_aliases.values()),
+    revision_context = None
+    last_feedback: list[str] = []
+    review_attempt_budget = [_MAX_AGENT_ATTEMPTS]
+    for attempt in range(1, _MAX_AGENT_ATTEMPTS + 1):
+        try:
+            payload = _call_agent(
+                retrospective.SPEC,
+                "生成整理与回顾板块和人物画像候选。没有值得长期保存的画像时返回空数组，不要凑数。",
+                base_input,
+                model_config,
+                store,
+                run_id,
+                revision_context=revision_context,
+            )
+        except AgentOutputError as error:
+            if attempt == _MAX_AGENT_ATTEMPTS:
+                raise
+            revision_context = _revision_context(
+                attempt + 1,
+                error.response,
+                [str(error)],
+                source="中控 JSON 解析",
+            )
+            continue
+        payload = _replace_profile_aliases(payload, profile_aliases)
+        try:
+            markdown, entries = retrospective.validate(
+                payload,
+                allowed_source_ids=allowed_source_ids,
+                current_source_ids=current_source_ids,
+                visible_profile_ids=set(profile_aliases.values()),
+            )
+        except AgentPipelineError as error:
+            _save_validation_failure(
+                store, run_id, retrospective.SPEC.name, payload, error
+            )
+            if attempt == _MAX_AGENT_ATTEMPTS:
+                raise
+            revision_context = _revision_context(
+                attempt + 1,
+                payload,
+                [str(error)],
+                source="中控确定性校验",
+            )
+            continue
+
+        normalized_payload = {"markdown": markdown, "profile_entries": entries}
+        cited_ids = cited_source_ids(markdown)
+        cited_ids.update(ref for entry in entries for ref in entry["source_refs"])
+        review_context = {
+            "period": base_input["period"],
+            "records": [
+                record
+                for record in base_input["records"]
+                if record["source_id"] in cited_ids
+            ],
+            "historical_profiles": base_input["historical_profiles"],
+        }
+        passed, decisions, last_feedback, review_payload = _review(
+            "retrospective_review",
+            normalized_payload,
+            {entry["temp_id"] for entry in entries},
+            review_context,
+            model_config,
+            store,
+            run_id,
+            attempt_budget=review_attempt_budget,
         )
-    except AgentPipelineError as error:
-        _save_validation_failure(store, run_id, retrospective.SPEC.name, payload, error)
-        raise
-    normalized_payload = {"markdown": markdown, "profile_entries": entries}
-    cited_ids = cited_source_ids(markdown)
-    cited_ids.update(ref for entry in entries for ref in entry["source_refs"])
-    review_context = {
-        "period": base_input["period"],
-        "records": [
-            record
-            for record in base_input["records"]
-            if record["source_id"] in cited_ids
-        ],
-        "historical_profiles": base_input["historical_profiles"],
-    }
-    passed, decisions, feedback = _review(
-        "retrospective_review",
-        normalized_payload,
-        {entry["temp_id"] for entry in entries},
-        review_context,
-        model_config,
-        store,
-        run_id,
-    )
-    if not passed:
-        raise AgentPipelineError("整理与回顾未通过审查: " + "; ".join(feedback))
-    store.save_artifact(run_id, retrospective.SPEC.name, normalized_payload)
-    return markdown, entries, decisions
+        if passed:
+            store.save_artifact(run_id, retrospective.SPEC.name, normalized_payload)
+            return markdown, entries, decisions
+
+        error = AgentPipelineError(
+            "整理与回顾未通过审查: " + "; ".join(last_feedback)
+        )
+        _save_validation_failure(
+            store, run_id, retrospective.SPEC.name, normalized_payload, error
+        )
+        if attempt == _MAX_AGENT_ATTEMPTS or review_attempt_budget[0] == 0:
+            raise error
+        revision_context = _revision_context(
+            attempt + 1,
+            normalized_payload,
+            _review_feedback(review_payload),
+            source="Reviewer 实质审查",
+        )
+    raise AgentPipelineError("整理与回顾修订次数耗尽: " + "; ".join(last_feedback))
 
 
 def _research_topics(
@@ -243,21 +382,17 @@ def _research_topics(
     store: AnalysisStore,
     run_id: str,
 ) -> list[dict]:
-    payload = _call_agent(
+    _, topics = _validated_agent_call(
         research_planner.SPEC,
         "选择少量记录驱动或信息雷达驱动的公开研究主题。",
         planner_input,
+        lambda candidate: research_planner.validate(
+            candidate, current_source_ids
+        ),
         model_config,
         store,
         run_id,
     )
-    try:
-        topics = research_planner.validate(payload, current_source_ids)
-    except AgentPipelineError as error:
-        _save_validation_failure(
-            store, run_id, research_planner.SPEC.name, payload, error
-        )
-        raise
     store.save_artifact(run_id, research_planner.SPEC.name, {"topics": topics})
     return topics
 
@@ -274,48 +409,91 @@ def _research_section(
         "research_topics": topics,
         "information_leads": information_leads,
     }
-    payload = _call_agent(
-        researcher.SPEC,
-        "逐项联网查证并生成领域探索与研究板块。",
-        research_input,
-        model_config,
-        store,
-        run_id,
-    )
-    try:
-        markdown, sources = researcher.validate(payload, topics, current_source_ids)
-    except AgentPipelineError as error:
-        _save_validation_failure(store, run_id, researcher.SPEC.name, payload, error)
-        raise
-    telemetry = payload.get("_telemetry", {})
-    used_search = bool(
-        model_config.get("search", False)
-        or telemetry.get("web_citations", 0)
-        or telemetry.get("search_results", 0)
-        or telemetry.get("tool_calls", {}).get("web_search", 0)
-    )
-    if not used_search:
-        error = AgentPipelineError("领域研究没有实际执行联网搜索")
-        _save_validation_failure(store, run_id, researcher.SPEC.name, payload, error)
-        raise error
-    normalized_payload = {"markdown": markdown, "sources": sources}
-    passed, _, feedback = _review(
-        "research_review",
-        normalized_payload,
-        set(),
-        {
-            "research_topics": topics,
-            "information_leads": information_leads,
-            "search_telemetry": telemetry,
-        },
-        model_config,
-        store,
-        run_id,
-    )
-    if not passed:
-        raise AgentPipelineError("领域研究未通过审查: " + "; ".join(feedback))
-    store.save_artifact(run_id, researcher.SPEC.name, normalized_payload)
-    return markdown
+    revision_context = None
+    last_feedback: list[str] = []
+    review_attempt_budget = [_MAX_AGENT_ATTEMPTS]
+    for attempt in range(1, _MAX_AGENT_ATTEMPTS + 1):
+        try:
+            payload = _call_agent(
+                researcher.SPEC,
+                "逐项联网查证并生成领域探索与研究板块。",
+                research_input,
+                model_config,
+                store,
+                run_id,
+                revision_context=revision_context,
+            )
+        except AgentOutputError as error:
+            if attempt == _MAX_AGENT_ATTEMPTS:
+                raise
+            revision_context = _revision_context(
+                attempt + 1,
+                error.response,
+                [str(error)],
+                source="中控 JSON 解析",
+            )
+            continue
+        try:
+            markdown, sources = researcher.validate(
+                payload, topics, current_source_ids
+            )
+            telemetry = payload.get("_telemetry", {})
+            used_search = bool(
+                model_config.get("search", False)
+                or telemetry.get("web_citations", 0)
+                or telemetry.get("search_results", 0)
+                or telemetry.get("tool_calls", {}).get("web_search", 0)
+            )
+            if not used_search:
+                raise AgentPipelineError("领域研究没有实际执行联网搜索")
+        except AgentPipelineError as error:
+            _save_validation_failure(
+                store, run_id, researcher.SPEC.name, payload, error
+            )
+            if attempt == _MAX_AGENT_ATTEMPTS:
+                raise
+            revision_context = _revision_context(
+                attempt + 1,
+                payload,
+                [str(error)],
+                source="中控确定性校验",
+            )
+            continue
+
+        normalized_payload = {"markdown": markdown, "sources": sources}
+        passed, _, last_feedback, review_payload = _review(
+            "research_review",
+            normalized_payload,
+            set(),
+            {
+                "research_topics": topics,
+                "information_leads": information_leads,
+                "search_telemetry": telemetry,
+            },
+            model_config,
+            store,
+            run_id,
+            attempt_budget=review_attempt_budget,
+        )
+        if passed:
+            store.save_artifact(run_id, researcher.SPEC.name, normalized_payload)
+            return markdown
+
+        error = AgentPipelineError(
+            "领域研究未通过审查: " + "; ".join(last_feedback)
+        )
+        _save_validation_failure(
+            store, run_id, researcher.SPEC.name, normalized_payload, error
+        )
+        if attempt == _MAX_AGENT_ATTEMPTS or review_attempt_budget[0] == 0:
+            raise error
+        revision_context = _revision_context(
+            attempt + 1,
+            normalized_payload,
+            _review_feedback(review_payload),
+            source="Reviewer 实质审查",
+        )
+    raise AgentPipelineError("领域研究修订次数耗尽: " + "; ".join(last_feedback))
 
 
 def _observed_dates(

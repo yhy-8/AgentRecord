@@ -263,7 +263,6 @@ def show_help(mode: str = RECORD_MODE) -> None:
             "  普通文字      → 立即写入今日日记\n"
             "  [cyan]/h[/cyan]        → 显示记录模式帮助\n"
             "  [cyan]/mode[/cyan]     → 切换到报告模式\n"
-            "  [cyan]/status[/cyan]   → 查看自动任务产物、调度与失败状态\n"
             "  [cyan]/v [日期][/cyan] → 查看历史日记（[cyan]/v help[/cyan] 查看用法）\n"
             "  [cyan]/ref [日期][/cyan] → 按日期选择日记并继续记录\n"
             "  [cyan]/d[/cyan]        → 删除今日最后一条记录\n"

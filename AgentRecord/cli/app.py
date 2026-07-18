@@ -25,7 +25,7 @@ from .terminal import (
 
 
 MODE_COMMANDS = {
-    RECORD_MODE: ("/h", "/mode", "/status", "/v", "/ref", "/d", "/c"),
+    RECORD_MODE: ("/h", "/mode", "/v", "/ref", "/d", "/c"),
     REPORT_MODE: ("/h", "/mode", "/status", "/s", "/a", "/retry", "/f", "/m"),
 }
 
@@ -67,10 +67,6 @@ def run_interactive() -> None:
         if command == "/h":
             show_help(mode)
             continue
-        if command == "/status":
-            _handle_status()
-            continue
-
         allowed_commands = MODE_COMMANDS[mode]
         known_commands = set(MODE_COMMANDS[RECORD_MODE] + MODE_COMMANDS[REPORT_MODE])
         if command in known_commands and command not in allowed_commands:
@@ -79,7 +75,9 @@ def run_interactive() -> None:
             continue
 
         if mode == REPORT_MODE:
-            if command == "/m":
+            if command == "/status":
+                _handle_status()
+            elif command == "/m":
                 next_model = settings.ModelConfig.next_after(current_model["name"])
                 try:
                     current_model = settings.ModelConfig.select(next_model["name"])

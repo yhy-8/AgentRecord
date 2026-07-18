@@ -310,7 +310,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
             [call.args[0] for call in generate.call_args_list],
         )
 
-    def test_retrospective_validation_failure_stops_without_rewriting(self):
+    def test_retrospective_validation_failure_uses_bounded_revisions(self):
         source_id = "R-20260714-001"
         base_input = {
             "period": {"kind": "weekly", "start": "2026-07-13", "end": "2026-07-19"},
@@ -335,8 +335,65 @@ class AnalysisWorkflowTests(unittest.TestCase):
                 "run-id",
             )
 
-        self.assertEqual(1, call_agent.call_count)
+        self.assertEqual(3, call_agent.call_count)
+        correction = call_agent.call_args.kwargs["revision_context"]
+        self.assertEqual("中控确定性校验", correction["feedback_source"])
+        self.assertIn("没有来源引用", correction["problems_to_fix"][0])
         review.assert_not_called()
+
+    def test_reviewer_feedback_is_returned_to_original_agent(self):
+        source_id = "R-20260714-001"
+        base_input = {
+            "period": {"kind": "weekly", "start": "2026-07-13", "end": "2026-07-19"},
+            "records": [{"source_id": source_id, "text": "用户记录"}],
+            "historical_profiles": [],
+        }
+        first = {
+            "markdown": f"第一稿判断。 [{source_id}]",
+            "profile_entries": [],
+        }
+        revised = {
+            "markdown": f"修订后仅保留有依据的判断。 [{source_id}]",
+            "profile_entries": [],
+        }
+        rejected_review = {
+            "pass": False,
+            "entry_decisions": [],
+            "unsupported_claims": ["第一稿判断超出记录支持范围"],
+            "required_changes": ["删除无依据判断"],
+            "summary": "需要修订",
+        }
+        store = Mock()
+
+        with patch.object(
+            orchestrator, "_call_agent", side_effect=[first, revised]
+        ) as call_agent, patch.object(
+            orchestrator,
+            "_review",
+            side_effect=[
+                (False, {}, ["删除无依据判断"], rejected_review),
+                (True, {}, [], {"pass": True}),
+            ],
+        ):
+            markdown, entries, decisions = orchestrator._retrospective_section(
+                base_input,
+                {source_id},
+                {source_id},
+                {},
+                {"name": "mock"},
+                store,
+                "run-id",
+            )
+
+        self.assertIn("修订后", markdown)
+        self.assertEqual([], entries)
+        self.assertEqual({}, decisions)
+        correction = call_agent.call_args_list[1].kwargs["revision_context"]
+        self.assertEqual("Reviewer 实质审查", correction["feedback_source"])
+        self.assertEqual(first, correction["rejected_previous_output"])
+        self.assertIn(
+            "删除无依据判断", correction["problems_to_fix"]["required_changes"]
+        )
 
     def test_invalid_agent_json_fails_without_a_repair_call(self):
         parse_error = AgentPipelineError(
@@ -366,6 +423,27 @@ class AnalysisWorkflowTests(unittest.TestCase):
         saved_payload = store.save_artifact.call_args.args[2]
         self.assertEqual(1, saved_payload["_telemetry"]["tool_calls"]["web_search"])
         self.assertEqual(12, saved_payload["_telemetry"]["search_results"])
+
+    def test_api_failure_does_not_enter_content_revision_loop(self):
+        store = Mock()
+        failure = AgentPipelineError(
+            "research_planner 调用失败: 网络异常: timeout"
+        )
+
+        with patch.object(
+            orchestrator, "_call_agent", side_effect=failure
+        ) as call_agent, self.assertRaises(AgentPipelineError):
+            orchestrator._validated_agent_call(
+                orchestrator.research_planner.SPEC,
+                "选题",
+                {},
+                lambda payload: payload,
+                {"name": "mock"},
+                store,
+                "run-id",
+            )
+
+        self.assertEqual(1, call_agent.call_count)
 
     def test_retry_runs_all_failed_tasks(self):
         settings.ANALYSIS_DIR.mkdir()

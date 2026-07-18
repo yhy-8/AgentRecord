@@ -7,7 +7,7 @@ from AgentRecord.agents import (
     retrospective,
     reviewer,
 )
-from AgentRecord.agents.base import AgentPipelineError, _parse_json
+from AgentRecord.agents.base import AgentPipelineError, _parse_json, _prompt
 
 
 class AgentModuleTests(unittest.TestCase):
@@ -119,6 +119,45 @@ class AgentModuleTests(unittest.TestCase):
                 },
                 expected_entry_ids={"p1"},
             )
+
+    def test_rejected_profile_candidate_does_not_fail_section_by_itself(self):
+        passed, decisions, feedback = reviewer.validate(
+            {
+                "pass": True,
+                "entry_decisions": [
+                    {
+                        "temp_id": "p1",
+                        "status": "rejected",
+                        "reason": "只出现一次，不值得跨周期保存",
+                    }
+                ],
+                "unsupported_claims": [],
+                "required_changes": [],
+            },
+            expected_entry_ids={"p1"},
+        )
+
+        self.assertTrue(passed)
+        self.assertEqual({"p1": "rejected"}, decisions)
+        self.assertEqual([], feedback)
+
+    def test_revision_prompt_preserves_original_request_as_prefix(self):
+        original = _prompt(retrospective.SPEC, "生成", {"records": ["内容"]})
+        revised = _prompt(
+            retrospective.SPEC,
+            "生成",
+            {"records": ["内容"]},
+            {
+                "problems_to_fix": ["缺少引用"],
+                "rejected_previous_output": {"markdown": "原稿"},
+            },
+        )
+
+        shared_prefix = original.rsplit(
+            "\n\n只输出一个符合契约的 JSON 对象", 1
+        )[0]
+        self.assertTrue(revised.startswith(shared_prefix))
+        self.assertIn("缺少引用", revised)
 
 
 if __name__ == "__main__":

@@ -167,6 +167,8 @@ class MainCommandTests(unittest.TestCase):
         output = str(console_print.call_args.args[0].renderable)
         self.assertIn("2026-07-14", output)
         self.assertIn("weekly_report", output)
+        self.assertIn("非网络错误", output)
+        self.assertNotIn("weekly_report [网络错误]", output)
 
     def test_feedback_command_records_correction(self):
         store = Mock()
@@ -191,13 +193,24 @@ class MainCommandTests(unittest.TestCase):
 
     def test_help_commands_are_separated_by_mode(self):
         self.assertEqual(
-            {"/h", "/mode", "/status", "/v", "/ref", "/d", "/c"},
+            {"/h", "/mode", "/v", "/ref", "/d", "/c"},
             set(app.MODE_COMMANDS[terminal.RECORD_MODE]),
         )
         self.assertEqual(
             {"/h", "/mode", "/status", "/s", "/a", "/retry", "/f", "/m"},
             set(app.MODE_COMMANDS[terminal.REPORT_MODE]),
         )
+
+    def test_status_is_not_executed_in_record_mode(self):
+        with patch(
+            "AgentRecord.cli.app.safe_input", side_effect=["/status", EOFError]
+        ), patch("AgentRecord.cli.app.show_help"), patch(
+            "AgentRecord.cli.app._handle_status"
+        ) as handle_status, patch("AgentRecord.cli.app.journal.append_log") as append:
+            app.run_interactive()
+
+        handle_status.assert_not_called()
+        append.assert_not_called()
 
     def test_report_help_expands_analysis_subcommands(self):
         with patch("AgentRecord.cli.terminal.console.print") as console_print:

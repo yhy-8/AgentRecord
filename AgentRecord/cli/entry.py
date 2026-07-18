@@ -66,10 +66,14 @@ def _show_automation_status() -> None:
     marker = "*" if status["installed"] else "!"
     console.print(f"[{color}][{marker}] {status['install_message']}[/{color}]")
     if status["errors"]:
-        tasks = "、".join(status["errors"])
+        retry_kind = status.get("retry_kind", {})
+        tasks = "、".join(
+            f"{task}（{'网络错误' if retry_kind.get(task) == 'network' else '非网络错误'}）"
+            for task in status["errors"]
+        )
         console.print(
-            f"[yellow][!] 自动任务存在未恢复失败：{tasks}；网络错误会在 5 分钟后重试，其他错误在下个整点重试，"
-            "也可用 /status 查看或在报告模式执行 /retry 立即全量重试。[/yellow]"
+            f"[yellow][!] 自动任务存在未恢复失败：{tasks}；"
+            "请切换到报告模式用 /status 查看实际重试时间，或执行 /retry 立即全量重试。[/yellow]"
         )
 
 

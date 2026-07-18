@@ -33,16 +33,20 @@ class AgentPipelineError(RuntimeError):
         self.telemetry = telemetry or {}
 
 
+class AgentOutputError(AgentPipelineError):
+    """The model call succeeded, but its structured output could not be read."""
+
+
 def _parse_json(text: str) -> dict:
     stripped = text.strip()
     try:
         value = json.loads(stripped)
     except json.JSONDecodeError as error:
-        raise AgentPipelineError(
+        raise AgentOutputError(
             f"Agent JSON 无法解析: {error}", response=text
         ) from error
     if not isinstance(value, dict):
-        raise AgentPipelineError("Agent JSON 顶层必须是对象", response=text)
+        raise AgentOutputError("Agent JSON 顶层必须是对象", response=text)
     return value
 
 
@@ -54,7 +58,12 @@ def cited_source_ids(markdown: str) -> set[str]:
     return refs
 
 
-def _prompt(spec: AgentSpec, task: str, input_data: dict) -> str:
+def _prompt(
+    spec: AgentSpec,
+    task: str,
+    input_data: dict,
+    revision_context: dict | None = None,
+) -> str:
     permission_text = (
         f"可读原始记录：{'是' if spec.can_read_raw else '否'}；"
         f"可见节点：{', '.join(sorted(spec.readable_node_types)) or '无'}；"
@@ -62,7 +71,7 @@ def _prompt(spec: AgentSpec, task: str, input_data: dict) -> str:
         f"可创建关系：{', '.join(sorted(spec.writable_relation_types)) or '无'}；"
         f"可用工具：{', '.join(sorted(spec.allowed_tools)) or '无'}。"
     )
-    return f"""[程序 Agent 任务:{spec.name}]
+    prompt = f"""[程序 Agent 任务:{spec.name}]
 你是 AgentRecord 的 {spec.name} Agent。{spec.purpose}。
 
 【中控权限】
@@ -76,7 +85,14 @@ def _prompt(spec: AgentSpec, task: str, input_data: dict) -> str:
 {task}
 
 【中控提供的输入 JSON】
-{json.dumps(input_data, ensure_ascii=False)}
+{json.dumps(input_data, ensure_ascii=False)}"""
+    if revision_context:
+        prompt += f"""
+
+【中控修订请求】
+这是同一阶段的有限修订，不是新任务。保留原稿中正确且有依据的内容，只修正下列问题，然后重新输出完整结果；不要解释修改过程。
+{json.dumps(revision_context, ensure_ascii=False)}"""
+    return prompt + """
 
 只输出一个符合契约的 JSON 对象，不要输出代码围栏、解释或完成提示。"""
 
@@ -87,10 +103,12 @@ def invoke_agent(
     input_data: dict,
     model_config: dict,
     call_model: Callable,
+    *,
+    revision_context: dict | None = None,
 ) -> dict:
     """Invoke one Agent with centrally supplied model access and tool permissions."""
     text, success, web_count, tool_counts, result_count = call_model(
-        _prompt(spec, task, input_data),
+        _prompt(spec, task, input_data, revision_context),
         model_config,
         allowed_tools=spec.allowed_tools,
     )
