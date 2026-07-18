@@ -1,9 +1,8 @@
 """SQLite persistence for report runs and the long-lived personal profile.
 
 The database is derived state. Markdown records remain the source of truth.
-Schema v3 intentionally replaces the former generic knowledge graph with a
-small profile store for viewpoints, principles, ideals, behaviour patterns,
-and sustained interests.
+The final schema stores the compact profile model together with validated-stage
+cache and request/search telemetry in Agent artifact payloads.
 """
 
 import datetime
@@ -18,7 +17,6 @@ from typing import Iterator, Sequence
 from .. import settings
 
 
-SCHEMA_VERSION = 3
 PROFILE_CATEGORIES = {
     "viewpoint",
     "principle",
@@ -28,6 +26,31 @@ PROFILE_CATEGORIES = {
 }
 PROFILE_STATUSES = {"accepted", "rejected", "superseded"}
 RUN_STATUSES = {"running", "completed", "failed"}
+_SCHEMA_COLUMNS = {
+    "analysis_runs": {
+        "id", "kind", "period_start", "period_end", "origin", "trigger",
+        "model_name", "status", "input_hash", "report_path", "error",
+        "created_at", "completed_at",
+    },
+    "agent_artifacts": {
+        "id", "run_id", "agent", "revision", "status", "payload_json",
+        "error", "created_at",
+    },
+    "source_catalog": {
+        "source_id", "relative_path", "source_date", "source_time",
+        "record_index", "speaker", "tag", "content_hash", "excerpt",
+        "last_seen_at",
+    },
+    "run_sources": {"run_id", "source_id"},
+    "profile_entries": {
+        "id", "run_id", "category", "title", "statement", "status",
+        "confidence", "source_refs_json", "first_observed", "last_observed",
+        "created_by", "supersedes_id", "created_at", "updated_at",
+    },
+    "profile_feedback": {
+        "id", "entry_id", "action", "replacement_entry_id", "created_at",
+    },
+}
 
 
 def _now() -> str:
@@ -72,22 +95,44 @@ class AnalysisStore:
             connection.close()
 
     def _initialize(self) -> None:
-        # Read the version before enabling WAL or other runtime pragmas so an
-        # incompatible development database is rejected without modification.
+        # Inspect the physical schema before enabling WAL so an incompatible
+        # database is rejected without modification. No schema version or
+        # migration state is stored.
         connection = sqlite3.connect(self.path, timeout=10)
         try:
-            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                    """
+                )
+            }
+            if tables:
+                if tables != set(_SCHEMA_COLUMNS):
+                    raise RuntimeError(
+                        "分析数据库结构不符合当前程序。"
+                        "本项目不提供数据库迁移或兼容；请确认无需保留后，"
+                        f"手动删除 {self.path} 及同名 -wal、-shm 文件再启动。"
+                    )
+                for table, expected_columns in _SCHEMA_COLUMNS.items():
+                    actual_columns = {
+                        row[1]
+                        for row in connection.execute(
+                            f"PRAGMA table_info({table})"
+                        )
+                    }
+                    if actual_columns != expected_columns:
+                        raise RuntimeError(
+                            f"分析数据库表 {table} 结构不符合当前程序。"
+                            "本项目不提供数据库迁移或兼容；请手动删除"
+                            "数据库主文件及同名 -wal、-shm 文件再启动。"
+                        )
         finally:
             connection.close()
 
-        if version not in (0, SCHEMA_VERSION):
-            raise RuntimeError(
-                f"分析数据库版本为 {version}，当前开发版本要求 {SCHEMA_VERSION}。"
-                "本项目尚不提供数据库升级兼容；请确认无需保留后，手动删除 "
-                f"{self.path} 及同名 -wal、-shm 文件再启动。"
-            )
-
-        if version == SCHEMA_VERSION:
+        if tables:
             return
 
         with self.transaction() as connection:
@@ -175,7 +220,6 @@ class AnalysisStore:
                     ON profile_feedback(entry_id, created_at DESC);
                 """
             )
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def start_run(
         self,

@@ -4,7 +4,7 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
-from AgentRecord.analysis.store import AnalysisStore, SCHEMA_VERSION
+from AgentRecord.analysis.store import AnalysisStore
 
 
 class AnalysisStoreTests(unittest.TestCase):
@@ -53,7 +53,7 @@ class AnalysisStoreTests(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )
             }
-        self.assertEqual(SCHEMA_VERSION, version)
+        self.assertEqual(0, version)
         self.assertIn("profile_entries", tables)
         self.assertNotIn("knowledge_edges", tables)
 
@@ -226,19 +226,17 @@ class AnalysisStoreTests(unittest.TestCase):
         self.assertEqual("修正观点", candidates[0]["title"])
 
     def test_incompatible_schema_fails_without_replacing_database(self):
-        with closing(sqlite3.connect(self.path)) as connection:
-            connection.execute("PRAGMA user_version = 2")
+        legacy_path = Path(self.temp_dir.name) / "legacy.sqlite3"
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            connection.execute("CREATE TABLE legacy_nodes(id TEXT PRIMARY KEY)")
             connection.commit()
-        original = self.path.read_bytes()
+        original = legacy_path.read_bytes()
 
-        with self.assertRaisesRegex(RuntimeError, "尚不提供数据库升级兼容"):
-            AnalysisStore(self.path)
+        with self.assertRaisesRegex(RuntimeError, "不提供数据库迁移或兼容"):
+            AnalysisStore(legacy_path)
 
-        self.assertEqual(original, self.path.read_bytes())
-        with closing(sqlite3.connect(self.path)) as connection:
-            version = connection.execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(2, version)
-        self.assertFalse(Path(f"{self.path}.v2.legacy.bak").exists())
+        self.assertEqual(original, legacy_path.read_bytes())
+        self.assertFalse(Path(f"{legacy_path}.legacy.bak").exists())
 
 
 if __name__ == "__main__":
