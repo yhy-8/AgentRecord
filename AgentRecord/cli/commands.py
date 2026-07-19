@@ -215,6 +215,7 @@ def _handle_status() -> None:
         lines.append("  [yellow]当前失败（/retry 可立即全量重试）：[/yellow]")
         retry_after = status.get("retry_after", {})
         retry_kind = status.get("retry_kind", {})
+        failure_counts = status.get("failure_counts", {})
         for task, message in errors.items():
             deadline = retry_after.get(task, "")
             kind = retry_kind.get(task)
@@ -222,15 +223,19 @@ def _handle_status() -> None:
                 "network": "网络错误",
                 "rate_limit": "接口限流",
                 "blocked": "配置/鉴权错误",
+                "content_blocked": "内容/格式连续失败",
             }.get(kind, "非网络错误（内容或格式错误）")
             retry_policy = {
                 "network": "5 分钟后重试",
                 "rate_limit": "5 分钟后重试",
                 "blocked": "修正配置后用 /retry 重试",
+                "content_blocked": "输入或模型变化后自动解锁，也可用 /retry 重试",
             }.get(kind, "下个整点重试")
             suffix = f"；{retry_policy}不早于 {deadline}" if deadline else ""
-            if kind == "blocked":
+            if kind in {"blocked", "content_blocked"}:
                 suffix = f"；{retry_policy}"
+            if kind == "content_blocked":
+                suffix += f"（同一输入已失败 {failure_counts.get(task, 0)} 次）"
             lines.append(
                 f"    - {task} [{failure_type}]: {message}{suffix}"
             )

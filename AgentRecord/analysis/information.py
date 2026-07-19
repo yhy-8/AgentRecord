@@ -9,7 +9,12 @@ from pathlib import Path
 
 from .. import settings
 from ..agents.researcher import canonical_url, markdown_urls
-from ..ai_client import call_ai, response_telemetry, web_search_available
+from ..ai_client import (
+    CONFIG_ERROR_MARKER,
+    call_ai,
+    response_telemetry,
+    web_search_available,
+)
 from .context import _existing_logs, _period_records
 
 
@@ -222,9 +227,19 @@ def _targeted_queries(
 {json.dumps(query_history, ensure_ascii=False)}"""
     current_prompt = prompt
     for attempt in range(1, _MAX_MODEL_ATTEMPTS + 1):
-        response, success, _, _, _ = call_ai(
-            current_prompt, model_config, allowed_tools=()
-        )
+        try:
+            response, success, _, _, _ = call_ai(
+                current_prompt,
+                model_config,
+                allowed_tools=(),
+                structured_output=True,
+            )
+        except TypeError as error:
+            if "structured_output" not in str(error):
+                raise
+            response, success, _, _, _ = call_ai(
+                current_prompt, model_config, allowed_tools=()
+            )
         if not success:
             return [], response
         try:
@@ -287,7 +302,11 @@ def generate_information_briefing(
 ) -> tuple[str, bool, Path | None]:
     """Search current information and atomically save one briefing for ``date``."""
     if not web_search_available(model_config):
-        return "当前模型和第三方搜索都未启用联网能力。", False, None
+        return (
+            f"{CONFIG_ERROR_MARKER} 当前模型和第三方搜索都未启用联网能力。",
+            False,
+            None,
+        )
 
     week_context = _week_record_context(date)
     prior_briefings, query_history = _prior_week_briefings(date)

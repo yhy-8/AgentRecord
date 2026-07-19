@@ -41,8 +41,9 @@ class AgentModuleTests(unittest.TestCase):
             {"retrospective", "research_planner", "researcher", "reviewer"},
             set(AGENTS),
         )
+        self.assertEqual(frozenset(), AGENTS["researcher"].allowed_tools)
         self.assertEqual(
-            frozenset({"web_search"}), AGENTS["researcher"].allowed_tools
+            frozenset({"web_search"}), researcher.NATIVE_SEARCH_SPEC.allowed_tools
         )
         self.assertEqual(frozenset(), AGENTS["retrospective"].allowed_tools)
         self.assertTrue(AGENTS["reviewer"].can_read_raw)
@@ -200,6 +201,82 @@ class AgentModuleTests(unittest.TestCase):
                     ],
                 },
                 [{"topic_id": "Q001", "origin": "news", "source_refs": []}],
+                set(),
+            )
+
+    def test_grounded_researcher_uses_controller_owned_evidence_ids(self):
+        topics = [
+            {
+                "topic_id": "Q001",
+                "origin": "records",
+                "source_refs": ["R-20260714-001"],
+            }
+        ]
+        evidence = [
+            {
+                "source_id": "W-Q001-001",
+                "topic_id": "Q001",
+                "title": "权威来源",
+                "url": "https://example.com/article_(one)",
+                "published": "2026-07-14",
+            }
+        ]
+
+        grounded, cited = researcher.validate_grounded(
+            {
+                "markdown": (
+                    "该问题由记录引出 [R-20260714-001]，"
+                    "外部证据说明了适用边界 [W-Q001-001]。"
+                )
+            },
+            topics,
+            evidence,
+            {"R-20260714-001"},
+        )
+        rendered, sources = researcher.render_grounded(
+            grounded, cited, evidence
+        )
+
+        self.assertNotIn("W-Q001-001", rendered)
+        self.assertIn("https://example.com/article_%28one%29", rendered)
+        self.assertEqual(["W-Q001-001"], cited)
+        self.assertEqual(["https://example.com/article_(one)"], [s["url"] for s in sources])
+
+    def test_grounded_researcher_rejects_model_written_url(self):
+        with self.assertRaisesRegex(AgentPipelineError, "不得自行输出 URL"):
+            researcher.validate_grounded(
+                {"markdown": "事实 [来源](https://example.com) [W-Q001-001]"},
+                [{"topic_id": "Q001", "origin": "news", "source_refs": []}],
+                [
+                    {
+                        "source_id": "W-Q001-001",
+                        "topic_id": "Q001",
+                        "url": "https://example.com",
+                    }
+                ],
+                set(),
+            )
+
+    def test_grounded_researcher_requires_evidence_for_every_topic(self):
+        with self.assertRaisesRegex(AgentPipelineError, "Q002"):
+            researcher.validate_grounded(
+                {"markdown": "仅覆盖一个主题 [W-Q001-001]"},
+                [
+                    {"topic_id": "Q001", "origin": "news", "source_refs": []},
+                    {"topic_id": "Q002", "origin": "news", "source_refs": []},
+                ],
+                [
+                    {
+                        "source_id": "W-Q001-001",
+                        "topic_id": "Q001",
+                        "url": "https://example.com/one",
+                    },
+                    {
+                        "source_id": "W-Q002-001",
+                        "topic_id": "Q002",
+                        "url": "https://example.com/two",
+                    },
+                ],
                 set(),
             )
 

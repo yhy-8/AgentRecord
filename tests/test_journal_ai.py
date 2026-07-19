@@ -76,6 +76,7 @@ class JournalAITests(unittest.TestCase):
         settings.CONFIG["third_search"] = {
             "enabled": True,
             "api_key": "search-key",
+            "api_url": "https://search.example.test",
             "max_rounds": 3,
         }
         post.side_effect = [
@@ -124,6 +125,7 @@ class JournalAITests(unittest.TestCase):
         settings.CONFIG["third_search"] = {
             "enabled": True,
             "api_key": "search-key",
+            "api_url": "https://search.example.test",
             "max_rounds": 3,
         }
         tool_message = lambda call_id: FakeResponse(
@@ -273,12 +275,165 @@ class JournalAITests(unittest.TestCase):
         self.assertEqual("tool", second_payload["messages"][-1]["role"])
         self.assertEqual("日记内容", second_payload["messages"][-1]["content"])
 
+    @patch("AgentRecord.ai_client.execute_tool")
+    @patch("AgentRecord.ai_client.requests.post")
+    def test_malformed_tool_arguments_are_returned_for_model_correction(
+        self, post, execute_tool
+    ):
+        post.side_effect = [
+            FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "bad-call",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "read_daily_log",
+                                            "arguments": "{bad json",
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            ),
+            FakeResponse(
+                {"choices": [{"message": {"role": "assistant", "content": "已修正"}}]}
+            ),
+        ]
+
+        response = ai_client.call_ai("分析任务", self.model)
+
+        self.assertTrue(response.success)
+        self.assertEqual("已修正", response.text)
+        execute_tool.assert_not_called()
+        correction = post.call_args_list[1].kwargs["json"]["messages"][-1]
+        self.assertEqual("tool", correction["role"])
+        self.assertIn("工具参数格式错误", correction["content"])
+
+    @patch("AgentRecord.ai_client.execute_tool")
+    @patch("AgentRecord.ai_client.requests.post")
+    def test_thinking_tool_round_preserves_reasoning_content(
+        self, post, execute_tool
+    ):
+        post.side_effect = [
+            FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "reasoning_content": "先读取记录再回答",
+                                "tool_calls": [
+                                    {
+                                        "id": "read-1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "read_daily_log",
+                                            "arguments": '{"date":"2026-07-14"}',
+                                        },
+                                    }
+                                ],
+                            },
+                        }
+                    ]
+                }
+            ),
+            FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"role": "assistant", "content": "完成"},
+                        }
+                    ]
+                }
+            ),
+        ]
+        execute_tool.return_value = ai_client.ToolResult("记录", 0)
+
+        response = ai_client.call_ai("分析任务", self.model)
+
+        self.assertTrue(response.success)
+        messages = post.call_args_list[1].kwargs["json"]["messages"]
+        assistant = next(message for message in messages if message["role"] == "assistant")
+        self.assertEqual("先读取记录再回答", assistant["reasoning_content"])
+        self.assertNotIn("tool_choice", post.call_args_list[0].kwargs["json"])
+
+    @patch("AgentRecord.ai_client.requests.post")
+    def test_output_length_stop_is_classified_as_truncation(self, post):
+        post.return_value = FakeResponse(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"role": "assistant", "content": '{"partial":'},
+                    }
+                ]
+            }
+        )
+
+        response = ai_client.call_ai("结构化任务", self.model)
+
+        self.assertFalse(response.success)
+        self.assertIn(ai_client.OUTPUT_TRUNCATED_MARKER, response.text)
+        self.assertEqual(["length"], response.telemetry["finish_reasons"])
+
+    @patch("AgentRecord.ai_client.requests.post")
+    def test_filtered_and_resource_exhausted_finishes_are_failures(self, post):
+        post.side_effect = [
+            FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "content_filter",
+                            "message": {"role": "assistant", "content": "部分内容"},
+                        }
+                    ]
+                }
+            ),
+            FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "insufficient_system_resource",
+                            "message": {"role": "assistant", "content": ""},
+                        }
+                    ]
+                }
+            ),
+        ]
+
+        filtered = ai_client.call_ai("结构化任务", self.model)
+        exhausted = ai_client.call_ai("结构化任务", self.model)
+
+        self.assertFalse(filtered.success)
+        self.assertIn(ai_client.OUTPUT_FILTERED_MARKER, filtered.text)
+        self.assertFalse(exhausted.success)
+        self.assertTrue(ai_client.is_network_failure(exhausted.text))
+
     def test_system_prompt_is_for_analysis_not_realtime_chat(self):
         prompt = ai_client._build_system_prompt()
 
         self.assertIn("分析引擎", prompt)
         self.assertIn("不承担日常聊天", prompt)
         self.assertNotIn("@AI 提问", prompt)
+
+    def test_incomplete_third_party_search_config_is_not_available(self):
+        settings.CONFIG["third_search"] = {
+            "enabled": True,
+            "api_key": "search-key",
+        }
+
+        self.assertFalse(ai_client.third_party_search_available())
 
     @patch("AgentRecord.ai_client.time.sleep")
     @patch("AgentRecord.ai_client.requests.post")
@@ -334,7 +489,7 @@ class JournalAITests(unittest.TestCase):
         message, success, _, _, _ = ai_client.call_ai("自动任务", self.model)
         self.assertFalse(success)
         self.assertTrue(ai_client.is_rate_limit_failure(message))
-        self.assertEqual(3, post.call_count)
+        self.assertEqual(1, post.call_count)
 
         post.reset_mock()
         unauthorized = FakeResponse({})

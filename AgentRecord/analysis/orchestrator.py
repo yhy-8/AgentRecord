@@ -15,7 +15,13 @@ from ..agents.base import (
     cited_source_ids,
     invoke_agent,
 )
-from ..ai_client import call_ai, web_search_available
+from ..ai_client import (
+    CONFIG_ERROR_MARKER,
+    call_ai,
+    search_web_once,
+    third_party_search_available,
+    web_search_available,
+)
 from ..file_lock import FileLock
 from .context import (
     _analysis_report_path,
@@ -520,7 +526,7 @@ def _research_topics(
     return topics
 
 
-def _research_section(
+def _native_research_section(
     topics: list[dict],
     information_leads: str,
     current_source_ids: set[str],
@@ -539,7 +545,7 @@ def _research_section(
     for attempt in range(1, _MAX_AGENT_ATTEMPTS + 1):
         try:
             payload = _call_agent(
-                researcher.SPEC,
+                researcher.NATIVE_SEARCH_SPEC,
                 "逐项联网查证并生成领域探索与研究板块；本次调用即使是修订稿也必须重新执行 web_search。",
                 research_input,
                 model_config,
@@ -567,7 +573,7 @@ def _research_section(
         telemetry = payload.get("_telemetry", {})
         _merge_search_evidence(accumulated_evidence, telemetry)
         try:
-            markdown, sources = researcher.validate(
+            markdown, sources = researcher.validate_linked(
                 payload, topics, current_source_ids
             )
             used_search = bool(
@@ -652,6 +658,324 @@ def _research_section(
     raise AgentPipelineError("领域研究修订次数耗尽: " + "; ".join(last_feedback))
 
 
+def _valid_cached_research_evidence(
+    cached_payload: dict | None, topics: list[dict]
+) -> tuple[list[dict], list[dict], dict] | None:
+    if not isinstance(cached_payload, dict) or cached_payload.get("topics") != topics:
+        return None
+    usable_topics = cached_payload.get("usable_topics")
+    evidence = cached_payload.get("evidence")
+    telemetry = cached_payload.get("_telemetry")
+    if not isinstance(usable_topics, list) or not isinstance(evidence, list):
+        return None
+    if not usable_topics or not evidence or not isinstance(telemetry, dict):
+        return None
+    original_topics = {topic.get("topic_id"): topic for topic in topics}
+    topic_ids = {topic.get("topic_id") for topic in usable_topics}
+    if (
+        len(topic_ids) != len(usable_topics)
+        or any(
+            original_topics.get(topic.get("topic_id")) != topic
+            for topic in usable_topics
+        )
+    ):
+        return None
+    seen = set()
+    evidence_topic_ids = set()
+    for item in evidence:
+        if not isinstance(item, dict):
+            return None
+        source_id = str(item.get("source_id", ""))
+        topic_id = item.get("topic_id")
+        url = str(item.get("url", ""))
+        url_key = researcher.canonical_url(url)
+        if (
+            not re.fullmatch(r"W-Q\d{3}-\d{3}", source_id)
+            or source_id in seen
+            or topic_id not in topic_ids
+            or not source_id.startswith(f"W-{topic_id}-")
+            or re.search(r"[\x00-\x20\x7f]", url)
+            or url_key[0] not in {"http", "https"}
+            or not url_key[1]
+            or any(key not in item for key in ("title", "snippet", "published"))
+        ):
+            return None
+        seen.add(source_id)
+        evidence_topic_ids.add(topic_id)
+    if evidence_topic_ids != topic_ids:
+        return None
+    return usable_topics, evidence, telemetry
+
+
+def _collect_research_evidence(
+    topics: list[dict],
+    store: AnalysisStore,
+    run_id: str,
+    cached: tuple[str, dict] | None = None,
+) -> tuple[list[dict], list[dict], dict]:
+    """Search each fixed query once and assign controller-owned evidence IDs."""
+    if cached:
+        validated = _valid_cached_research_evidence(cached[1], topics)
+        if validated:
+            usable_topics, evidence, telemetry = validated
+            store.save_artifact(
+                run_id,
+                "research_search",
+                {
+                    "topics": topics,
+                    "usable_topics": usable_topics,
+                    "evidence": evidence,
+                    "_telemetry": telemetry,
+                    "_cache": {"hit": True, "source_run_id": cached[0]},
+                },
+            )
+            logger.info(
+                "agent_cache_hit run=%s agent=research_search source_run=%s",
+                run_id,
+                cached[0],
+            )
+            return usable_topics, evidence, telemetry
+
+    evidence = []
+    usable_topics = []
+    search_queries = []
+    search_results = 0
+    for topic in topics:
+        query = topic["query"]
+        search_queries.append(query)
+        result, error = search_web_once(query)
+        if error:
+            payload = {
+                "topics": topics,
+                "usable_topics": usable_topics,
+                "evidence": evidence,
+                "_telemetry": {
+                    "tool_calls": {"web_search": len(search_queries)},
+                    "search_queries": search_queries,
+                    "search_results": search_results,
+                    "search_evidence": evidence,
+                },
+            }
+            store.save_artifact(
+                run_id, "research_search", payload, status="failed", error=error
+            )
+            raise AgentPipelineError(error)
+        search_results += result.result_count
+        topic_evidence = []
+        seen_urls = set()
+        for item in result.evidence:
+            url = str(item.get("url", "")).strip()
+            url_key = researcher.canonical_url(url)
+            if (
+                re.search(r"[\x00-\x20\x7f]", url)
+                or url_key[0] not in {"http", "https"}
+                or not url_key[1]
+                or url_key in seen_urls
+            ):
+                continue
+            seen_urls.add(url_key)
+            source_id = f"W-{topic['topic_id']}-{len(topic_evidence) + 1:03d}"
+            topic_evidence.append(
+                {
+                    "source_id": source_id,
+                    "topic_id": topic["topic_id"],
+                    "query": query,
+                    "title": str(item.get("title", ""))[:300],
+                    "url": url,
+                    "snippet": str(item.get("snippet", ""))[:800],
+                    "published": str(item.get("published", ""))[:80],
+                }
+            )
+        if topic_evidence:
+            usable_topics.append(topic)
+            evidence.extend(topic_evidence)
+
+    telemetry = {
+        "tool_calls": {"web_search": len(search_queries)},
+        "search_queries": search_queries,
+        "search_results": search_results,
+        "search_evidence": evidence,
+    }
+    payload = {
+        "topics": topics,
+        "usable_topics": usable_topics,
+        "dropped_topic_ids": [
+            topic["topic_id"] for topic in topics if topic not in usable_topics
+        ],
+        "evidence": evidence,
+        "_telemetry": telemetry,
+    }
+    if not usable_topics:
+        error = "所有研究主题的固定查询都没有返回可验证结果"
+        store.save_artifact(
+            run_id, "research_search", payload, status="failed", error=error
+        )
+        raise AgentPipelineError(error)
+    store.save_artifact(run_id, "research_search", payload)
+    logger.info(
+        "research_search_completed run=%s queries=%s results=%s usable_topics=%s",
+        run_id,
+        len(search_queries),
+        search_results,
+        len(usable_topics),
+    )
+    return usable_topics, evidence, telemetry
+
+
+def _grounded_research_section(
+    topics: list[dict],
+    current_source_ids: set[str],
+    model_config: settings.ModelDict,
+    store: AnalysisStore,
+    run_id: str,
+    cached_search: tuple[str, dict] | None = None,
+) -> str:
+    usable_topics, evidence, search_telemetry = _collect_research_evidence(
+        topics, store, run_id, cached_search
+    )
+    research_input = {
+        "research_topics": usable_topics,
+        "evidence_sources": [
+            {
+                "source_id": item["source_id"],
+                "topic_id": item["topic_id"],
+                "title": item["title"],
+                "snippet": item["snippet"],
+                "published": item["published"],
+            }
+            for item in evidence
+        ],
+    }
+    revision_context = None
+    last_feedback: list[str] = []
+    review_attempt_budget = [_MAX_AGENT_ATTEMPTS]
+    for attempt in range(1, _MAX_AGENT_ATTEMPTS + 1):
+        try:
+            payload = _call_agent(
+                researcher.SPEC,
+                "基于中控已经检索的证据生成领域探索与研究板块；只引用 W-* 证据 ID，不要自行输出 URL。",
+                research_input,
+                model_config,
+                store,
+                run_id,
+                revision_context=revision_context,
+            )
+        except AgentOutputError as error:
+            if attempt == _MAX_AGENT_ATTEMPTS:
+                raise
+            revision_context = _revision_context(
+                attempt + 1,
+                error.response,
+                [str(error)],
+                source="中控 JSON 解析",
+            )
+            continue
+        try:
+            grounded_markdown, cited_ids = researcher.validate_grounded(
+                payload, usable_topics, evidence, current_source_ids
+            )
+            rendered_markdown, sources = researcher.render_grounded(
+                grounded_markdown, cited_ids, evidence
+            )
+        except AgentPipelineError as error:
+            _save_validation_failure(
+                store, run_id, researcher.SPEC.name, payload, error
+            )
+            if attempt == _MAX_AGENT_ATTEMPTS:
+                raise
+            revision_context = _revision_context(
+                attempt + 1,
+                payload,
+                [str(error)],
+                source="中控确定性校验",
+            )
+            continue
+
+        normalized_payload = {"markdown": rendered_markdown, "sources": sources}
+        passed, _, last_feedback, review_payload = _review(
+            "research_review",
+            normalized_payload,
+            set(),
+            {
+                "research_topics": usable_topics,
+                "search_telemetry": _review_search_telemetry(
+                    search_telemetry, sources
+                ),
+            },
+            model_config,
+            store,
+            run_id,
+            attempt_budget=review_attempt_budget,
+        )
+        if passed:
+            model_telemetry = payload.get("_telemetry", {})
+            store.save_artifact(
+                run_id,
+                researcher.SPEC.name,
+                {
+                    **normalized_payload,
+                    "grounded_markdown": grounded_markdown,
+                    "_telemetry": {
+                        **model_telemetry,
+                        **search_telemetry,
+                    },
+                },
+            )
+            return rendered_markdown
+
+        error = AgentPipelineError(
+            "领域研究未通过审查: " + "; ".join(last_feedback)
+        )
+        _save_validation_failure(
+            store,
+            run_id,
+            researcher.SPEC.name,
+            {
+                "markdown": grounded_markdown,
+                "rendered_markdown": rendered_markdown,
+                "sources": sources,
+            },
+            error,
+        )
+        if attempt == _MAX_AGENT_ATTEMPTS or review_attempt_budget[0] == 0:
+            raise error
+        revision_context = _revision_context(
+            attempt + 1,
+            {"markdown": grounded_markdown},
+            _review_feedback(review_payload),
+            source="Reviewer 实质审查",
+        )
+    raise AgentPipelineError("领域研究修订次数耗尽: " + "; ".join(last_feedback))
+
+
+def _research_section(
+    topics: list[dict],
+    information_leads: str,
+    current_source_ids: set[str],
+    model_config: settings.ModelDict,
+    store: AnalysisStore,
+    run_id: str,
+    cached_search: tuple[str, dict] | None = None,
+) -> str:
+    if third_party_search_available() and not model_config.get("search", False):
+        return _grounded_research_section(
+            topics,
+            current_source_ids,
+            model_config,
+            store,
+            run_id,
+            cached_search,
+        )
+    return _native_research_section(
+        topics,
+        information_leads,
+        current_source_ids,
+        model_config,
+        store,
+        run_id,
+    )
+
+
 def _observed_dates(
     entries: list[dict], profiles_by_id: dict[str, dict], store: AnalysisStore
 ) -> None:
@@ -721,7 +1045,12 @@ def generate_analysis_report(
     if not records:
         return "日记中没有可识别的标准记录。", False, None
     if model_config.get("api_url") and not web_search_available(model_config):
-        return "当前模型和第三方搜索都未启用联网能力，报告必然无法完成领域研究。", False, None
+        return (
+            f"{CONFIG_ERROR_MARKER} 当前模型和第三方搜索都未启用联网能力，"
+            "报告必然无法完成领域研究。",
+            False,
+            None,
+        )
 
     report_path = _analysis_report_path(kind, start, end, origin)
     report_lock = FileLock.acquire(settings.ANALYSIS_DIR / ".report.lock")
@@ -895,6 +1224,9 @@ def generate_analysis_report(
                 cache_run_id,
             )
         else:
+            cached_search = store.reusable_artifact(
+                *cache_arguments, "research_search"
+            )
             research_markdown = _research_section(
                 topics,
                 information_leads,
@@ -902,6 +1234,7 @@ def generate_analysis_report(
                 model_config,
                 store,
                 run_id,
+                cached_search,
             )
 
         body = (

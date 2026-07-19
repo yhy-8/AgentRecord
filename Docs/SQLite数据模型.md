@@ -66,6 +66,8 @@
 
 唯一约束为 `(run_id, agent, revision)`。模型回答格式错误、结构校验失败、Reviewer 输出不完整或审查未通过时，也保存失败产物；同阶段修订产生后续版本。`payload_json._telemetry` 保存请求与搜索遥测，`payload_json._cache` 标记已过审阶段复用。
 
+`research_search` 是中控阶段而非模型 Agent：它保存固定选题、实际执行的查询、`W-*` 证据 ID、URL、标题/摘要和搜索遥测。等价失败运行重试时只有选题完全一致且每个保留主题都有安全有效证据，才能复用该产物。
+
 ## 5. source_catalog 与 run_sources
 
 `source_catalog` 以稳定 `R-YYYYMMDD-NNN` 为主键，保存：
@@ -153,3 +155,4 @@ Retrospective 的候选只有通过 Reviewer 才能为 `accepted`，但只有整
 - 运行中的数据库应使用 SQLite backup API 或同时一致处理主库、WAL、SHM，不能只复制主文件。
 - 数据库错误不得触发对 `Records/` 的清理。
 - 报告是可重建交付物，画像反馈是不可从原文完全推导的用户决定，恢复时应优先保护后者。
+- 已生成的 Markdown 报告包含完整正文、外部链接和 `R-*` 来源索引，阅读不依赖 SQLite；删除数据库不会截断报告文件，但会永久丢失运行审计、缓存、画像版本链和用户反馈。

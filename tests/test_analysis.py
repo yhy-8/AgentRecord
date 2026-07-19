@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from AgentRecord import settings
+from AgentRecord.ai_client import ToolResult
 from AgentRecord.analysis import automation, context, orchestrator
 from AgentRecord.analysis.store import AnalysisStore
 from AgentRecord.agents.base import AgentPipelineError
@@ -538,6 +539,197 @@ class AnalysisWorkflowTests(unittest.TestCase):
         whitelist = correction["problems_to_fix"]["verified_source_options"]
         self.assertEqual(prior_url, whitelist[0]["sources"][0]["url"])
 
+    def test_grounded_research_searches_once_and_controller_renders_url(self):
+        topics = [
+            {
+                "topic_id": "Q001",
+                "title": "公开主题",
+                "query": "公开查询",
+                "reason": "研究",
+                "origin": "news",
+                "source_refs": [],
+            }
+        ]
+        store = Mock()
+        result = ToolResult(
+            "搜索结果",
+            1,
+            [
+                {
+                    "query": "公开查询",
+                    "title": "真实来源",
+                    "url": "https://example.com/real",
+                    "snippet": "支持材料",
+                    "published": "2026-07-14",
+                }
+            ],
+        )
+        draft = {
+            "markdown": "基于证据可以确认边界 [W-Q001-001]。",
+            "_telemetry": {"usage": {"total_tokens": 100}},
+        }
+
+        with patch.object(
+            orchestrator, "third_party_search_available", return_value=True
+        ), patch.object(
+            orchestrator, "search_web_once", return_value=(result, "")
+        ) as search, patch.object(
+            orchestrator, "_call_agent", return_value=draft
+        ) as call_agent, patch.object(
+            orchestrator,
+            "_review",
+            return_value=(True, {}, [], {"pass": True}),
+        ):
+            markdown = orchestrator._research_section(
+                topics, "不应送入模型", set(), {"name": "mock"}, store, "run-id"
+            )
+
+        self.assertEqual(1, search.call_count)
+        self.assertIn("https://example.com/real", markdown)
+        input_data = call_agent.call_args.args[2]
+        self.assertNotIn("information_leads", input_data)
+        self.assertNotIn("url", input_data["evidence_sources"][0])
+        self.assertEqual(frozenset(), call_agent.call_args.args[0].allowed_tools)
+
+    def test_grounded_research_revision_does_not_repeat_search(self):
+        topics = [
+            {
+                "topic_id": "Q001",
+                "title": "公开主题",
+                "query": "公开查询",
+                "reason": "研究",
+                "origin": "news",
+                "source_refs": [],
+            }
+        ]
+        result = ToolResult(
+            "搜索结果",
+            1,
+            [
+                {
+                    "query": "公开查询",
+                    "title": "真实来源",
+                    "url": "https://example.com/real",
+                    "snippet": "支持材料",
+                    "published": "",
+                }
+            ],
+        )
+        drafts = [
+            {"markdown": "缺少证据"},
+            {"markdown": "修订后引用证据 [W-Q001-001]。"},
+        ]
+        store = Mock()
+
+        with patch.object(
+            orchestrator, "search_web_once", return_value=(result, "")
+        ) as search, patch.object(
+            orchestrator, "_call_agent", side_effect=drafts
+        ) as call_agent, patch.object(
+            orchestrator,
+            "_review",
+            return_value=(True, {}, [], {"pass": True}),
+        ):
+            markdown = orchestrator._grounded_research_section(
+                topics, set(), {"name": "mock"}, store, "run-id"
+            )
+
+        self.assertIn("https://example.com/real", markdown)
+        self.assertEqual(1, search.call_count)
+        self.assertEqual(2, call_agent.call_count)
+
+    def test_grounded_search_cache_avoids_searching_again_on_report_retry(self):
+        topics = [
+            {
+                "topic_id": "Q001",
+                "title": "公开主题",
+                "query": "公开查询",
+                "reason": "研究",
+                "origin": "news",
+                "source_refs": [],
+            }
+        ]
+        evidence = [
+            {
+                "source_id": "W-Q001-001",
+                "topic_id": "Q001",
+                "query": "公开查询",
+                "title": "真实来源",
+                "url": "https://example.com/real",
+                "snippet": "支持材料",
+                "published": "",
+            }
+        ]
+        telemetry = {
+            "tool_calls": {"web_search": 1},
+            "search_queries": ["公开查询"],
+            "search_results": 1,
+            "search_evidence": evidence,
+        }
+        cached = (
+            "previous-run",
+            {
+                "topics": topics,
+                "usable_topics": topics,
+                "evidence": evidence,
+                "_telemetry": telemetry,
+            },
+        )
+        store = Mock()
+
+        with patch.object(orchestrator, "search_web_once") as search:
+            usable, restored, restored_telemetry = (
+                orchestrator._collect_research_evidence(
+                    topics, store, "run-id", cached
+                )
+            )
+
+        search.assert_not_called()
+        self.assertEqual(topics, usable)
+        self.assertEqual(evidence, restored)
+        self.assertEqual(telemetry, restored_telemetry)
+        saved = store.save_artifact.call_args.args[2]
+        self.assertTrue(saved["_cache"]["hit"])
+
+    def test_grounded_search_cache_requires_safe_evidence_for_every_topic(self):
+        topics = [
+            {
+                "topic_id": "Q001",
+                "title": "主题一",
+                "query": "查询一",
+                "reason": "研究",
+                "origin": "news",
+                "source_refs": [],
+            },
+            {
+                "topic_id": "Q002",
+                "title": "主题二",
+                "query": "查询二",
+                "reason": "研究",
+                "origin": "news",
+                "source_refs": [],
+            },
+        ]
+        payload = {
+            "topics": topics,
+            "usable_topics": topics,
+            "evidence": [
+                {
+                    "source_id": "W-Q001-001",
+                    "topic_id": "Q001",
+                    "title": "来源",
+                    "url": "https://example.com/unsafe\nlink",
+                    "snippet": "材料",
+                    "published": "",
+                }
+            ],
+            "_telemetry": {},
+        }
+
+        self.assertIsNone(
+            orchestrator._valid_cached_research_evidence(payload, topics)
+        )
+
     def test_invalid_agent_json_fails_without_a_repair_call(self):
         parse_error = AgentPipelineError(
             "Agent JSON 无法解析: test",
@@ -709,17 +901,63 @@ class AnalysisWorkflowTests(unittest.TestCase):
                 return cls(2026, 7, 17, 0, 25, 41)
 
         state = {}
-        with patch.object(automation.datetime, "datetime", FixedDateTime):
+        with patch.object(
+            automation.datetime, "datetime", FixedDateTime
+        ), patch.object(
+            automation, "_content_failure_key", return_value="same-input"
+        ):
             automation._set_task_error(state, "weekly_report", "周报失败")
 
         self.assertEqual(
             "2026-07-17T01:00:00", state["retry_after"]["weekly_report"]
         )
         self.assertEqual("hourly", state["retry_kind"]["weekly_report"])
+        self.assertEqual(1, state["failure_counts"]["weekly_report"])
         automation._clear_task_error(state, "weekly_report")
         self.assertNotIn("errors", state)
         self.assertNotIn("retry_after", state)
         self.assertNotIn("retry_kind", state)
+        self.assertNotIn("failure_counts", state)
+        self.assertNotIn("failure_keys", state)
+
+    def test_same_content_failure_stops_after_one_automatic_retry(self):
+        state = {}
+        with patch.object(
+            automation, "_content_failure_key", return_value="same-input"
+        ):
+            automation._set_task_error(state, "weekly_report", "第一次失败")
+            automation._set_task_error(state, "weekly_report", "第二次失败")
+
+        self.assertEqual("content_blocked", state["retry_kind"]["weekly_report"])
+        self.assertEqual(2, state["failure_counts"]["weekly_report"])
+        self.assertNotIn("weekly_report", state.get("retry_after", {}))
+        self.assertFalse(
+            automation._failure_retry_is_due(
+                state, "weekly_report", datetime.datetime(2026, 7, 17, 12, 0)
+            )
+        )
+
+    def test_changed_input_unlocks_content_failure_on_hourly_detection(self):
+        state = {
+            "errors": {"weekly_report": "连续失败"},
+            "retry_kind": {"weekly_report": "content_blocked"},
+            "failure_counts": {"weekly_report": 2},
+            "failure_keys": {"weekly_report": "old-input"},
+        }
+        now = datetime.datetime(2026, 7, 17, 12, 0)
+        with patch.object(
+            automation, "_content_failure_key", return_value="new-input"
+        ), patch.object(automation, "_task_missing", return_value=True):
+            should_run = automation._task_should_run(
+                state,
+                "weekly_report",
+                now,
+                initial_detection_due=True,
+            )
+
+        self.assertTrue(should_run)
+        self.assertNotIn("errors", state)
+        self.assertNotIn("failure_counts", state)
 
     def test_network_failure_sets_five_minute_retry_deadline(self):
         class FixedDateTime(datetime.datetime):

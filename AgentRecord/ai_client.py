@@ -19,6 +19,8 @@ from . import journal, settings
 NETWORK_ERROR_MARKER = "网络异常:"
 RATE_LIMIT_ERROR_MARKER = "限流异常:"
 CONFIG_ERROR_MARKER = "配置异常:"
+OUTPUT_TRUNCATED_MARKER = "输出截断:"
+OUTPUT_FILTERED_MARKER = "输出过滤:"
 _MAX_WEB_RESULTS_PER_QUERY = 10
 
 
@@ -71,10 +73,18 @@ def response_telemetry(response: object) -> dict[str, Any]:
 
 
 def web_search_available(model_config: settings.ModelDict) -> bool:
-    third = settings.CONFIG.get("third_search", {})
     return bool(
         model_config.get("search", False)
-        or (third.get("enabled", False) and third.get("api_key", ""))
+        or third_party_search_available()
+    )
+
+
+def third_party_search_available() -> bool:
+    third = settings.CONFIG.get("third_search", {})
+    return bool(
+        third.get("enabled", False)
+        and third.get("api_url", "")
+        and third.get("api_key", "")
     )
 
 
@@ -98,7 +108,7 @@ def _post_with_transient_retry(*args, **kwargs):
                 raise
             time.sleep(1 << attempt)
             continue
-        if response.status_code in (408, 429) or 500 <= response.status_code < 600:
+        if response.status_code == 408 or 500 <= response.status_code < 600:
             if attempt < 2:
                 time.sleep(1 << attempt)
                 continue
@@ -291,6 +301,25 @@ def bocha_search(query: str, include: str = "", exclude: str = "") -> ToolResult
         return ToolResult("")
 
 
+def search_web_once(query: str) -> tuple[ToolResult, str]:
+    """Run one third-party search and return a classified error instead of raising."""
+    try:
+        return bocha_search(query), ""
+    except (requests.ConnectionError, requests.Timeout) as error:
+        return ToolResult(""), f"{NETWORK_ERROR_MARKER} 第三方搜索失败: {error}"
+    except requests.HTTPError as error:
+        status = error.response.status_code if error.response is not None else None
+        if status == 429:
+            marker = RATE_LIMIT_ERROR_MARKER
+        elif status in (401, 403):
+            marker = CONFIG_ERROR_MARKER
+        else:
+            marker = NETWORK_ERROR_MARKER if _transient_http_error(error) else "接口异常:"
+        return ToolResult(""), f"{marker} 第三方搜索失败: {error}"
+    except requests.RequestException as error:
+        return ToolResult(""), f"接口异常: 第三方搜索失败: {error}"
+
+
 def execute_tool(function_name: str, arguments: dict) -> ToolResult:
     if function_name == "read_daily_log":
         return ToolResult(journal.read_daily_log(
@@ -392,10 +421,7 @@ def call_ai(
     native_search = model_config.get("search", False)
     web_allowed = allowed_tools is None or "web_search" in allowed_tools
     use_third_search = (
-        web_allowed
-        and not native_search
-        and third_search.get("enabled", False)
-        and third_search.get("api_key", "")
+        web_allowed and not native_search and third_party_search_available()
     )
     if not use_third_search:
         tools = [tool for tool in tools if tool["function"]["name"] != "web_search"]
@@ -412,7 +438,6 @@ def call_ai(
         payload["response_format"] = {"type": "json_object"}
     if tools:
         payload["tools"] = tools
-        payload["tool_choice"] = "auto"
     if native_search and web_allowed:
         model_name = (model_config.get("model_id") or model_config["name"]).lower()
         if "glm" in model_name:
@@ -425,8 +450,6 @@ def call_ai(
             ]
         else:
             payload["web_search"] = True
-        if payload.get("tools"):
-            payload["tool_choice"] = "auto"
 
     headers = {
         "Authorization": f"Bearer {model_config['api_key']}",
@@ -455,6 +478,7 @@ def call_ai(
     rejected_search_queries: list[str] = []
     duplicate_search_queries: list[str] = []
     completed_search_queries: set[str] = set()
+    finish_reasons: list[str] = []
 
     def observe_attempt(_attempt: int) -> None:
         nonlocal http_attempts
@@ -475,6 +499,7 @@ def call_ai(
                 "rejected_search_queries": rejected_search_queries,
                 "duplicate_search_queries": duplicate_search_queries,
                 "search_evidence": search_evidence,
+                "finish_reasons": finish_reasons,
             },
         )
 
@@ -490,7 +515,10 @@ def call_ai(
             )
             response.raise_for_status()
             data = response.json()
-            message = data["choices"][0]["message"]
+            choice = data["choices"][0]
+            message = choice["message"]
+            finish_reason = str(choice.get("finish_reason", ""))
+            finish_reasons.append(finish_reason)
             for key, value in _usage_values(data).items():
                 usage[key] += value
 
@@ -505,6 +533,23 @@ def call_ai(
             requested_tools = message.get("tool_calls", [])
             if not requested_tools:
                 text = (message.get("content") or "").strip()
+                if finish_reason == "length":
+                    return finish(
+                        (text + "\n\n" if text else "")
+                        + f"{OUTPUT_TRUNCATED_MARKER} 模型达到输出长度上限。",
+                        False,
+                    )
+                if finish_reason == "content_filter":
+                    return finish(
+                        (text + "\n\n" if text else "")
+                        + f"{OUTPUT_FILTERED_MARKER} 模型输出触发内容过滤。",
+                        False,
+                    )
+                if finish_reason == "insufficient_system_resource":
+                    return finish(
+                        f"{NETWORK_ERROR_MARKER} 模型服务资源暂时不足。",
+                        False,
+                    )
                 if not text:
                     return finish("(AI 未给出最终回答)", False)
                 return finish(text, True)
@@ -513,7 +558,20 @@ def call_ai(
             for tool_call in requested_tools:
                 function_name = tool_call["function"]["name"]
                 tool_calls[function_name] = tool_calls.get(function_name, 0) + 1
-                arguments = json.loads(tool_call["function"]["arguments"])
+                try:
+                    arguments = json.loads(tool_call["function"]["arguments"])
+                    if not isinstance(arguments, dict):
+                        raise ValueError("工具参数顶层不是对象")
+                except (json.JSONDecodeError, TypeError, ValueError) as error:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "name": function_name,
+                            "content": f"工具参数格式错误，请修正后重试: {error}",
+                        }
+                    )
+                    continue
                 query = str(arguments.get("query", "")).strip()
                 if function_name == "web_search":
                     search_queries.append(query)

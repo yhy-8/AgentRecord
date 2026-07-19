@@ -186,6 +186,14 @@ def invoke_agent(
         **response_telemetry(response),
     }
     if not success:
+        from ..ai_client import OUTPUT_FILTERED_MARKER, OUTPUT_TRUNCATED_MARKER
+
+        if OUTPUT_TRUNCATED_MARKER in text or OUTPUT_FILTERED_MARKER in text:
+            raise AgentOutputError(
+                f"{spec.name} 输出未完整交付",
+                response=text,
+                telemetry=telemetry,
+            )
         raise AgentPipelineError(
             f"{spec.name} 调用失败: {text}", response=text, telemetry=telemetry
         )

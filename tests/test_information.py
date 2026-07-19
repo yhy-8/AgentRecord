@@ -34,6 +34,7 @@ class InformationBriefingTests(unittest.TestCase):
         settings.CONFIG["third_search"] = {
             "enabled": True,
             "api_key": "test-key",
+            "api_url": "https://search.example.test",
         }
 
     def tearDown(self):

@@ -1,6 +1,7 @@
 """Automatic due-task execution and operating-system scheduler integration."""
 
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -17,12 +18,28 @@ from ..ai_client import (
     is_network_failure,
     is_rate_limit_failure,
 )
-from .context import _analysis_report_path, _existing_logs
-from .information import generate_information_briefing, information_briefing_path
+from .context import (
+    _analysis_report_path,
+    _existing_logs,
+    _information_briefings,
+    _monthly_supporting_reports,
+    _recent_summary_context,
+    _referenced_source_context,
+)
+from .information import (
+    _prior_week_briefings,
+    _week_record_context,
+    generate_information_briefing,
+    information_briefing_path,
+)
 from .orchestrator import generate_analysis_report, summarize_diary
 
 
 logger = logging.getLogger(__name__)
+
+
+_MAX_AUTOMATIC_CONTENT_FAILURES = 2
+_CONTENT_FAILURE_POLICY_VERSION = 1
 
 
 class _AutomationLock:
@@ -103,6 +120,73 @@ def _next_hour(now: datetime.datetime) -> datetime.datetime:
     )
 
 
+def _content_failure_key(task: str, now: datetime.datetime) -> str:
+    """Hash the effective task input without persisting private content or keys."""
+    try:
+        model = _automation_model()
+        model_signature = {
+            key: model.get(key)
+            for key in (
+                "name",
+                "model_id",
+                "api_url",
+                "search",
+                "json_mode",
+                "max_tokens",
+            )
+        }
+        third_search = settings.CONFIG.get("third_search", {})
+        search_signature = {
+            key: third_search.get(key)
+            for key in ("enabled", "api_url", "count", "timeout", "max_rounds")
+        }
+        today = now.date()
+        payload: dict = {
+            "policy_version": _CONTENT_FAILURE_POLICY_VERSION,
+            "task": task,
+            "model": model_signature,
+            "third_search": search_signature,
+        }
+        if task == "daily_summary":
+            date = today - datetime.timedelta(days=1)
+            path = settings.DIARY_DIR / f"{date.isoformat()}.md"
+            payload.update(
+                target=date.isoformat(),
+                diary=path.read_text(encoding="utf-8") if path.is_file() else "",
+            )
+        elif task == "daily_information":
+            week_start = today - datetime.timedelta(days=today.weekday())
+            prior_briefings, prior_queries = _prior_week_briefings(today)
+            payload.update(
+                target=today.isoformat(),
+                week_start=week_start.isoformat(),
+                records=_week_record_context(today),
+                prior_briefings=prior_briefings,
+                prior_queries=prior_queries,
+            )
+        elif task in {"weekly_report", "monthly_report"}:
+            if task == "weekly_report":
+                start, end = _latest_week_period(today)
+                supporting_reports = "（周报不读取下级周期报告）"
+            else:
+                start, end = _latest_month_period(today)
+                supporting_reports = _monthly_supporting_reports(start, end)
+            logs = _existing_logs(start, end)
+            payload.update(
+                period={"start": start.isoformat(), "end": end.isoformat()},
+                logs=logs,
+                referenced_sources=_referenced_source_context(logs),
+                recent_summaries=_recent_summary_context(start),
+                supporting_reports=supporting_reports,
+                information_leads=_information_briefings(start, end),
+            )
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+    except (OSError, RuntimeError, KeyError, TypeError, ValueError):
+        return ""
+
+
 def _set_task_error(state: dict, task: str, message: str) -> None:
     now = datetime.datetime.now()
     state.setdefault("errors", {})[task] = f"{now:%Y-%m-%d %H:%M} {message}"
@@ -129,7 +213,29 @@ def _set_task_error(state: dict, task: str, message: str) -> None:
             elif rate_limited:
                 retry_kind = "rate_limit"
             else:
-                retry_kind = "hourly"
+                failure_key = _content_failure_key(task, now)
+                previous_key = state.get("failure_keys", {}).get(task)
+                try:
+                    previous_count = int(
+                        state.get("failure_counts", {}).get(task, 0)
+                    )
+                except (TypeError, ValueError):
+                    previous_count = 0
+                failure_count = (
+                    previous_count + 1
+                    if failure_key and failure_key == previous_key
+                    else 1
+                )
+                state.setdefault("failure_counts", {})[task] = failure_count
+                if failure_key:
+                    state.setdefault("failure_keys", {})[task] = failure_key
+                if failure_count >= _MAX_AUTOMATIC_CONTENT_FAILURES:
+                    retry_kind = "content_blocked"
+                    state.get("retry_after", {}).pop(task, None)
+                    if not state.get("retry_after"):
+                        state.pop("retry_after", None)
+                else:
+                    retry_kind = "hourly"
             state.setdefault("retry_kind", {})[task] = retry_kind
 
 
@@ -146,6 +252,14 @@ def _clear_task_error(state: dict, task: str) -> None:
     retry_kind.pop(task, None)
     if not retry_kind:
         state.pop("retry_kind", None)
+    failure_counts = state.get("failure_counts", {})
+    failure_counts.pop(task, None)
+    if not failure_counts:
+        state.pop("failure_counts", None)
+    failure_keys = state.get("failure_keys", {})
+    failure_keys.pop(task, None)
+    if not failure_keys:
+        state.pop("failure_keys", None)
 
 
 def _acquire_automation_lock() -> _AutomationLock | None:
@@ -186,7 +300,7 @@ def _failure_retry_is_due(
 ) -> bool:
     if task not in state.get("errors", {}):
         return True
-    if state.get("retry_kind", {}).get(task) == "blocked":
+    if state.get("retry_kind", {}).get(task) in {"blocked", "content_blocked"}:
         return False
     retry_text = str(state.get("retry_after", {}).get(task, ""))
     if retry_text:
@@ -281,6 +395,14 @@ def _task_should_run(
     initial_detection_due: bool,
 ) -> bool:
     if task in state.get("errors", {}):
+        if state.get("retry_kind", {}).get(task) == "content_blocked":
+            previous_key = str(state.get("failure_keys", {}).get(task, ""))
+            current_key = _content_failure_key(task, now)
+            if not current_key or current_key == previous_key:
+                return False
+            _clear_task_error(state, task)
+            if not initial_detection_due:
+                return False
         if not _failure_retry_is_due(state, task, now):
             return False
     elif not initial_detection_due:
@@ -735,6 +857,7 @@ def automation_status_snapshot() -> dict:
         "last_detection_hour": state.get("last_detection_hour", ""),
         "retry_after": dict(state.get("retry_after", {})),
         "retry_kind": dict(state.get("retry_kind", {})),
+        "failure_counts": dict(state.get("failure_counts", {})),
         "errors": dict(state.get("errors", {})),
     }
 
