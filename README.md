@@ -68,46 +68,7 @@ Windows 交互终端使用按键事件等待和批量 Unicode 回显，不再通
 
 ## 配置
 
-编辑应用目录中的 `config.yaml`：
-
-```yaml
-models:
-  - name: deepseek-v4-pro
-    model_id: deepseek-v4-pro
-    api_url: https://api.deepseek.com/chat/completions
-    api_key: ""
-    search: false
-    json_mode: true
-    max_tokens: 32768
-
-current_model: deepseek-v4-pro
-
-third_search:
-  enabled: false
-  api_url: https://api.bocha.cn/v1/web-search
-  api_key: ""
-  count: 10                  # 程序上限为 10，减少低相关结果和上下文噪声
-  timeout: 30
-  max_rounds: 3
-
-diary_dir: ./Records
-analysis_dir: ./AnalysisReports
-log_dir: ./Log
-
-automation:
-  enabled: true
-  daily_summary: true
-  daily_information: true
-  daily_information_time: "08:05"
-  weekly_report: true
-  monthly_report: true
-```
-
-- `current_model` 用于手动总结、手动报告和自动任务。
-- 第三方搜索只在所选模型没有原生搜索能力时使用。
-- 使用第三方搜索时，中控把每个去隐私固定查询只执行一次，为结果分配 `W-*` 证据 ID；Researcher 只写证据 ID，中控校验后确定性渲染真实 URL。格式修订和 Reviewer 退回不会重复搜索，也不会让模型抄写或猜测链接。模型原生搜索保留兼容路径。
-- DeepSeek 官方接口支持 OpenAI JSON mode，示例已启用；使用其他兼容接口时需先确认其是否接受 `response_format: {type: json_object}`。
-- 相对目录以 `config.yaml` 所在目录为基准。
+配置项、默认值和注释见应用目录中的 [`config.yaml`](./config.yaml)。初次使用只需填写模型密钥并确认 `current_model`；所选模型没有原生搜索能力时，再配置 `third_search`。相对目录以配置文件所在目录为基准。
 
 ## 自动任务
 
@@ -159,10 +120,6 @@ AnalysisReports/
   Monthly/YYYY-MM_auto.md
 Log/AgentRecord.log
 ```
-
-`.analysis.sqlite3` 不记录 schema 版本，也不提供数据库迁移或旧结构兼容。数据库不存在时会按当前结构自动创建；结构不符合时程序拒绝使用，不会自动改写或删除。
-
-正常代码更新不需要删除数据库。本次报告工作流调整没有修改数据库结构。删除数据库不会破坏已经写成 Markdown 的报告正文、外部链接或其中的 `R-*` 来源索引，但会永久丢失运行审计、阶段缓存、跨周期人物画像和 `/f` 用户反馈；后两类信息不能保证仅从原始记录完整重建。因此只有出现明确的结构不兼容且确认无需保留这些派生状态时才应删除主库及同名 `-wal`、`-shm` 文件。
 
 ## 构建 Windows EXE
 
