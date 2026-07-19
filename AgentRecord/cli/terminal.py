@@ -86,11 +86,12 @@ def _redraw_line(prompt: str, characters: list[str], popped: str = "") -> None:
     old_width = new_width + (_display_width(popped) if popped else 1)
     old_rows = max(1, (old_width + terminal_width - 1) // terminal_width)
 
-    if old_rows > 1:
-        sys.stdout.write(f"\x1b[{old_rows - 1}A")
-    sys.stdout.write("\r")
-    sys.stdout.buffer.write(b"\x1b[0J")
-    sys.stdout.write(new_text)
+    move_up = f"\x1b[{old_rows - 1}A" if old_rows > 1 else ""
+    # Do not mix TextIOWrapper writes with direct ``buffer`` writes.  On
+    # Windows their buffering order is not guaranteed: the erase sequence can
+    # otherwise run before the carriage return and leave the final cell of a
+    # double-width Chinese character on screen.
+    sys.stdout.write(f"{move_up}\r\x1b[0J{new_text}")
     sys.stdout.flush()
 
 
@@ -103,10 +104,8 @@ def _show_notifications(prompt: str, characters: list[str]) -> None:
     )
     terminal_width = shutil.get_terminal_size().columns or 80
     current_rows = max(1, (current_width + terminal_width - 1) // terminal_width)
-    if current_rows > 1:
-        sys.stdout.write(f"\x1b[{current_rows - 1}A")
-    sys.stdout.write("\r")
-    sys.stdout.buffer.write(b"\x1b[0J")
+    move_up = f"\x1b[{current_rows - 1}A" if current_rows > 1 else ""
+    sys.stdout.write(f"{move_up}\r\x1b[0J")
     sys.stdout.flush()
     for message, style in notifications:
         console.print(message, style=style, markup=False)

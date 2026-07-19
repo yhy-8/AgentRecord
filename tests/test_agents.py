@@ -7,7 +7,12 @@ from AgentRecord.agents import (
     retrospective,
     reviewer,
 )
-from AgentRecord.agents.base import AgentPipelineError, _parse_json, _prompt
+from AgentRecord.agents.base import (
+    AgentPipelineError,
+    _parse_json,
+    _prompt,
+    cited_source_ids,
+)
 
 
 class AgentModuleTests(unittest.TestCase):
@@ -56,6 +61,17 @@ class AgentModuleTests(unittest.TestCase):
 
         self.assertEqual(markdown, result)
 
+    def test_record_range_citation_expands_for_review_context(self):
+        self.assertEqual(
+            {
+                "R-20260707-007",
+                "R-20260707-008",
+                "R-20260707-009",
+                "R-20260707-010",
+            },
+            cited_source_ids("采购过程 [R-20260707-007~010]"),
+        )
+
     def test_profile_update_requires_current_period_evidence(self):
         with self.assertRaisesRegex(AgentPipelineError, "本周期来源"):
             retrospective.validate(
@@ -84,8 +100,8 @@ class AgentModuleTests(unittest.TestCase):
                 "topics": [
                     {
                         "topic_id": "Q001",
-                        "title": "公开研究问题",
-                        "query": "研究 /mnt/private/a 和 12345678",
+                        "title": "公开研究问题 D:/private/title.txt",
+                        "query": "研究 /private/a 和 12345678",
                         "reason": "拓宽视野",
                         "origin": "records",
                         "source_refs": ["R-20260714-001"],
@@ -94,7 +110,8 @@ class AgentModuleTests(unittest.TestCase):
             },
             {"R-20260714-001"},
         )
-        self.assertNotIn("/mnt/private", topics[0]["query"])
+        self.assertNotIn("/private", topics[0]["query"])
+        self.assertNotIn("D:/private", topics[0]["title"])
         self.assertNotIn("12345678", topics[0]["query"])
 
     def test_researcher_requires_external_url(self):
@@ -112,6 +129,83 @@ class AgentModuleTests(unittest.TestCase):
                     }
                 ],
                 {"R-20260714-001"},
+            )
+
+    def test_researcher_accepts_equivalent_percent_encoded_markdown_url(self):
+        markdown, _ = researcher.validate(
+            {
+                "markdown": (
+                    "外部事实 [论文]"
+                    "(https://doi.org/10.1037%2F0022-006X.50.6.880)"
+                ),
+                "sources": [
+                    {
+                        "topic_id": "Q001",
+                        "title": "论文",
+                        "url": "https://doi.org/10.1037/0022-006X.50.6.880",
+                    }
+                ],
+            },
+            [{"topic_id": "Q001", "origin": "news", "source_refs": []}],
+            set(),
+        )
+
+        self.assertIn("%2F", markdown)
+
+    def test_researcher_requires_record_citation_for_each_driven_topic(self):
+        with self.assertRaisesRegex(AgentPipelineError, "Q002"):
+            researcher.validate(
+                {
+                    "markdown": (
+                        "Q001 [R-20260714-001] "
+                        "[来源](https://example.com/article_(one))"
+                    ),
+                    "sources": [
+                        {
+                            "topic_id": topic_id,
+                            "title": "来源",
+                            "url": "https://example.com/article_(one)",
+                        }
+                        for topic_id in ("Q001", "Q002")
+                    ],
+                },
+                [
+                    {
+                        "topic_id": "Q001",
+                        "origin": "records",
+                        "source_refs": ["R-20260714-001"],
+                    },
+                    {
+                        "topic_id": "Q002",
+                        "origin": "records",
+                        "source_refs": ["R-20260714-002"],
+                    },
+                ],
+                {"R-20260714-001", "R-20260714-002"},
+            )
+
+    def test_profile_cannot_be_superseded_twice_in_one_report(self):
+        entries = [
+            {
+                "temp_id": temp_id,
+                "category": "viewpoint",
+                "title": temp_id,
+                "statement": "更新",
+                "confidence": 0.8,
+                "source_refs": ["R-20260714-001"],
+                "supersedes_id": "profile-1",
+            }
+            for temp_id in ("p1", "p2")
+        ]
+        with self.assertRaisesRegex(AgentPipelineError, "多个候选"):
+            retrospective.validate(
+                {
+                    "markdown": "整理 [R-20260714-001]",
+                    "profile_entries": entries,
+                },
+                allowed_source_ids={"R-20260714-001"},
+                current_source_ids={"R-20260714-001"},
+                visible_profile_ids={"profile-1"},
             )
 
     def test_reviewer_must_decide_every_profile_entry(self):

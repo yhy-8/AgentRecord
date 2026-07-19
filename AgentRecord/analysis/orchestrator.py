@@ -33,7 +33,7 @@ from .store import AnalysisStore
 logger = logging.getLogger(__name__)
 _LONG_ID_PATTERN = re.compile(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])")
 _MAX_AGENT_ATTEMPTS = 3
-_PIPELINE_VERSION = 2
+_PIPELINE_VERSION = 3
 
 
 def _replace_id_substrings(value: object, replacements: dict[str, str]) -> object:
@@ -203,12 +203,51 @@ def _revision_context(
     source: str,
 ) -> dict:
     """Build the common correction suffix while keeping the original prompt stable."""
+    def model_visible(value: object) -> object:
+        if isinstance(value, dict):
+            return {
+                key: model_visible(item)
+                for key, item in value.items()
+                if not str(key).startswith("_")
+            }
+        if isinstance(value, list):
+            return [model_visible(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(model_visible(item) for item in value)
+        return value
+
     return {
         "attempt": attempt,
         "maximum_attempts": _MAX_AGENT_ATTEMPTS,
         "feedback_source": source,
-        "problems_to_fix": feedback,
-        "rejected_previous_output": previous_output,
+        "problems_to_fix": model_visible(feedback),
+        "rejected_previous_output": model_visible(previous_output),
+    }
+
+
+def _review_search_telemetry(telemetry: dict, sources: list[dict]) -> dict:
+    """Keep only evidence the draft actually cites for the Reviewer."""
+    source_keys = {researcher.canonical_url(source["url"]) for source in sources}
+    evidence = []
+    for item in telemetry.get("search_evidence", []):
+        if not isinstance(item, dict) or not item.get("url"):
+            continue
+        if researcher.canonical_url(str(item["url"])) not in source_keys:
+            continue
+        evidence.append(
+            {
+                "query": str(item.get("query", "")),
+                "title": str(item.get("title", "")),
+                "url": str(item["url"]),
+                "snippet": str(item.get("snippet", ""))[:800],
+                "published": str(item.get("published", "")),
+            }
+        )
+    return {
+        "tool_calls": telemetry.get("tool_calls", {}),
+        "search_results": telemetry.get("search_results", 0),
+        "search_queries": telemetry.get("search_queries", []),
+        "search_evidence": evidence,
     }
 
 
@@ -459,7 +498,7 @@ def _research_section(
         try:
             payload = _call_agent(
                 researcher.SPEC,
-                "逐项联网查证并生成领域探索与研究板块。",
+                "逐项联网查证并生成领域探索与研究板块；本次调用即使是修订稿也必须重新执行 web_search。",
                 research_input,
                 model_config,
                 store,
@@ -490,7 +529,7 @@ def _research_section(
             if not used_search:
                 raise AgentPipelineError("领域研究没有实际执行联网搜索")
             evidence_urls = {
-                str(item.get("url", "")).rstrip("/")
+                researcher.canonical_url(str(item.get("url", "")))
                 for item in telemetry.get("search_evidence", [])
                 if isinstance(item, dict) and item.get("url")
             }
@@ -498,7 +537,7 @@ def _research_section(
                 unsupported_urls = [
                     source["url"]
                     for source in sources
-                    if source["url"].rstrip("/") not in evidence_urls
+                    if researcher.canonical_url(source["url"]) not in evidence_urls
                 ]
                 if unsupported_urls:
                     raise AgentPipelineError(
@@ -527,7 +566,7 @@ def _research_section(
             {
                 "research_topics": topics,
                 "information_leads": information_leads,
-                "search_telemetry": telemetry,
+                "search_telemetry": _review_search_telemetry(telemetry, sources),
             },
             model_config,
             store,

@@ -239,6 +239,8 @@ class AnalysisStore:
         trigger = trigger or ("manual" if origin == "manual" else "scheduled")
         if trigger not in {"manual", "scheduled", "retry"}:
             raise ValueError(f"不支持的触发方式: {trigger}")
+        if (origin == "manual") != (trigger == "manual"):
+            raise ValueError("手动来源只能使用 manual 触发，自动来源不能使用 manual 触发")
         run_id = uuid.uuid4().hex
         with self.transaction() as connection:
             connection.execute(

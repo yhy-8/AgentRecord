@@ -34,6 +34,7 @@ jobs:
       - name: Build executable
         run: |
           pyinstaller --onefile --clean --name AgentRecord --hidden-import=yaml --exclude-module termios --exclude-module tty main.py
+          pyinstaller --onefile --clean --noconsole --name AgentRecordBackground --hidden-import=yaml --exclude-module termios --exclude-module tty main.py
           Copy-Item config.yaml dist\config.yaml
           dir dist\
 

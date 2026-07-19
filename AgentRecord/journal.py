@@ -72,6 +72,10 @@ def read_daily_log(
     summary_only: bool = False,
 ) -> str:
     if date:
+        try:
+            datetime.date.fromisoformat(date)
+        except (TypeError, ValueError):
+            return "本地系统提示：日期必须为 YYYY-MM-DD。"
         file_path = settings.DIARY_DIR / f"{date}.md"
         if not file_path.exists():
             return f"本地系统提示：找不到 {date} 的记录。"
@@ -240,7 +244,11 @@ def delete_last_record() -> bool:
         start = matches[-1].start()
         if start > 0 and content[start - 1] == "\n":
             start -= 1
-        file_path.write_text(content[:start].rstrip() + "\n\n", encoding="utf-8")
+        temp_path = file_path.with_suffix(
+            file_path.suffix + f".{uuid.uuid4().hex}.tmp"
+        )
+        temp_path.write_text(content[:start].rstrip() + "\n\n", encoding="utf-8")
+        temp_path.replace(file_path)
         return True
     finally:
         lock.release()

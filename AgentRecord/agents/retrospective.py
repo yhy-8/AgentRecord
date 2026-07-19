@@ -71,6 +71,7 @@ def validate(
         raise AgentPipelineError("Retrospective profile_entries 必须是不超过 12 项的数组")
     entries = []
     seen = set()
+    superseded = set()
     for raw in raw_entries:
         if not isinstance(raw, dict):
             raise AgentPipelineError("人物画像条目必须是对象")
@@ -94,6 +95,8 @@ def validate(
             raise AgentPipelineError("人物画像更新必须有本周期来源")
         if supersedes_id and supersedes_id not in visible_profile_ids:
             raise AgentPipelineError("人物画像尝试替代不可见条目")
+        if supersedes_id and supersedes_id in superseded:
+            raise AgentPipelineError("一次报告不能用多个候选替代同一人物画像")
         entries.append(
             {
                 "temp_id": temp_id,
@@ -106,4 +109,6 @@ def validate(
             }
         )
         seen.add(temp_id)
+        if supersedes_id:
+            superseded.add(supersedes_id)
     return markdown.strip(), entries

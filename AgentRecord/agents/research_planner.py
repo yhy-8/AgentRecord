@@ -23,7 +23,9 @@ def _sanitize(text: str, limit: int) -> str:
     value = re.sub(r"[\w.+-]+@[\w.-]+", "[email]", text)
     value = re.sub(r"(?<!\d)\d{7,}(?!\d)", "[number]", value)
     value = re.sub(
-        r"(?:[A-Za-z]:\\|/home/|/Users/|/mnt/)[^\s]+", "[local-path]", value
+        r"(?:(?<!\w)[A-Za-z]:[\\/]|(?<![:/\w])/(?!/))[^\s]+",
+        "[local-path]",
+        value,
     )
     return value.strip()[:limit]
 
@@ -38,7 +40,7 @@ def validate(payload: dict, allowed_source_ids: set[str]) -> list[dict]:
         if not isinstance(raw, dict):
             raise AgentPipelineError("研究主题必须是对象")
         topic_id = str(raw.get("topic_id", "")).strip()
-        title = str(raw.get("title", "")).strip()
+        title = _sanitize(str(raw.get("title", "")), 200)
         query = _sanitize(str(raw.get("query", "")), 240)
         reason = _sanitize(str(raw.get("reason", "")), 500)
         origin = str(raw.get("origin", "")).strip()

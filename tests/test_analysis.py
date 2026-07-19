@@ -422,6 +422,41 @@ class AnalysisWorkflowTests(unittest.TestCase):
             "删除无依据判断", correction["problems_to_fix"]["required_changes"]
         )
 
+    def test_revision_context_does_not_echo_large_internal_telemetry(self):
+        correction = orchestrator._revision_context(
+            2,
+            {
+                "markdown": "原稿",
+                "_telemetry": {"search_evidence": [{"snippet": "x" * 10000}]},
+            },
+            ["链接需修正"],
+            source="中控确定性校验",
+        )
+
+        self.assertEqual(
+            {"markdown": "原稿"}, correction["rejected_previous_output"]
+        )
+
+    def test_reviewer_receives_only_evidence_used_by_draft(self):
+        telemetry = {
+            "tool_calls": {"web_search": 1},
+            "search_results": 25,
+            "search_queries": ["查询"],
+            "search_evidence": [
+                {"url": "https://example.com/used", "snippet": "支持稿件"},
+                {"url": "https://example.com/unused", "snippet": "无关结果"},
+            ],
+        }
+        compact = orchestrator._review_search_telemetry(
+            telemetry,
+            [{"url": "https://example.com/used", "topic_id": "Q001"}],
+        )
+
+        self.assertEqual(1, len(compact["search_evidence"]))
+        self.assertEqual(
+            "https://example.com/used", compact["search_evidence"][0]["url"]
+        )
+
     def test_invalid_agent_json_fails_without_a_repair_call(self):
         parse_error = AgentPipelineError(
             "Agent JSON 无法解析: test",
@@ -724,6 +759,35 @@ class AnalysisWorkflowTests(unittest.TestCase):
         self.assertIn("@reboot", cron_input)
         self.assertIn("* * * * *", cron_input)
         self.assertIn(" minute", cron_input)
+
+    def test_windows_frozen_automation_uses_windowless_companion(self):
+        root = Path(self.temp_dir.name)
+        foreground = root / "AgentRecord.exe"
+        background = root / "AgentRecordBackground.exe"
+        foreground.touch()
+        background.touch()
+
+        with patch.object(automation, "_is_windows", return_value=True), patch.object(
+            automation.sys, "executable", str(foreground)
+        ), patch.object(automation.sys, "frozen", True, create=True):
+            command = automation._automation_command()
+
+        self.assertEqual(str(background), command[0])
+
+    def test_windows_status_rejects_old_windowed_task_action(self):
+        result = Mock(
+            returncode=0,
+            stdout="<Task><Actions><Exec><Command>C:\\AgentRecord.exe</Command>"
+            "</Exec></Actions></Task>",
+            stderr="",
+        )
+        with patch.object(automation, "_is_windows", return_value=True), patch.object(
+            automation.subprocess, "run", return_value=result
+        ):
+            installed, message = automation.system_automation_status()
+
+        self.assertFalse(installed)
+        self.assertIn("旧入口", message)
 
 
 if __name__ == "__main__":

@@ -281,6 +281,23 @@ class MainCommandTests(unittest.TestCase):
         self.assertEqual("utf-8", stderr.encoding.lower())
         self.assertEqual("选择日记", stdout_bytes.getvalue().decode("utf-8"))
 
+    def test_windows_backspace_removes_one_chinese_character(self):
+        output = io.BytesIO()
+        stream = io.TextIOWrapper(output, encoding="utf-8")
+        windows_console = Mock()
+        windows_console.kbhit.return_value = True
+        windows_console.getwch.side_effect = ["中", "\x08", "\r"]
+
+        with patch.object(terminal, "msvcrt", windows_console, create=True), patch.object(
+            terminal.sys, "stdout", stream
+        ):
+            value = terminal._safe_input_windows(">> ")
+            stream.flush()
+
+        self.assertEqual("", value)
+        rendered = output.getvalue().decode("utf-8")
+        self.assertIn("\r\x1b[0J>> ", rendered)
+
     @patch("AgentRecord.cli.app.journal.append_log")
     @patch("AgentRecord.cli.app.show_help")
     @patch(

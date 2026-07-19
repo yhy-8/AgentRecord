@@ -90,6 +90,11 @@ class JournalTests(unittest.TestCase):
         self.assertIn("先前记录", content)
         self.assertNotIn("关联想法", content)
 
+    def test_tool_date_cannot_escape_diary_directory(self):
+        message = journal.read_daily_log(date="../Docs/设计基线")
+
+        self.assertIn("YYYY-MM-DD", message)
+
 
 if __name__ == "__main__":
     unittest.main()

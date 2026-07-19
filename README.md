@@ -29,7 +29,7 @@ Windows 打包版：
 AgentRecord.exe
 ```
 
-Windows 版 `AgentRecord.exe` 和 `config.yaml` 应放在同一目录。
+Windows 版 `AgentRecord.exe`、`AgentRecordBackground.exe` 和 `config.yaml` 应放在同一目录。后台专用程序没有控制台窗口，不要单独启动。
 
 ## 记录模式
 
@@ -160,7 +160,8 @@ GitHub Actions 在每次 `push` 时自动构建 Windows 产物，也支持手动
 
 ```powershell
 pyinstaller --onefile --name AgentRecord main.py
+pyinstaller --onefile --noconsole --name AgentRecordBackground main.py
 Copy-Item config.yaml dist\config.yaml
 ```
 
-最终分发 `dist` 中的 `AgentRecord.exe` 和 `config.yaml`。
+最终分发 `dist` 中的两个 EXE 和 `config.yaml`。更新时必须同时替换两个 EXE，并重新安装自动任务。

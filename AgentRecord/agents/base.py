@@ -63,6 +63,23 @@ def cited_source_ids(markdown: str) -> set[str]:
     refs: set[str] = set()
     for citation in re.findall(r"\[([^\]\n]+)\]", markdown):
         refs.update(re.findall(r"R-\d{8}-\d{3}", citation))
+        for match in re.finditer(
+            r"R-(\d{8})-(\d{3})\s*(?:~|～|–|—|至)\s*"
+            r"(?:(?:R-(\d{8})-)?(\d{3}))",
+            citation,
+        ):
+            start_date, start_text, end_date, end_text = match.groups()
+            if end_date and end_date != start_date:
+                continue
+            start_number = int(start_text)
+            end_number = int(end_text)
+            # A range is only shorthand within one diary.  Bound expansion so
+            # malformed model output cannot create an enormous review context.
+            if start_number <= end_number and end_number - start_number <= 200:
+                refs.update(
+                    f"R-{start_date}-{number:03d}"
+                    for number in range(start_number, end_number + 1)
+                )
     return refs
 
 

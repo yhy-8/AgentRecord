@@ -57,6 +57,18 @@ class AnalysisStoreTests(unittest.TestCase):
         self.assertIn("profile_entries", tables)
         self.assertNotIn("knowledge_edges", tables)
 
+    def test_manual_origin_cannot_use_automatic_trigger(self):
+        with self.assertRaisesRegex(ValueError, "manual"):
+            self.store.start_run(
+                "weekly",
+                "2026-07-13",
+                "2026-07-19",
+                "manual",
+                "mock",
+                "input-hash",
+                trigger="retry",
+            )
+
     def test_source_catalog_keeps_location_hash_and_excerpt(self):
         run_id = self.start_run()
         self.save_source(run_id)

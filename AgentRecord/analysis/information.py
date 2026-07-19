@@ -8,7 +8,8 @@ import re
 from pathlib import Path
 
 from .. import settings
-from ..ai_client import call_ai, web_search_available
+from ..agents.researcher import canonical_url, markdown_urls
+from ..ai_client import call_ai, response_telemetry, web_search_available
 from .context import _existing_logs, _period_records
 
 
@@ -64,7 +65,9 @@ def _sanitize_text(text: str, limit: int) -> str:
     value = re.sub(r"[\w.+-]+@[\w.-]+", "[email]", text)
     value = re.sub(r"(?<!\d)\d{7,}(?!\d)", "[number]", value)
     value = re.sub(
-        r"(?:[A-Za-z]:\\|/home/|/Users/|/mnt/)[^\s]+", "[local-path]", value
+        r"(?:(?<!\w)[A-Za-z]:[\\/]|(?<![:/\w])/(?!/))[^\s]+",
+        "[local-path]",
+        value,
     )
     return value.strip()[:limit]
 
@@ -250,12 +253,19 @@ def _has_five_daily_highlights(markdown: str) -> bool:
     return numbers == ["1", "2", "3", "4", "5"]
 
 
-def _briefing_errors(markdown: str, used_search: bool) -> list[str]:
+def _briefing_errors(
+    markdown: str,
+    used_search: bool,
+    evidence_urls: set[tuple] | None = None,
+) -> list[str]:
     errors = []
     if not used_search:
         errors.append("没有实际执行联网搜索")
     if not re.search(r"https?://", markdown):
         errors.append("没有可验证的来源链接")
+    linked_urls = markdown_urls(markdown)
+    if evidence_urls and linked_urls - evidence_urls:
+        errors.append("正文包含未出现在本轮搜索证据中的 URL")
     if markdown.lstrip().startswith(("```", "# ")):
         errors.append("输出包含代码围栏或一级标题")
     required_sections = (
@@ -298,7 +308,7 @@ def generate_information_briefing(
         *targeted,
     ]
     prompt = f"""[程序每日信息收集任务]
-今天是 {date:%Y-%m-%d}。你必须使用 web_search 逐项搜索下列查询，生成一份可独立阅读的中文信息简报。
+今天是 {date:%Y-%m-%d}。你必须使用 web_search 逐项搜索下列查询，生成一份可独立阅读的中文信息简报。每次输出（包括修订稿）都必须重新执行联网搜索。
 
 要求：
 - 只收录具有较高信息量、可验证且对理解变化有价值的内容，不做热搜堆砌。
@@ -337,10 +347,16 @@ def generate_information_briefing(
         markdown, success, citations, tool_counts, result_count = response
         if not success:
             return markdown, False, None
+        telemetry = response_telemetry(response)
+        evidence_urls = {
+            canonical_url(str(item.get("url", "")))
+            for item in telemetry.get("search_evidence", [])
+            if isinstance(item, dict) and item.get("url")
+        }
         used_search = bool(
             citations or result_count
         )
-        errors = _briefing_errors(markdown, used_search)
+        errors = _briefing_errors(markdown, used_search, evidence_urls)
         if not errors:
             break
         if attempt == _MAX_MODEL_ATTEMPTS:

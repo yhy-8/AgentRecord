@@ -4,6 +4,7 @@ import datetime
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -620,12 +621,23 @@ def launch_automation_retry() -> tuple[bool, str]:
 _CRON_MARKER = "# AgentRecord automation"
 _WINDOWS_MINUTE_TASK_NAME = "AgentRecord Automation"
 _WINDOWS_LOGON_TASK_NAME = "AgentRecord Automation Logon"
+_WINDOWS_BACKGROUND_EXECUTABLE = "AgentRecordBackground.exe"
 
 
 def _automation_command(action: str = "--run-automation") -> list[str]:
     if getattr(sys, "frozen", False):
-        return [sys.executable, action]
-    return [sys.executable, str(settings.CONFIG_DIR / "main.py"), action]
+        executable = Path(sys.executable)
+        if _is_windows():
+            background = executable.with_name(_WINDOWS_BACKGROUND_EXECUTABLE)
+            if background.is_file():
+                executable = background
+        return [str(executable), action]
+    executable = Path(sys.executable)
+    if _is_windows():
+        pythonw = executable.with_name("pythonw.exe")
+        if pythonw.is_file():
+            executable = pythonw
+    return [str(executable), str(settings.CONFIG_DIR / "main.py"), action]
 
 
 def _is_windows() -> bool:
@@ -638,7 +650,7 @@ def system_automation_status() -> tuple[bool, str]:
         if _is_windows():
             results = [
                 subprocess.run(
-                    ["schtasks", "/Query", "/TN", task_name],
+                    ["schtasks", "/Query", "/TN", task_name, "/XML"],
                     capture_output=True,
                     text=True,
                     timeout=30,
@@ -650,6 +662,26 @@ def system_automation_status() -> tuple[bool, str]:
             ]
             installed_count = sum(result.returncode == 0 for result in results)
             if installed_count == len(results):
+                commands = [
+                    re_match.group(1).strip()
+                    for result in results
+                    if (
+                        re_match := re.search(
+                            r"<(?:\w+:)?Command>(.*?)</(?:\w+:)?Command>",
+                            result.stdout,
+                            re.IGNORECASE | re.DOTALL,
+                        )
+                    )
+                ]
+                allowed_names = {
+                    _WINDOWS_BACKGROUND_EXECUTABLE.casefold(),
+                    "pythonw.exe",
+                }
+                if len(commands) != len(results) or any(
+                    Path(command).name.casefold() not in allowed_names
+                    for command in commands
+                ):
+                    return False, "系统自动任务仍指向有窗口的旧入口，请重新安装。"
                 return True, "系统自动任务已安装；每分钟唤醒调度器检查到期任务。"
             if installed_count:
                 return False, "系统自动任务安装不完整，请重新执行安装命令。"
@@ -712,6 +744,15 @@ def install_system_automation() -> tuple[bool, str]:
     try:
         command = _automation_command()
         if _is_windows():
+            if Path(command[0]).name.casefold() not in {
+                _WINDOWS_BACKGROUND_EXECUTABLE.casefold(),
+                "pythonw.exe",
+            }:
+                return (
+                    False,
+                    f"缺少无窗口后台入口 {_WINDOWS_BACKGROUND_EXECUTABLE}，"
+                    "请将它与 AgentRecord.exe 放在同一目录后重试。",
+                )
             task_command = subprocess.list2cmdline(command)
             schedules = (
                 (_WINDOWS_MINUTE_TASK_NAME, "MINUTE"),
@@ -778,7 +819,7 @@ def uninstall_system_automation() -> tuple[bool, str]:
     """卸载由 AgentRecord 创建的用户级系统任务。"""
     try:
         if _is_windows():
-            results = [
+            delete_results = [
                 subprocess.run(
                     ["schtasks", "/Delete", "/TN", task_name, "/F"],
                     capture_output=True,
@@ -790,17 +831,30 @@ def uninstall_system_automation() -> tuple[bool, str]:
                     _WINDOWS_LOGON_TASK_NAME,
                 )
             ]
-            if all(result.returncode != 0 for result in results):
-                result = results[0]
+            remaining = [
+                subprocess.run(
+                    ["schtasks", "/Query", "/TN", task_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                for task_name in (
+                    _WINDOWS_MINUTE_TASK_NAME,
+                    _WINDOWS_LOGON_TASK_NAME,
+                )
+            ]
+            if any(result.returncode == 0 for result in remaining):
+                result = next(
+                    (result for result in delete_results if result.returncode != 0),
+                    next(result for result in remaining if result.returncode == 0),
+                )
                 return (
                     False,
                     result.stderr.strip()
                     or result.stdout.strip()
-                    or "未找到可卸载的系统后台任务。",
+                    or "系统后台任务未能完全卸载。",
                 )
-            result = next(
-                result for result in results if result.returncode == 0
-            )
+            result = subprocess.CompletedProcess([], 0, "", "")
         else:
             current = subprocess.run(
                 ["crontab", "-l"], capture_output=True, text=True, timeout=30

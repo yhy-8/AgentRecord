@@ -195,6 +195,15 @@ class InformationBriefingTests(unittest.TestCase):
         )
         self.assertFalse(information._has_five_daily_highlights(only_four))
 
+    def test_briefing_rejects_links_absent_from_search_evidence(self):
+        errors = information._briefing_errors(
+            self.valid_briefing(),
+            True,
+            {information.canonical_url("https://example.com/1")},
+        )
+
+        self.assertTrue(any("搜索证据" in error for error in errors))
+
     def test_invalid_briefing_is_revised_with_original_draft_and_reason(self):
         date = datetime.date(2026, 7, 15)
         responses = [
@@ -243,6 +252,15 @@ class InformationBriefingTests(unittest.TestCase):
             ["个人知识管理 Obsidian 插件安全事件影响"],
             [item["query"] for item in result],
         )
+
+    def test_privacy_sanitizer_removes_paths_without_damaging_urls(self):
+        value = information._sanitize_text(
+            "参考 https://example.com/article，私有文件 /private/note.md",
+            300,
+        )
+
+        self.assertIn("https://example.com/article", value)
+        self.assertNotIn("/private/note.md", value)
 
     def test_prior_briefings_exclude_target_date_and_previous_week(self):
         directory = settings.ANALYSIS_DIR / "Information"
