@@ -53,6 +53,7 @@ _NOTIFICATIONS: queue.SimpleQueue[tuple[str, str | None]] = queue.SimpleQueue()
 
 RECORD_MODE = "record"
 REPORT_MODE = "report"
+_WINDOWS_NOTIFICATION_INTERVAL_MS = 50
 
 
 def post_notification(message: str, style: str | None = None) -> None:
@@ -111,6 +112,42 @@ def _show_notifications(prompt: str, characters: list[str]) -> None:
         console.print(message, style=style, markup=False)
     sys.stdout.write(prompt + "".join(characters))
     sys.stdout.flush()
+
+
+def _wait_for_windows_input(timeout_ms: int = _WINDOWS_NOTIFICATION_INTERVAL_MS) -> None:
+    """Wait for console input without adding polling latency to the next key."""
+    try:
+        input_handle = msvcrt.get_osfhandle(sys.stdin.fileno())
+        result = ctypes.windll.kernel32.WaitForSingleObject(
+            ctypes.c_void_p(input_handle), timeout_ms
+        )
+        # A console can also signal for a resize or key-up event.  Avoid a hot
+        # loop when that event does not make a character available to getwch.
+        if result not in (0, 258) or (result == 0 and not msvcrt.kbhit()):
+            time.sleep(0.005)
+    except (AttributeError, OSError, TypeError, ValueError):
+        # Redirected streams and unusual hosts may not expose a waitable
+        # console handle.  Keep the previous bounded polling as a fallback.
+        time.sleep(timeout_ms / 1000)
+
+
+def _windows_character() -> str:
+    """Read one Unicode character, joining a UTF-16 surrogate pair if needed."""
+    character = msvcrt.getwch()
+    codepoint = ord(character)
+    if 0xD800 <= codepoint <= 0xDBFF:
+        trailing = msvcrt.getwch()
+        trailing_codepoint = ord(trailing)
+        if 0xDC00 <= trailing_codepoint <= 0xDFFF:
+            return chr(
+                0x10000
+                + ((codepoint - 0xD800) << 10)
+                + (trailing_codepoint - 0xDC00)
+            )
+        return ""
+    if 0xDC00 <= codepoint <= 0xDFFF:
+        return ""
+    return character
 
 
 def _safe_input_unix(prompt: str) -> str:
@@ -188,41 +225,56 @@ def _safe_input_windows(prompt: str) -> str:
     while True:
         if not msvcrt.kbhit():
             _show_notifications(prompt, characters)
-            time.sleep(0.05)
+            _wait_for_windows_input()
             continue
-        character = msvcrt.getwch()
-        if character in ("\r", "\n"):
-            sys.stdout.write("\r\n")
-            sys.stdout.flush()
-            break
-        if character == "\x08":
-            if characters:
-                _redraw_line(prompt, characters, characters.pop())
-            continue
-        if character == "\x03":
-            sys.stdout.write("^C\r\n")
-            sys.stdout.flush()
-            raise KeyboardInterrupt()
-        if character == "\x1a":
-            if not characters:
-                sys.stdout.write("^Z\r\n")
+
+        pending_echo: list[str] = []
+        while msvcrt.kbhit():
+            character = _windows_character()
+            if not character:
+                continue
+            if character in ("\r", "\n"):
+                sys.stdout.write("".join(pending_echo) + "\r\n")
                 sys.stdout.flush()
-                raise EOFError()
-            continue
-        if character in ("\x00", "\xe0"):
-            msvcrt.getwch()
-            continue
-        if character == "\x1b":
-            time.sleep(0.03)
-            while msvcrt.kbhit():
+                return "".join(characters)
+            if character == "\x08":
+                if pending_echo:
+                    sys.stdout.write("".join(pending_echo))
+                    sys.stdout.flush()
+                    pending_echo.clear()
+                if characters:
+                    _redraw_line(prompt, characters, characters.pop())
+                continue
+            if character == "\x03":
+                sys.stdout.write("".join(pending_echo) + "^C\r\n")
+                sys.stdout.flush()
+                raise KeyboardInterrupt()
+            if character == "\x1a":
+                if not characters:
+                    sys.stdout.write("^Z\r\n")
+                    sys.stdout.flush()
+                    raise EOFError()
+                continue
+            if character in ("\x00", "\xe0"):
                 msvcrt.getwch()
-            continue
-        if ord(character) < 0x20 or ord(character) == 0x7F:
-            continue
-        characters.append(character)
-        sys.stdout.write(character)
-        sys.stdout.flush()
-    return "".join(characters)
+                continue
+            if character == "\x1b":
+                if pending_echo:
+                    sys.stdout.write("".join(pending_echo))
+                    sys.stdout.flush()
+                    pending_echo.clear()
+                time.sleep(0.03)
+                while msvcrt.kbhit():
+                    msvcrt.getwch()
+                continue
+            if ord(character) < 0x20 or ord(character) == 0x7F:
+                continue
+            characters.append(character)
+            pending_echo.append(character)
+
+        if pending_echo:
+            sys.stdout.write("".join(pending_echo))
+            sys.stdout.flush()
 
 
 def safe_input(prompt: str = "") -> str:

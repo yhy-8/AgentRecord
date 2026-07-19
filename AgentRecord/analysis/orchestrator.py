@@ -251,6 +251,47 @@ def _review_search_telemetry(telemetry: dict, sources: list[dict]) -> dict:
     }
 
 
+def _merge_search_evidence(
+    accumulated: dict[tuple, dict], telemetry: dict
+) -> None:
+    """Retain auditable search results across bounded revisions in one run."""
+    for item in telemetry.get("search_evidence", []):
+        if not isinstance(item, dict) or not item.get("url"):
+            continue
+        url_key = researcher.canonical_url(str(item["url"]))
+        if url_key[0] not in {"http", "https"} or not url_key[1]:
+            continue
+        accumulated.setdefault(url_key, item)
+
+
+def _verified_source_options(
+    topics: list[dict], evidence: list[dict], *, per_topic: int = 8
+) -> list[dict]:
+    """Return a compact exact-URL whitelist to guide a rejected revision."""
+    results = []
+    for topic in topics:
+        query_key = re.sub(r"\s+", " ", topic["query"].strip()).casefold()
+        options = []
+        seen = set()
+        for item in evidence:
+            item_query = re.sub(
+                r"\s+", " ", str(item.get("query", "")).strip()
+            ).casefold()
+            url = str(item.get("url", "")).strip()
+            url_key = researcher.canonical_url(url)
+            if not url or item_query != query_key or url_key in seen:
+                continue
+            # Only echo the exact URL.  Titles and snippets are untrusted web
+            # text and must not be promoted into the controller's revision
+            # instructions.
+            options.append({"url": url})
+            seen.add(url_key)
+            if len(options) >= per_topic:
+                break
+        results.append({"topic_id": topic["topic_id"], "sources": options})
+    return results
+
+
 def _validated_agent_call(
     spec,
     task: str,
@@ -494,6 +535,7 @@ def _research_section(
     revision_context = None
     last_feedback: list[str] = []
     review_attempt_budget = [_MAX_AGENT_ATTEMPTS]
+    accumulated_evidence: dict[tuple, dict] = {}
     for attempt in range(1, _MAX_AGENT_ATTEMPTS + 1):
         try:
             payload = _call_agent(
@@ -507,20 +549,27 @@ def _research_section(
                 allowed_search_queries=[topic["query"] for topic in topics],
             )
         except AgentOutputError as error:
+            _merge_search_evidence(accumulated_evidence, error.telemetry)
             if attempt == _MAX_AGENT_ATTEMPTS:
                 raise
             revision_context = _revision_context(
                 attempt + 1,
                 error.response,
-                [str(error)],
+                {
+                    "validation_error": str(error),
+                    "verified_source_options": _verified_source_options(
+                        topics, list(accumulated_evidence.values())
+                    ),
+                },
                 source="中控 JSON 解析",
             )
             continue
+        telemetry = payload.get("_telemetry", {})
+        _merge_search_evidence(accumulated_evidence, telemetry)
         try:
             markdown, sources = researcher.validate(
                 payload, topics, current_source_ids
             )
-            telemetry = payload.get("_telemetry", {})
             used_search = bool(
                 telemetry.get("web_citations", 0)
                 or telemetry.get("search_results", 0)
@@ -528,11 +577,7 @@ def _research_section(
             )
             if not used_search:
                 raise AgentPipelineError("领域研究没有实际执行联网搜索")
-            evidence_urls = {
-                researcher.canonical_url(str(item.get("url", "")))
-                for item in telemetry.get("search_evidence", [])
-                if isinstance(item, dict) and item.get("url")
-            }
+            evidence_urls = set(accumulated_evidence)
             if evidence_urls:
                 unsupported_urls = [
                     source["url"]
@@ -553,11 +598,20 @@ def _research_section(
             revision_context = _revision_context(
                 attempt + 1,
                 payload,
-                [str(error)],
+                {
+                    "validation_error": str(error),
+                    "verified_source_options": _verified_source_options(
+                        topics, list(accumulated_evidence.values())
+                    ),
+                },
                 source="中控确定性校验",
             )
             continue
 
+        telemetry = {
+            **telemetry,
+            "search_evidence": list(accumulated_evidence.values()),
+        }
         normalized_payload = {"markdown": markdown, "sources": sources}
         passed, _, last_feedback, review_payload = _review(
             "research_review",

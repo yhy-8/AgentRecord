@@ -457,6 +457,87 @@ class AnalysisWorkflowTests(unittest.TestCase):
             "https://example.com/used", compact["search_evidence"][0]["url"]
         )
 
+    def test_research_revision_receives_exact_verified_source_options(self):
+        options = orchestrator._verified_source_options(
+            [{"topic_id": "Q001", "query": "Public Query"}],
+            [
+                {
+                    "query": "  public   query ",
+                    "title": "可核查来源",
+                    "url": "https://example.com/exact",
+                    "published": "2026-07-01",
+                },
+                {
+                    "query": "另一查询",
+                    "title": "无关来源",
+                    "url": "https://example.com/other",
+                },
+            ],
+        )
+
+        self.assertEqual(
+            "https://example.com/exact", options[0]["sources"][0]["url"]
+        )
+        self.assertEqual(1, len(options[0]["sources"]))
+
+    def test_research_revision_can_reuse_prior_audited_url_after_researching(self):
+        topics = [
+            {
+                "topic_id": "Q001",
+                "title": "公开主题",
+                "query": "公开查询",
+                "reason": "研究",
+                "origin": "news",
+                "source_refs": [],
+            }
+        ]
+        prior_url = "https://example.com/prior"
+        first = {
+            "markdown": "第一稿没有使用来源。",
+            "sources": [
+                {"topic_id": "Q001", "title": "来源", "url": prior_url}
+            ],
+            "_telemetry": {
+                "search_results": 1,
+                "search_evidence": [
+                    {"query": "公开查询", "title": "来源", "url": prior_url}
+                ],
+            },
+        }
+        second = {
+            "markdown": f"修订稿使用已审计来源 [来源]({prior_url})。",
+            "sources": [
+                {"topic_id": "Q001", "title": "来源", "url": prior_url}
+            ],
+            "_telemetry": {
+                "search_results": 1,
+                "search_evidence": [
+                    {
+                        "query": "公开查询",
+                        "title": "本轮另一结果",
+                        "url": "https://example.com/current",
+                    }
+                ],
+            },
+        }
+        store = Mock()
+
+        with patch.object(
+            orchestrator, "_call_agent", side_effect=[first, second]
+        ) as call_agent, patch.object(
+            orchestrator,
+            "_review",
+            return_value=(True, {}, [], {"pass": True}),
+        ):
+            markdown = orchestrator._research_section(
+                topics, "", set(), {"name": "mock"}, store, "run-id"
+            )
+
+        self.assertIn(prior_url, markdown)
+        correction = call_agent.call_args_list[1].kwargs["revision_context"]
+        whitelist = correction["problems_to_fix"]["verified_source_options"]
+        self.assertEqual(prior_url, whitelist[0]["sources"][0]["url"])
+
     def test_invalid_agent_json_fails_without_a_repair_call(self):
         parse_error = AgentPipelineError(
             "Agent JSON 无法解析: test",

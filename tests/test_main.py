@@ -298,6 +298,40 @@ class MainCommandTests(unittest.TestCase):
         rendered = output.getvalue().decode("utf-8")
         self.assertIn("\r\x1b[0J>> ", rendered)
 
+    def test_windows_input_wait_wakes_without_fixed_polling_sleep(self):
+        windows_console = Mock()
+        windows_console.get_osfhandle.return_value = 123
+        windows_console.kbhit.return_value = True
+        kernel32 = Mock()
+        kernel32.WaitForSingleObject.return_value = 0
+        windll = Mock(kernel32=kernel32)
+        stdin = Mock()
+        stdin.fileno.return_value = 0
+
+        with patch.object(terminal, "msvcrt", windows_console, create=True), patch.object(
+            terminal.ctypes, "windll", windll, create=True
+        ), patch.object(terminal.sys, "stdin", stdin), patch.object(
+            terminal.time, "sleep"
+        ) as sleep:
+            terminal._wait_for_windows_input()
+
+        kernel32.WaitForSingleObject.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_windows_ime_commit_is_echoed_in_one_batch(self):
+        windows_console = Mock()
+        windows_console.kbhit.side_effect = [True, True, True, True]
+        windows_console.getwch.side_effect = ["中", "文", "\r"]
+        stream = Mock()
+
+        with patch.object(terminal, "msvcrt", windows_console, create=True), patch.object(
+            terminal.sys, "stdout", stream
+        ):
+            value = terminal._safe_input_windows(">> ")
+
+        self.assertEqual("中文", value)
+        self.assertEqual([">> ", "中文\r\n"], [call.args[0] for call in stream.write.call_args_list])
+
     @patch("AgentRecord.cli.app.journal.append_log")
     @patch("AgentRecord.cli.app.show_help")
     @patch(

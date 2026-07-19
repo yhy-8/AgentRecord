@@ -50,9 +50,27 @@ def _parse_json(text: str) -> dict:
     try:
         value = json.loads(stripped)
     except json.JSONDecodeError as error:
-        raise AgentOutputError(
-            f"Agent JSON 无法解析: {error}", response=text
-        ) from error
+        # Some OpenAI-compatible endpoints occasionally append a lone quote or
+        # closing Markdown fence after an otherwise complete JSON object.  This
+        # is unambiguous to recover, unlike extracting JSON from explanatory
+        # prose or attempting to repair malformed content.
+        if error.msg == "Extra data":
+            try:
+                value, end = json.JSONDecoder().raw_decode(stripped)
+            except json.JSONDecodeError:
+                value, end = None, 0
+            trailing = stripped[end:].strip()
+            if not (
+                isinstance(value, dict)
+                and re.fullmatch(r"(?:[`'\"}\]]|\s)*", trailing)
+            ):
+                raise AgentOutputError(
+                    f"Agent JSON 无法解析: {error}", response=text
+                ) from error
+        else:
+            raise AgentOutputError(
+                f"Agent JSON 无法解析: {error}", response=text
+            ) from error
     if not isinstance(value, dict):
         raise AgentOutputError("Agent JSON 顶层必须是对象", response=text)
     return value

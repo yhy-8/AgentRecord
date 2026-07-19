@@ -118,6 +118,89 @@ class JournalAITests(unittest.TestCase):
         self.assertEqual(["私自改写的查询"], response.telemetry["rejected_search_queries"])
         self.assertEqual(0, response.search_results)
 
+    @patch("AgentRecord.ai_client.execute_tool")
+    @patch("AgentRecord.ai_client.requests.post")
+    def test_duplicate_search_query_reuses_previous_result(self, post, execute_tool):
+        settings.CONFIG["third_search"] = {
+            "enabled": True,
+            "api_key": "search-key",
+            "max_rounds": 3,
+        }
+        tool_message = lambda call_id: FakeResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": "web_search",
+                                        "arguments": '{"query":"同一查询"}',
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        )
+        post.side_effect = [
+            tool_message("search-1"),
+            tool_message("search-2"),
+            FakeResponse(
+                {"choices": [{"message": {"role": "assistant", "content": "{}"}}]}
+            ),
+        ]
+        execute_tool.return_value = ai_client.ToolResult("首次结果", 10)
+
+        response = ai_client.call_ai(
+            "研究",
+            self.model,
+            allowed_tools={"web_search"},
+            allowed_search_queries=["同一查询"],
+        )
+
+        self.assertTrue(response.success)
+        self.assertEqual(1, execute_tool.call_count)
+        self.assertEqual(10, response.search_results)
+        self.assertEqual(["同一查询"], response.telemetry["duplicate_search_queries"])
+
+    @patch("AgentRecord.ai_client._post_with_transient_retry")
+    def test_third_party_search_caps_noisy_result_count(self, request):
+        settings.CONFIG["third_search"] = {
+            "enabled": True,
+            "api_key": "search-key",
+            "api_url": "https://search.example.test",
+            "count": 25,
+        }
+        request.return_value = FakeResponse(
+            {
+                "code": 200,
+                "data": {
+                    "webPages": {
+                        "value": [
+                            {
+                                "name": f"结果 {index}",
+                                "url": f"https://example.com/{index}",
+                                "snippet": "摘要",
+                            }
+                            for index in range(15)
+                        ]
+                    }
+                },
+            }
+        )
+
+        result = ai_client.bocha_search("公开查询")
+
+        self.assertEqual(10, result.result_count)
+        self.assertEqual(10, len(result.evidence))
+        self.assertEqual(10, request.call_args.kwargs["json"]["count"])
+
     @patch("AgentRecord.ai_client.requests.post")
     def test_central_permission_can_remove_all_tools(self, post):
         post.return_value = FakeResponse(
@@ -133,6 +216,20 @@ class JournalAITests(unittest.TestCase):
         payload = post.call_args.kwargs["json"]
         self.assertNotIn("tools", payload)
         self.assertNotIn("tool_choice", payload)
+
+    @patch("AgentRecord.ai_client.requests.post")
+    def test_structured_output_uses_configured_json_mode(self, post):
+        post.return_value = FakeResponse(
+            {"choices": [{"message": {"role": "assistant", "content": "{}"}}]}
+        )
+        model = {**self.model, "json_mode": True, "max_tokens": 32768}
+
+        response = ai_client.call_ai("JSON 任务", model, structured_output=True)
+
+        self.assertTrue(response.success)
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual({"type": "json_object"}, payload["response_format"])
+        self.assertEqual(32768, payload["max_tokens"])
 
     @patch("AgentRecord.ai_client.execute_tool")
     @patch("AgentRecord.ai_client.requests.post")

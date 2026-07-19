@@ -19,6 +19,7 @@ from . import journal, settings
 NETWORK_ERROR_MARKER = "网络异常:"
 RATE_LIMIT_ERROR_MARKER = "限流异常:"
 CONFIG_ERROR_MARKER = "配置异常:"
+_MAX_WEB_RESULTS_PER_QUERY = 10
 
 
 @dataclass
@@ -207,11 +208,16 @@ def bocha_search(query: str, include: str = "", exclude: str = "") -> ToolResult
         "Content-Type": "application/json",
         "Authorization": f"Bearer {config['api_key']}",
     }
+    try:
+        requested_count = int(config.get("count", _MAX_WEB_RESULTS_PER_QUERY))
+    except (TypeError, ValueError):
+        requested_count = _MAX_WEB_RESULTS_PER_QUERY
+    requested_count = max(1, min(requested_count, _MAX_WEB_RESULTS_PER_QUERY))
     body: dict[str, Any] = {
         "query": query,
         "freshness": "noLimit",
         "summary": True,
-        "count": config.get("count", 25),
+        "count": requested_count,
     }
     if include:
         body["include"] = include
@@ -235,11 +241,16 @@ def bocha_search(query: str, include: str = "", exclude: str = "") -> ToolResult
         data = response.json()
         if data.get("code") != 200:
             return ToolResult("")
-        results = data.get("data", {}).get("webPages", {}).get("value", [])
+        results = data.get("data", {}).get("webPages", {}).get("value", [])[
+            :requested_count
+        ]
         if not results:
             return ToolResult("")
 
-        lines = ["[网络搜索结果]"]
+        lines = [
+            "[网络搜索结果]",
+            "[来源约束] 仅各条“链接：”字段中的完整 URL 可用于正文链接和 sources；摘要中的网址不可使用。",
+        ]
         evidence = []
         for index, item in enumerate(results, 1):
             title = _search_excerpt(item.get("name", ""), 300)
@@ -442,6 +453,8 @@ def call_ai(
     search_evidence: list[dict[str, str]] = []
     search_queries: list[str] = []
     rejected_search_queries: list[str] = []
+    duplicate_search_queries: list[str] = []
+    completed_search_queries: set[str] = set()
 
     def observe_attempt(_attempt: int) -> None:
         nonlocal http_attempts
@@ -460,6 +473,7 @@ def call_ai(
                 "usage": usage,
                 "search_queries": search_queries,
                 "rejected_search_queries": rejected_search_queries,
+                "duplicate_search_queries": duplicate_search_queries,
                 "search_evidence": search_evidence,
             },
         )
@@ -503,13 +517,22 @@ def call_ai(
                 query = str(arguments.get("query", "")).strip()
                 if function_name == "web_search":
                     search_queries.append(query)
+                normalized_query = _normalized_query(query)
                 if (
                     function_name == "web_search"
                     and allowed_query_set is not None
-                    and _normalized_query(query) not in allowed_query_set
+                    and normalized_query not in allowed_query_set
                 ):
                     rejected_search_queries.append(query)
                     tool_result = ToolResult("搜索查询未获中控授权，请使用原样给定的查询。")
+                elif (
+                    function_name == "web_search"
+                    and normalized_query in completed_search_queries
+                ):
+                    duplicate_search_queries.append(query)
+                    tool_result = ToolResult(
+                        "该查询已在本次调用中执行，请直接使用前一轮工具结果，不要重复搜索。"
+                    )
                 else:
                     raw_result = execute_tool(function_name, arguments)
                     if isinstance(raw_result, ToolResult):
@@ -517,6 +540,8 @@ def call_ai(
                     else:
                         content, count = raw_result
                         tool_result = ToolResult(content, count)
+                    if function_name == "web_search":
+                        completed_search_queries.add(normalized_query)
                 result, result_count = tool_result
                 search_results += result_count
                 search_evidence.extend(tool_result.evidence)

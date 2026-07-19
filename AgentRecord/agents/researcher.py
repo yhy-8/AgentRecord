@@ -16,7 +16,7 @@ SPEC = AgentSpec(
     allowed_tools=frozenset({"web_search"}),
     instructions="""逐项研究 research_topics。每一次输出（包括格式修订和 Reviewer 退回后的修订）都必须重新调用 web_search；调用时只能逐字使用中控给出的 query，不得尝试还原私人背景。优先一手、权威、可核查来源，同时寻找反例、适用边界、相邻概念和不同视角。
 生成报告第二板块正文：它是一份领域研究，而不是新闻链接堆砌或行为建议。记录驱动主题应保留中控给出的 [R-...] 来源标记，外部事实必须就近使用 Markdown 链接。明确区分记录为何引出问题、外部资料说明什么、AI 进行了什么有限推演。探索性推断可以大胆，但必须显式标注不确定性。
-只使用本轮搜索结果中真实出现的 URL，并将同一 URL 原样放入正文 Markdown 链接和 sources，不得凭记忆补全、改写或推测链接。只返回 JSON：{"markdown":"不含一、二级标题的第二板块正文","sources":[{"topic_id":"Q001","title":"...","url":"https://...","published":"..."}]}。""",
+只使用工具结果中“链接：”字段真实出现的 URL，并将同一 URL 原样放入正文 Markdown 链接和 sources；中控修订请求中的 verified_source_options 是本次运行此前轮次已审计的真实工具结果，也可以继续使用。摘要正文里出现的网址不算可用来源，不得凭记忆补全、改写或推测链接。sources 只列正文实际引用的链接，不要附加“备选来源”。只返回 JSON：{"markdown":"不含一、二级标题的第二板块正文","sources":[{"topic_id":"Q001","title":"...","url":"https://...","published":"..."}]}。""",
 )
 
 
@@ -102,14 +102,19 @@ def validate(
     linked_urls = markdown_urls(markdown)
     if not sources or not linked_urls:
         raise AgentPipelineError("领域研究没有可验证的外部来源")
+    declared_urls = {canonical_url(source["url"]) for source in sources}
+    if linked_urls - declared_urls:
+        raise AgentPipelineError("领域研究正文包含未列入 sources 的外部链接")
+    # ``sources`` is audit metadata rather than delivered report content.  Models
+    # sometimes append unused alternatives here; discard those harmless extras
+    # instead of rejecting an otherwise cited draft.  Topic coverage below still
+    # requires at least one source that the report actually links.
+    sources = [
+        source
+        for source in sources
+        if canonical_url(source["url"]) in linked_urls
+    ]
     covered_topic_ids = {source["topic_id"] for source in sources}
     if covered_topic_ids != topic_ids:
-        raise AgentPipelineError("领域研究没有为每个中控选题提供来源")
-    missing_links = [
-        source["url"]
-        for source in sources
-        if canonical_url(source["url"]) not in linked_urls
-    ]
-    if missing_links:
-        raise AgentPipelineError("领域研究 sources 中的 URL 没有在正文就近引用")
+        raise AgentPipelineError("领域研究正文没有为每个中控选题就近引用来源")
     return markdown.strip(), sources

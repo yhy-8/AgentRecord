@@ -31,6 +31,8 @@ AgentRecord.exe
 
 Windows 版 `AgentRecord.exe`、`AgentRecordBackground.exe` 和 `config.yaml` 应放在同一目录。后台专用程序没有控制台窗口，不要单独启动。
 
+Windows 交互终端使用按键事件等待和批量 Unicode 回显，不再通过固定休眠轮询按键。更新时需同时替换两个 EXE，否则可能仍在运行旧版输入逻辑。
+
 ## 记录模式
 
 启动后默认进入记录模式。普通文字按回车后立即写入当天日记，不等待模型。
@@ -75,6 +77,8 @@ models:
     api_url: https://api.deepseek.com/chat/completions
     api_key: ""
     search: false
+    json_mode: true
+    max_tokens: 32768
 
 current_model: deepseek-v4-pro
 
@@ -82,7 +86,7 @@ third_search:
   enabled: false
   api_url: https://api.bocha.cn/v1/web-search
   api_key: ""
-  count: 25
+  count: 10                  # 程序上限为 10，减少低相关结果和上下文噪声
   timeout: 30
   max_rounds: 3
 
@@ -101,6 +105,8 @@ automation:
 
 - `current_model` 用于手动总结、手动报告和自动任务。
 - 第三方搜索只在所选模型没有原生搜索能力时使用。
+- 报告搜索会去除同次调用中的重复查询，并严格核对正文链接、`sources` 与真实搜索证据；这减少上下文噪声，不会跳过来源质量检查。
+- DeepSeek 官方接口支持 OpenAI JSON mode，示例已启用；使用其他兼容接口时需先确认其是否接受 `response_format: {type: json_object}`。
 - 相对目录以 `config.yaml` 所在目录为基准。
 
 ## 自动任务

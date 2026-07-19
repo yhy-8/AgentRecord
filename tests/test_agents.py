@@ -26,6 +26,16 @@ class AgentModuleTests(unittest.TestCase):
         with self.assertRaisesRegex(AgentPipelineError, "JSON 无法解析"):
             _parse_json('我已经完成了：\n{"markdown":"内容"}')
 
+    def test_json_parser_recovers_lone_trailing_delimiters(self):
+        self.assertEqual(
+            {"markdown": "内容"},
+            _parse_json('{"markdown":"内容"}"}'),
+        )
+
+    def test_json_parser_rejects_two_concatenated_objects(self):
+        with self.assertRaisesRegex(AgentPipelineError, "JSON 无法解析"):
+            _parse_json('{"markdown":"第一份"}{"markdown":"第二份"}')
+
     def test_four_agents_have_separate_responsibilities(self):
         self.assertEqual(
             {"retrospective", "research_planner", "researcher", "reviewer"},
@@ -151,6 +161,47 @@ class AgentModuleTests(unittest.TestCase):
         )
 
         self.assertIn("%2F", markdown)
+
+    def test_researcher_discards_unused_source_metadata(self):
+        used = "https://example.com/used"
+        markdown, sources = researcher.validate(
+            {
+                "markdown": f"外部事实 [来源]({used})",
+                "sources": [
+                    {"topic_id": "Q001", "title": "采用", "url": used},
+                    {
+                        "topic_id": "Q001",
+                        "title": "未采用备选",
+                        "url": "https://example.com/unused",
+                    },
+                ],
+            },
+            [{"topic_id": "Q001", "origin": "news", "source_refs": []}],
+            set(),
+        )
+
+        self.assertIn(used, markdown)
+        self.assertEqual([used], [source["url"] for source in sources])
+
+    def test_researcher_rejects_markdown_link_missing_from_sources(self):
+        with self.assertRaisesRegex(AgentPipelineError, "未列入 sources"):
+            researcher.validate(
+                {
+                    "markdown": (
+                        "事实 [已声明](https://example.com/declared)，"
+                        "另一个事实 [未声明](https://example.com/undeclared)。"
+                    ),
+                    "sources": [
+                        {
+                            "topic_id": "Q001",
+                            "title": "已声明",
+                            "url": "https://example.com/declared",
+                        }
+                    ],
+                },
+                [{"topic_id": "Q001", "origin": "news", "source_refs": []}],
+                set(),
+            )
 
     def test_researcher_requires_record_citation_for_each_driven_topic(self):
         with self.assertRaisesRegex(AgentPipelineError, "Q002"):

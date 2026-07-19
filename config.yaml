@@ -7,6 +7,8 @@ models:
   - name: deepseek-v4-pro
     model_id: deepseek-v4-pro
     search: false         # false 时可按 third_search 配置使用第三方搜索
+    json_mode: true       # DeepSeek 官方接口支持 JSON Output
+    max_tokens: 32768     # 给长月报留足输出空间，避免 JSON 中途截断
     api_url: https://api.deepseek.com/chat/completions
     api_key:
 
@@ -18,7 +20,7 @@ third_search:
   enabled: false               # 全局开关
   api_url: "https://api.bocha.cn/v1/web-search"
   api_key: ""
-  count: 25                    # 单次搜索返回条数
+  count: 10                    # 单次搜索最多返回 10 条，避免低相关结果挤占上下文
   timeout: 30                  # 请求超时时间（秒）
   max_rounds: 3                # 最大搜索轮数（只能执行中控已授权的原样查询）
 
