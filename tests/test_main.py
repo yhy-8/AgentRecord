@@ -318,9 +318,11 @@ class MainCommandTests(unittest.TestCase):
         windows_console.kbhit.return_value = True
         windows_console.getwch.side_effect = ["中", "\x08", "\r"]
 
-        with patch.object(terminal, "msvcrt", windows_console, create=True), patch.object(
-            terminal.sys, "stdout", stream
-        ):
+        with patch.object(
+            terminal, "_windows_console_input_handle", return_value=None
+        ), patch.object(
+            terminal, "msvcrt", windows_console, create=True
+        ), patch.object(terminal.sys, "stdout", stream):
             value = terminal._safe_input_windows(">> ")
             stream.flush()
 
@@ -361,9 +363,11 @@ class MainCommandTests(unittest.TestCase):
         windows_console.getwch.side_effect = ["中", "文", "\r"]
         stream = Mock()
 
-        with patch.object(terminal, "msvcrt", windows_console, create=True), patch.object(
-            terminal.sys, "stdout", stream
-        ):
+        with patch.object(
+            terminal, "_windows_console_input_handle", return_value=None
+        ), patch.object(
+            terminal, "msvcrt", windows_console, create=True
+        ), patch.object(terminal.sys, "stdout", stream):
             value = terminal._safe_input_windows(">> ")
 
         self.assertEqual("中文", value)
