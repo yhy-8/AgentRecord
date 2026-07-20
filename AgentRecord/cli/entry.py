@@ -79,7 +79,7 @@ def _show_automation_status() -> None:
         )
         console.print(
             f"[yellow][!] 自动任务存在未恢复失败：{tasks}；"
-            "请切换到报告模式用 /status 查看实际重试时间，或执行 /retry 立即全量重试。[/yellow]"
+            "请切换到报告模式用 /status 查看实际重试时间，或执行 /retry 立即按依赖顺序重试。[/yellow]"
         )
 
 

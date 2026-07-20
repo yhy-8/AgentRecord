@@ -150,6 +150,7 @@ class MainCommandTests(unittest.TestCase):
             "current_task_detail": "",
             "current_task_started_at": "",
             "daily_summary_status": "2026-07-14 已存在",
+            "daily_profile_status": "2026-07-14 已更新",
             "daily_information_status": "2026-07-15 已存在",
             "weekly_report_status": "2026-07-06 至 2026-07-12 缺失",
             "monthly_report_status": "2026-06 已存在",
@@ -166,6 +167,7 @@ class MainCommandTests(unittest.TestCase):
 
         output = str(console_print.call_args.args[0].renderable)
         self.assertIn("2026-07-14", output)
+        self.assertIn("昨日人物画像", output)
         self.assertIn("weekly_report", output)
         self.assertIn("非网络错误", output)
         self.assertNotIn("weekly_report [网络错误]", output)
@@ -296,27 +298,34 @@ class MainCommandTests(unittest.TestCase):
 
         self.assertEqual("", value)
         rendered = output.getvalue().decode("utf-8")
-        self.assertIn("\r\x1b[0J>> ", rendered)
+        self.assertIn("\x1b8\x1b[0J\x1b7>> ", rendered)
 
-    def test_windows_input_wait_wakes_without_fixed_polling_sleep(self):
-        windows_console = Mock()
-        windows_console.get_osfhandle.return_value = 123
-        windows_console.kbhit.return_value = True
+    def test_windows_native_reader_consumes_unicode_key_event(self):
         kernel32 = Mock()
         kernel32.WaitForSingleObject.return_value = 0
+
+        def read_console(_handle, event_pointer, _length, count_pointer):
+            event = event_pointer._obj
+            event.EventType = terminal._KEY_EVENT
+            event.Event.KeyEvent.KeyDown = 1
+            event.Event.KeyEvent.RepeatCount = 1
+            event.Event.KeyEvent.Character.UnicodeChar = ord("中")
+            count_pointer._obj.value = 1
+            return 1
+
+        kernel32.ReadConsoleInputW.side_effect = read_console
         windll = Mock(kernel32=kernel32)
-        stdin = Mock()
-        stdin.fileno.return_value = 0
 
-        with patch.object(terminal, "msvcrt", windows_console, create=True), patch.object(
-            terminal.ctypes, "windll", windll, create=True
-        ), patch.object(terminal.sys, "stdin", stdin), patch.object(
-            terminal.time, "sleep"
-        ) as sleep:
-            terminal._wait_for_windows_input()
+        with patch.object(terminal.ctypes, "windll", windll, create=True):
+            result = terminal._read_windows_input_event(123, 50)
 
+        self.assertEqual(["中"], result)
         kernel32.WaitForSingleObject.assert_called_once()
-        sleep.assert_not_called()
+        kernel32.ReadConsoleInputW.assert_called_once()
+
+    def test_windows_input_record_layout_matches_win32_abi(self):
+        self.assertEqual(16, terminal.ctypes.sizeof(terminal._WindowsKeyEvent))
+        self.assertEqual(20, terminal.ctypes.sizeof(terminal._WindowsInputEvent))
 
     def test_windows_ime_commit_is_echoed_in_one_batch(self):
         windows_console = Mock()
@@ -330,7 +339,25 @@ class MainCommandTests(unittest.TestCase):
             value = terminal._safe_input_windows(">> ")
 
         self.assertEqual("中文", value)
-        self.assertEqual([">> ", "中文\r\n"], [call.args[0] for call in stream.write.call_args_list])
+        self.assertEqual(
+            ["\x1b7>> ", "中文\r\n"],
+            [call.args[0] for call in stream.write.call_args_list],
+        )
+
+    def test_windows_non_character_event_cannot_strand_enter(self):
+        stream = Mock()
+        with patch.object(
+            terminal, "_windows_console_input_handle", return_value=123
+        ), patch.object(
+            terminal,
+            "_read_windows_input_event",
+            side_effect=[[], ["\r"]],
+        ) as read_event, patch.object(terminal.sys, "stdout", stream):
+            value = terminal._safe_input_windows(">> ")
+
+        self.assertEqual("", value)
+        self.assertEqual(2, read_event.call_count)
+        self.assertEqual("\r\n", stream.write.call_args_list[-1].args[0])
 
     @patch("AgentRecord.cli.app.journal.append_log")
     @patch("AgentRecord.cli.app.show_help")

@@ -6,7 +6,7 @@
 
 当前结构使用精简画像模型，并把 Agent 调用遥测和已过审阶段缓存纳入审计产物：
 
-- 审计每次周报、月报运行；
+- 审计每次每日画像、周报和月报运行；
 - 保存 Agent 完成或失败产物；
 - 保存请求耗时、token/缓存 token 和搜索证据；
 - 仅复用同输入下已完全过审的 Agent 阶段；
@@ -29,23 +29,23 @@
 
 ## 3. analysis_runs
 
-一行表示一次周报或月报运行。
+一行表示一次每日画像、周报或月报运行。
 
 | 字段 | 含义 |
 |---|---|
 | `id` | 32 位 UUID 十六进制运行 ID |
-| `kind` | `weekly` 或 `monthly` |
-| `period_start/end` | 报告闭区间日期 |
+| `kind` | `daily_profile`、`weekly` 或 `monthly` |
+| `period_start/end` | 分析闭区间日期；每日画像两者相同 |
 | `origin` | `manual` 或 `auto` |
 | `trigger` | `manual`、`scheduled` 或 `retry` |
 | `model_name` | 本次模型显示名 |
 | `status` | `running`、`completed`、`failed` |
 | `input_hash` | 完整输入快照 SHA-256 |
-| `report_path` | 成功交付文件路径 |
+| `report_path` | 成功交付文件路径；每日画像为 `NULL` |
 | `error` | 失败原因 |
 | `created_at/completed_at` | 本地时间戳 |
 
-手动触发只允许 `origin=manual, trigger=manual`。系统计划任务首次执行使用 `origin=auto, trigger=scheduled`；整点自动重试和 `/retry` 都使用 `origin=auto, trigger=retry`。
+手动触发只允许 `origin=manual, trigger=manual`。每日画像只允许 `origin=auto`。系统计划任务首次执行使用 `trigger=scheduled`；整点自动重试和 `/retry` 使用 `trigger=retry`。
 
 每次重跑都插入新行。Markdown 固定路径可以被覆盖，运行 ID 仍保留每次尝试的审计身份。
 
@@ -101,7 +101,7 @@
 | 字段 | 含义 |
 |---|---|
 | `id` | 持久画像 ID |
-| `run_id` | 产生该版本的报告运行 |
+| `run_id` | 产生该版本的每日画像或报告运行 |
 | `title/statement` | 标题与陈述 |
 | `status` | `accepted`、`rejected`、`superseded` |
 | `confidence` | 0 到 1 |
@@ -111,7 +111,7 @@
 | `supersedes_id` | 被当前版本替代的旧条目 |
 | `created_at/updated_at` | 本地时间戳 |
 
-Retrospective 的候选只有通过 Reviewer 才能为 `accepted`，但只有整份报告成功交付并把运行标为 `completed` 后才进入历史上下文。完成运行与旧版本 `superseded` 在同一事务中生效；研究板块或交付失败时，新候选不激活，旧版本仍有效。
+Retrospective 的候选只有通过 Reviewer 才能为 `accepted`，但只有所属运行标为 `completed` 后才进入历史上下文。每日画像完成审查即可完成运行，不生成 Markdown 日报；周报/月报仍须整份报告成功交付。完成运行与旧版本 `superseded` 在同一事务中生效；每日审查、研究板块或交付失败时，新候选不激活，旧版本仍有效。
 
 失败运行的候选不会在下一轮自动清除，而是和失败 Agent 产物一起保留审计。重试创建新的运行；任何读取有效画像的查询都会排除这些失败运行，因此保留它们不会污染后续报告。
 

@@ -201,6 +201,7 @@ def _handle_status() -> None:
         f"  最后缺漏检测小时：{status['last_detection_hour'] or '尚未记录'}",
         f"  最后手动重试：{status.get('last_retry_completed_at') or '尚未记录'}",
         f"  昨日日记总结：{status['daily_summary_status']}",
+        f"  昨日人物画像：{status['daily_profile_status']}",
         f"  今日信息简报：{status['daily_information_status']}",
         f"  上周自动周报：{status['weekly_report_status']}",
         f"  上月自动月报：{status['monthly_report_status']}",
@@ -212,7 +213,7 @@ def _handle_status() -> None:
         )
     errors = status["errors"]
     if errors:
-        lines.append("  [yellow]当前失败（/retry 可立即全量重试）：[/yellow]")
+        lines.append("  [yellow]当前失败（/retry 可立即按依赖顺序重试）：[/yellow]")
         retry_after = status.get("retry_after", {})
         retry_kind = status.get("retry_kind", {})
         failure_counts = status.get("failure_counts", {})

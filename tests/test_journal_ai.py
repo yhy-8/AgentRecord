@@ -169,6 +169,9 @@ class JournalAITests(unittest.TestCase):
         self.assertTrue(response.success)
         self.assertEqual(1, execute_tool.call_count)
         self.assertEqual(10, response.search_results)
+        self.assertEqual(
+            ["同一查询"], response.telemetry["completed_search_queries"]
+        )
         self.assertEqual(["同一查询"], response.telemetry["duplicate_search_queries"])
 
     @patch("AgentRecord.ai_client._post_with_transient_retry")

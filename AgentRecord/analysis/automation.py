@@ -23,6 +23,7 @@ from .context import (
     _existing_logs,
     _information_briefings,
     _monthly_supporting_reports,
+    _period_records,
     _recent_summary_context,
     _referenced_source_context,
 )
@@ -32,14 +33,19 @@ from .information import (
     generate_information_briefing,
     information_briefing_path,
 )
-from .orchestrator import generate_analysis_report, summarize_diary
+from .orchestrator import (
+    generate_analysis_report,
+    generate_daily_profile,
+    summarize_diary,
+)
+from .store import AnalysisStore
 
 
 logger = logging.getLogger(__name__)
 
 
 _MAX_AUTOMATIC_CONTENT_FAILURES = 2
-_CONTENT_FAILURE_POLICY_VERSION = 1
+_CONTENT_FAILURE_POLICY_VERSION = 2
 
 
 class _AutomationLock:
@@ -148,6 +154,13 @@ def _content_failure_key(task: str, now: datetime.datetime) -> str:
             "third_search": search_signature,
         }
         if task == "daily_summary":
+            date = today - datetime.timedelta(days=1)
+            path = settings.DIARY_DIR / f"{date.isoformat()}.md"
+            payload.update(
+                target=date.isoformat(),
+                diary=path.read_text(encoding="utf-8") if path.is_file() else "",
+            )
+        elif task == "daily_profile":
             date = today - datetime.timedelta(days=1)
             path = settings.DIARY_DIR / f"{date.isoformat()}.md"
             payload.update(
@@ -347,6 +360,16 @@ def _task_missing(task: str, now: datetime.datetime) -> bool:
         yesterday = today - datetime.timedelta(days=1)
         path = settings.DIARY_DIR / f"{yesterday.isoformat()}.md"
         return path.exists() and _diary_summary_needs_generation(path)
+    if task == "daily_profile":
+        yesterday = today - datetime.timedelta(days=1)
+        logs = _existing_logs(yesterday, yesterday)
+        if not _period_records(logs):
+            return False
+        return not AnalysisStore.has_completed_run(
+            "daily_profile",
+            yesterday.isoformat(),
+            yesterday.isoformat(),
+        )
     if task == "daily_information":
         if now.time() < _daily_information_scheduled_time():
             return False
@@ -370,6 +393,12 @@ def _task_artifact_status(task: str, now: datetime.datetime) -> str:
         if not path.exists():
             return f"{yesterday} 无日记"
         return f"{yesterday} {'缺失' if _diary_summary_needs_generation(path) else '已存在'}"
+    if task == "daily_profile":
+        yesterday = today - datetime.timedelta(days=1)
+        logs = _existing_logs(yesterday, yesterday)
+        if not _period_records(logs):
+            return f"{yesterday} 无日记"
+        return f"{yesterday} {'缺失' if _task_missing(task, now) else '已更新'}"
     if task == "daily_information":
         if now.time() < _daily_information_scheduled_time():
             return f"{today} 未到生成时间"
@@ -458,6 +487,7 @@ def run_due_automatic_tasks() -> None:
         due_tasks = []
         task_settings = (
             ("daily_summary", "daily_summary", hourly_detection_due),
+            ("daily_profile", "daily_profile", hourly_detection_due),
             (
                 "daily_information",
                 "daily_information",
@@ -474,6 +504,10 @@ def run_due_automatic_tasks() -> None:
                 state, task, now, initial_detection_due=initial_due
             ):
                 due_tasks.append(task)
+            elif task in state.get("errors", {}):
+                # A recorded predecessor failure is a dependency barrier even
+                # while its own retry deadline has not arrived.
+                break
         _save_automation_state(state)
 
         if due_tasks:
@@ -482,10 +516,20 @@ def run_due_automatic_tasks() -> None:
             halt = False
             if "daily_summary" in due_tasks and not halt:
                 _run_daily_summaries(today, state, model_config)
-                halt = _global_failure(state, "daily_summary")
+                halt = "daily_summary" in state.get("errors", {})
+            if "daily_profile" in due_tasks and not halt:
+                trigger = (
+                    "retry"
+                    if "daily_profile" in state.get("errors", {})
+                    else "scheduled"
+                )
+                _run_daily_profile(
+                    today, state, model_config, trigger=trigger
+                )
+                halt = "daily_profile" in state.get("errors", {})
             if "daily_information" in due_tasks and not halt:
                 _run_daily_information(now, state, model_config)
-                halt = _global_failure(state, "daily_information")
+                halt = "daily_information" in state.get("errors", {})
             if "weekly_report" in due_tasks and not halt:
                 trigger = (
                     "retry"
@@ -493,7 +537,7 @@ def run_due_automatic_tasks() -> None:
                     else "scheduled"
                 )
                 _run_weekly_reports(today, state, model_config, trigger=trigger)
-                halt = _global_failure(state, "weekly_report")
+                halt = "weekly_report" in state.get("errors", {})
             if "monthly_report" in due_tasks and not halt:
                 trigger = (
                     "retry"
@@ -548,6 +592,43 @@ def _run_daily_information(
             state,
             "daily_information",
             f"自动收集 {date_text} 信息失败: {message[:500]}",
+        )
+    _save_automation_state(state)
+
+
+def _run_daily_profile(
+    today: datetime.date,
+    state: dict,
+    model_config: settings.ModelDict,
+    *,
+    trigger: str = "scheduled",
+) -> None:
+    date = today - datetime.timedelta(days=1)
+    date_text = date.isoformat()
+    logs = _existing_logs(date, date)
+    completed = AnalysisStore.has_completed_run(
+        "daily_profile", date_text, date_text
+    )
+    if not _period_records(logs) or completed:
+        _clear_task_error(state, "daily_profile")
+        _save_automation_state(state)
+        return
+    try:
+        _set_current_task(
+            state, "daily_profile", f"正在更新 {date_text} 人物画像"
+        )
+        message, success = generate_daily_profile(
+            date, model_config, trigger=trigger
+        )
+    except Exception as error:
+        message, success = f"接口异常: {error}", False
+    if success:
+        _clear_task_error(state, "daily_profile")
+    else:
+        _set_task_error(
+            state,
+            "daily_profile",
+            f"自动更新 {date_text} 人物画像失败: {message[:500]}",
         )
     _save_automation_state(state)
 
@@ -614,6 +695,7 @@ def _run_monthly_reports(
 
 AUTOMATION_TASK_LABELS = {
     "daily_summary": "日总结",
+    "daily_profile": "每日人物画像",
     "daily_information": "每日信息简报",
     "weekly_report": "自动周报",
     "monthly_report": "自动月报",
@@ -638,6 +720,8 @@ def _retry_one_task(
 ) -> None:
     if task == "daily_summary":
         _run_daily_summaries(now.date(), state, model)
+    elif task == "daily_profile":
+        _run_daily_profile(now.date(), state, model, trigger="retry")
     elif task == "daily_information":
         _run_daily_information(now, state, model)
     elif task == "weekly_report":
@@ -646,17 +730,8 @@ def _retry_one_task(
         _run_monthly_reports(now.date(), state, model, trigger="retry")
 
 
-def _global_failure(state: dict, task: str) -> bool:
-    """全局网络、限流或鉴权故障时，避免后续 Agent 重复消耗。"""
-    return state.get("retry_kind", {}).get(task) in {
-        "network",
-        "rate_limit",
-        "blocked",
-    }
-
-
 def retry_failed_automatic_tasks() -> tuple[str, bool]:
-    """Retry every currently failed automatic task in an independent process."""
+    """Retry current failures in dependency order until one still fails."""
     automation_lock = _acquire_automation_lock()
     if automation_lock is None:
         return "另一个自动任务正在运行，请稍后重试。", False
@@ -674,7 +749,7 @@ def retry_failed_automatic_tasks() -> tuple[str, bool]:
         for task in tasks:
             _retry_one_task(task, now, state, model)
             state = _load_automation_state()
-            if _global_failure(state, task):
+            if task in state.get("errors", {}):
                 break
         state = _load_automation_state()
         remaining = [task for task in tasks if task in state.get("errors", {})]
@@ -737,7 +812,7 @@ def launch_automation_retry() -> tuple[bool, str]:
         subprocess.Popen(command, **kwargs)
     except OSError as error:
         return False, f"启动后台重试进程失败: {error}"
-    return True, "已在独立后台进程中重试全部失败自动任务。"
+    return True, "已在独立后台进程中按依赖顺序重试失败自动任务。"
 
 
 _CRON_MARKER = "# AgentRecord automation"
@@ -851,6 +926,7 @@ def automation_status_snapshot() -> dict:
         "current_task_detail": state.get("current_task_detail", ""),
         "current_task_started_at": state.get("current_task_started_at", ""),
         "daily_summary_status": _task_artifact_status("daily_summary", now),
+        "daily_profile_status": _task_artifact_status("daily_profile", now),
         "daily_information_status": _task_artifact_status("daily_information", now),
         "weekly_report_status": _task_artifact_status("weekly_report", now),
         "monthly_report_status": _task_artifact_status("monthly_report", now),

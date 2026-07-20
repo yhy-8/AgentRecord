@@ -6,16 +6,24 @@ from pathlib import Path
 from unittest.mock import patch
 
 from AgentRecord import settings
+from AgentRecord.ai_client import AIResponse
 from AgentRecord.analysis import context, information
 
 
 class InformationBriefingTests(unittest.TestCase):
     @staticmethod
-    def valid_briefing(exploration: str = "可延伸。") -> str:
+    def valid_briefing(
+        exploration: str = "可延伸。", targeted_ids: tuple[str, ...] = ()
+    ) -> str:
         highlights = "\n\n".join(
             f"### {number}. 事项 {number}\n\n新资料 [来源](https://example.com/{number})"
             for number in range(1, 6)
         )
+        if targeted_ids:
+            exploration = "\n\n".join(
+                f"### {topic_id}. 选题\n\n{exploration}"
+                for topic_id in targeted_ids
+            )
         return (
             f"## 今日值得关注\n\n{highlights}\n\n"
             f"## 与本周思考相关的探索\n\n{exploration}\n\n"
@@ -69,7 +77,7 @@ class InformationBriefingTests(unittest.TestCase):
                 return json.dumps(payload), True, 0, {}, 0
             collector_prompts.append(prompt)
             return (
-                self.valid_briefing(),
+                self.valid_briefing(targeted_ids=("T001",)),
                 True,
                 0,
                 {"web_search": 2},
@@ -140,7 +148,7 @@ class InformationBriefingTests(unittest.TestCase):
                 )
             collector_prompts.append(prompt)
             return (
-                self.valid_briefing("新增内容。"),
+                self.valid_briefing("新增内容。", ("T001",)),
                 True,
                 0,
                 {"web_search": 3},
@@ -205,6 +213,23 @@ class InformationBriefingTests(unittest.TestCase):
 
         self.assertTrue(any("搜索证据" in error for error in errors))
 
+    def test_briefing_requires_every_record_driven_topic_in_order(self):
+        missing = information._briefing_errors(
+            self.valid_briefing(),
+            True,
+            None,
+            ["T001", "T002"],
+        )
+        covered = information._briefing_errors(
+            self.valid_briefing(targeted_ids=("T001", "T002")),
+            True,
+            None,
+            ["T001", "T002"],
+        )
+
+        self.assertTrue(any("定向选题" in error for error in missing))
+        self.assertFalse(any("定向选题" in error for error in covered))
+
     def test_invalid_briefing_is_revised_with_original_draft_and_reason(self):
         date = datetime.date(2026, 7, 15)
         responses = [
@@ -225,6 +250,32 @@ class InformationBriefingTests(unittest.TestCase):
         self.assertTrue(revision_prompt.startswith(original_prompt))
         self.assertIn("缺少章节和链接", revision_prompt)
         self.assertIn("缺少必需章节", revision_prompt)
+
+    def test_third_party_collector_must_execute_every_authorized_query(self):
+        date = datetime.date(2026, 7, 15)
+        first_query = f"{date:%Y-%m-%d} 全球重要新闻 国际 科技 科学 经济"
+        response = AIResponse(
+            self.valid_briefing(),
+            True,
+            0,
+            {"web_search": 1},
+            5,
+            telemetry={
+                "completed_search_queries": [
+                    information._normalized_query(first_query)
+                ],
+                "search_evidence": [],
+            },
+        )
+
+        with patch.object(information, "call_ai", return_value=response):
+            message, success, path = information.generate_information_briefing(
+                date, {"name": "mock", "search": False}
+            )
+
+        self.assertFalse(success)
+        self.assertIsNone(path)
+        self.assertIn("没有逐项执行全部授权查询", message)
 
     def test_briefing_fails_when_web_search_is_not_configured(self):
         settings.CONFIG["third_search"] = {"enabled": False, "api_key": ""}
@@ -277,6 +328,26 @@ class InformationBriefingTests(unittest.TestCase):
         self.assertIn("本周昨日简报", context_text)
         self.assertNotIn("上周简报", context_text)
         self.assertNotIn("当天旧简报", context_text)
+
+    def test_week_context_uses_raw_records_not_summary_and_resets_on_monday(self):
+        sunday = settings.DIARY_DIR / "2026-07-19.md"
+        monday = settings.DIARY_DIR / "2026-07-20.md"
+        sunday.write_text(
+            "# 2026-07-19\n\n<summary>周日总结</summary>\n\n"
+            "**09:00:** 上周记录\n",
+            encoding="utf-8",
+        )
+        monday.write_text(
+            "# 2026-07-20\n\n<summary>暂无今日总结。</summary>\n\n"
+            "**09:00:** 周一原始记录\n",
+            encoding="utf-8",
+        )
+
+        value = information._week_record_context(datetime.date(2026, 7, 20))
+
+        self.assertIn("周一原始记录", value)
+        self.assertNotIn("暂无今日总结", value)
+        self.assertNotIn("上周记录", value)
 
     def test_period_information_context_reads_only_matching_dates(self):
         directory = settings.ANALYSIS_DIR / "Information"

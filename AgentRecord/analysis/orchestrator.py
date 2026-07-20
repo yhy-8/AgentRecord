@@ -1,4 +1,4 @@
-"""Orchestrate weekly/monthly retrospective and domain-research reports."""
+"""Orchestrate daily profiles and weekly/monthly analysis reports."""
 
 import datetime
 import hashlib
@@ -402,6 +402,11 @@ def _retrospective_section(
     model_config: settings.ModelDict,
     store: AnalysisStore,
     run_id: str,
+    *,
+    task: str = (
+        "生成整理与回顾板块和人物画像候选。"
+        "没有值得长期保存的画像时返回空数组，不要凑数。"
+    ),
 ) -> tuple[str, list[dict], dict[str, str]]:
     revision_context = None
     last_feedback: list[str] = []
@@ -410,7 +415,7 @@ def _retrospective_section(
         try:
             payload = _call_agent(
                 retrospective.SPEC,
-                "生成整理与回顾板块和人物画像候选。没有值得长期保存的画像时返回空数组，不要凑数。",
+                task,
                 base_input,
                 model_config,
                 store,
@@ -1012,6 +1017,115 @@ def _source_appendix(markdown: str, store: AnalysisStore) -> str:
             f"— `{record['relative_path']}` 第 {record['record_index']} 条记录"
         )
     return "\n".join(lines)
+
+
+def generate_daily_profile(
+    date: datetime.date,
+    model_config: settings.ModelDict,
+    *,
+    trigger: str = "scheduled",
+) -> tuple[str, bool]:
+    """Review one closed diary day and activate only validated profile changes."""
+    if trigger not in {"scheduled", "retry"}:
+        return f"未知每日人物画像触发方式: {trigger}", False
+    logs = _existing_logs(date, date)
+    if not logs:
+        return f"{date:%Y-%m-%d} 没有日记记录。", False
+    records = _period_records(logs)
+    if not records:
+        return "日记中没有可识别的标准记录。", False
+
+    report_lock = FileLock.acquire(settings.ANALYSIS_DIR / ".report.lock")
+    if report_lock is None:
+        return "另一个分析任务正在生成，请稍后重试。", False
+    store: AnalysisStore | None = None
+    run_id: str | None = None
+    try:
+        store = AnalysisStore()
+        current_source_ids = {record["source_id"] for record in records}
+        profiles = store.active_profiles(date.isoformat())
+        profiles_by_id = {profile["id"]: profile for profile in profiles}
+        historical_source_ids = {
+            ref for profile in profiles for ref in profile["source_refs"]
+        }
+        compact_profiles, profile_aliases = _profile_input(profiles)
+        referenced_sources = _referenced_source_context(logs)
+        recent_summaries = _recent_summary_context(date)
+        snapshot = {
+            "pipeline_version": _PIPELINE_VERSION,
+            "kind": "daily_profile",
+            "records": records,
+            "profiles": profiles,
+            "referenced_sources": referenced_sources,
+            "recent_summaries": recent_summaries,
+        }
+        input_hash = hashlib.sha256(
+            json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        run_id = store.start_run(
+            "daily_profile",
+            date.isoformat(),
+            date.isoformat(),
+            "auto",
+            model_config.get("name", ""),
+            input_hash,
+            trigger=trigger,
+        )
+        logger.info("daily_profile_started run=%s date=%s", run_id, date)
+        store.save_sources(run_id, records)
+        retrospective_input = {
+            "period": {
+                "kind": "daily_profile",
+                "start": date.isoformat(),
+                "end": date.isoformat(),
+            },
+            "records": records,
+            "historical_profiles": compact_profiles,
+            "referenced_sources": referenced_sources,
+            "recent_summaries": recent_summaries,
+            "supporting_reports": "（每日人物画像不读取周期报告）",
+        }
+        _, entries, decisions = _retrospective_section(
+            retrospective_input,
+            current_source_ids | historical_source_ids,
+            current_source_ids,
+            profile_aliases,
+            model_config,
+            store,
+            run_id,
+            task=(
+                "只为昨日记录生成内部审查摘要和人物画像候选；摘要不会作为日报交付。"
+                "画像仍只保存相对稳定、值得跨日比较的内容，没有合适更新时返回空数组。"
+            ),
+        )
+        _observed_dates(entries, profiles_by_id, store)
+        store.save_profile_entries(run_id, entries, decisions)
+        store.complete_run(run_id)
+        accepted = sum(
+            decisions.get(entry["temp_id"]) == "accepted" for entry in entries
+        )
+        logger.info(
+            "daily_profile_completed run=%s date=%s accepted=%s",
+            run_id,
+            date,
+            accepted,
+        )
+        return f"{date:%Y-%m-%d} 人物画像已更新（接受 {accepted} 项）。", True
+    except Exception as error:
+        message = str(error) or error.__class__.__name__
+        if store is not None and run_id is not None:
+            try:
+                store.fail_run(run_id, message)
+            except Exception as state_error:
+                message += f"；保存失败状态时又发生异常: {state_error}"
+        logger.error(
+            "daily_profile_failed run=%s error_type=%s",
+            run_id or "not-started",
+            error.__class__.__name__,
+        )
+        return f"人物画像更新失败: {message}", False
+    finally:
+        report_lock.release()
 
 
 def generate_analysis_report(

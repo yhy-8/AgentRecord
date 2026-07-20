@@ -2,6 +2,7 @@ import datetime
 import json
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -26,6 +27,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
         settings.CONFIG["automation"] = {
             "enabled": True,
             "daily_summary": True,
+            "daily_profile": False,
             "daily_information": False,
             "weekly_report": False,
             "monthly_report": False,
@@ -194,6 +196,23 @@ class AnalysisWorkflowTests(unittest.TestCase):
         self.assertIsNone(path)
         self.assertIn("weekly", message)
 
+    def test_daily_profile_activates_reviewed_candidates_without_report_file(self):
+        day = datetime.date(2026, 7, 14)
+        self.write_diary(day.isoformat())
+
+        message, success = orchestrator.generate_daily_profile(
+            day, {"name": "mock"}
+        )
+
+        self.assertTrue(success, message)
+        active = AnalysisStore().active_profiles(day.isoformat())
+        self.assertEqual(["重视可验证性"], [item["title"] for item in active])
+        with closing(AnalysisStore()._connect()) as connection:
+            run = connection.execute(
+                "SELECT kind, status, report_path FROM analysis_runs"
+            ).fetchone()
+        self.assertEqual(("daily_profile", "completed", None), tuple(run))
+
     def test_manual_and_automatic_reports_remain_separate(self):
         day = datetime.date(2026, 7, 14)
         self.write_diary(day.isoformat())
@@ -280,7 +299,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
 
         summarize.assert_not_called()
 
-    def test_four_automatic_artifacts_include_daily_information(self):
+    def test_five_automatic_tasks_include_daily_profile_and_information(self):
         now = datetime.datetime(2026, 7, 17, 9, 0)
         yesterday = settings.DIARY_DIR / "2026-07-16.md"
         yesterday.write_text(
@@ -292,6 +311,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
         self.write_diary("2026-06-15")
 
         self.assertTrue(automation._task_missing("daily_summary", now))
+        self.assertTrue(automation._task_missing("daily_profile", now))
         self.assertTrue(automation._task_missing("daily_information", now))
         self.assertTrue(automation._task_missing("weekly_report", now))
         self.assertTrue(automation._task_missing("monthly_report", now))
@@ -300,6 +320,15 @@ class AnalysisWorkflowTests(unittest.TestCase):
             yesterday.read_text(encoding="utf-8").replace("暂无今日总结。", "已有总结。"),
             encoding="utf-8",
         )
+        profile_run = AnalysisStore().start_run(
+            "daily_profile",
+            "2026-07-16",
+            "2026-07-16",
+            "auto",
+            "mock",
+            "hash",
+        )
+        AnalysisStore().complete_run(profile_run)
         info_path = automation.information_briefing_path(now.date())
         info_path.parent.mkdir(parents=True, exist_ok=True)
         info_path.write_text("简报", encoding="utf-8")
@@ -811,10 +840,71 @@ class AnalysisWorkflowTests(unittest.TestCase):
             ["daily_information", "weekly_report", "monthly_report"], calls
         )
 
+    def test_retry_stops_after_any_predecessor_failure(self):
+        settings.ANALYSIS_DIR.mkdir()
+        automation._save_automation_state(
+            {
+                "errors": {
+                    "daily_summary": "失败",
+                    "daily_information": "失败",
+                }
+            }
+        )
+        calls = []
+
+        def still_fails(task, now, state, model):
+            calls.append(task)
+            automation._set_task_error(state, task, "内容校验失败")
+            automation._save_automation_state(state)
+
+        with patch.object(
+            automation, "_automation_model", return_value={"name": "mock"}
+        ), patch.object(automation, "_retry_one_task", side_effect=still_fails):
+            _, success = automation.retry_failed_automatic_tasks()
+
+        self.assertFalse(success)
+        self.assertEqual(["daily_summary"], calls)
+
+    def test_scheduler_does_not_cross_predecessor_retry_barrier(self):
+        class FixedDateTime(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 7, 17, 9, 0)
+
+        settings.CONFIG["automation"] = {
+            "enabled": True,
+            "daily_summary": True,
+            "daily_profile": False,
+            "daily_information": True,
+            "daily_information_time": "08:05",
+            "weekly_report": False,
+            "monthly_report": False,
+        }
+        settings.ANALYSIS_DIR.mkdir()
+        automation._save_automation_state(
+            {
+                "errors": {"daily_summary": "2026-07-17 08:30 内容失败"},
+                "retry_after": {"daily_summary": "2026-07-17T10:00:00"},
+                "retry_kind": {"daily_summary": "hourly"},
+            }
+        )
+
+        with patch.object(
+            automation.datetime, "datetime", FixedDateTime
+        ), patch.object(
+            automation,
+            "_task_missing",
+            side_effect=lambda task, now: task in {"daily_summary", "daily_information"},
+        ), patch.object(automation, "_run_daily_information") as run_information:
+            automation.run_due_automatic_tasks()
+
+        run_information.assert_not_called()
+
     def test_minute_scheduler_does_not_repeat_recorded_failures(self):
         settings.CONFIG["automation"] = {
             "enabled": True,
             "daily_summary": False,
+            "daily_profile": False,
             "daily_information": False,
             "weekly_report": True,
             "monthly_report": True,
@@ -851,6 +941,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
         settings.CONFIG["automation"] = {
             "enabled": True,
             "daily_summary": False,
+            "daily_profile": False,
             "daily_information": True,
             "daily_information_time": "08:05",
             "weekly_report": False,

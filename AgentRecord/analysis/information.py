@@ -11,6 +11,7 @@ from .. import settings
 from ..agents.researcher import canonical_url, markdown_urls
 from ..ai_client import (
     CONFIG_ERROR_MARKER,
+    _normalized_query,
     call_ai,
     response_telemetry,
     web_search_available,
@@ -268,10 +269,22 @@ def _has_five_daily_highlights(markdown: str) -> bool:
     return numbers == ["1", "2", "3", "4", "5"]
 
 
+def _targeted_exploration_ids(markdown: str) -> list[str]:
+    match = re.search(
+        r"^## 与本周思考相关的探索\s*$([\s\S]*?)(?=^##\s|\Z)",
+        markdown,
+        re.MULTILINE,
+    )
+    if not match:
+        return []
+    return re.findall(r"^###\s+(T\d{3})[.、]\s+\S", match.group(1), re.MULTILINE)
+
+
 def _briefing_errors(
     markdown: str,
     used_search: bool,
     evidence_urls: set[tuple] | None = None,
+    targeted_ids: list[str] | None = None,
 ) -> list[str]:
     errors = []
     if not used_search:
@@ -293,6 +306,12 @@ def _briefing_errors(
         errors.append("缺少必需章节: " + "、".join(missing))
     if not _has_five_daily_highlights(markdown):
         errors.append("“今日值得关注”没有严格生成编号 1 至 5 的五项")
+    actual_targeted_ids = _targeted_exploration_ids(markdown)
+    if actual_targeted_ids != (targeted_ids or []):
+        errors.append(
+            "“与本周思考相关的探索”没有按定向选题逐项生成: "
+            f"期望 {targeted_ids or []}，实际 {actual_targeted_ids}"
+        )
     return errors
 
 
@@ -315,6 +334,10 @@ def generate_information_briefing(
     )
     if error:
         return f"生成定向信息查询失败: {error}", False, None
+    targeted = [
+        {"topic_id": f"T{index:03d}", **item}
+        for index, item in enumerate(targeted, 1)
+    ]
     queries = [
         {
             "query": f"{date:%Y-%m-%d} 全球重要新闻 国际 科技 科学 经济",
@@ -334,7 +357,7 @@ def generate_information_briefing(
 - 优先一手、权威和多源可交叉验证的资料；区分事实、来源观点和 AI 推断。
 - 包含“今日值得关注”、“与本周思考相关的探索”、“可继续追踪”三个二级标题。
 - “今日值得关注”用于纯粹拓宽视野，固定选择五项彼此独立的重要信息，并严格使用“### 1. 标题”至“### 5. 标题”作为三级标题。
-- “与本周思考相关的探索”只对应定向查询；定向查询可以为零至三项，不得为了数量重复本周已有主题。
+- “与本周思考相关的探索”只对应定向查询；每项必须按输入顺序生成，并严格使用“### T001. 标题”等携带 topic_id 的三级标题。没有定向查询时该章节不写三级标题，只说明本次没有合适选题。
 - 每项关键信息就近附上 Markdown 来源链接和日期；无可靠来源时不要写成事实。
 - 定向查询是本周记录抽象后的研究方向，不得推测或还原私人细节。
 - 对照本周此前的信息简报，已经报道过的事件、背景和结论不得重复写入。只有出现实质性新事件、新数据、新来源或相反证据时才继续同一主题，并明确说明“新在哪里”。
@@ -375,7 +398,23 @@ def generate_information_briefing(
         used_search = bool(
             citations or result_count
         )
-        errors = _briefing_errors(markdown, used_search, evidence_urls)
+        errors = _briefing_errors(
+            markdown,
+            used_search,
+            evidence_urls,
+            [item["topic_id"] for item in targeted],
+        )
+        completed_queries = telemetry.get("completed_search_queries")
+        if isinstance(completed_queries, list):
+            missing_queries = [
+                item["query"]
+                for item in queries
+                if _normalized_query(item["query"]) not in completed_queries
+            ]
+            if missing_queries:
+                errors.append(
+                    "没有逐项执行全部授权查询: " + "、".join(missing_queries)
+                )
         if not errors:
             break
         if attempt == _MAX_MODEL_ATTEMPTS:

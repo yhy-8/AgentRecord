@@ -14,13 +14,14 @@ from .automation import (
 )
 from .context import analysis_report_path
 from .information import generate_information_briefing, information_briefing_path
-from .orchestrator import generate_analysis_report, summarize_diary
+from .orchestrator import generate_analysis_report, generate_daily_profile, summarize_diary
 
 __all__ = [
     "analysis_report_path",
     "automation_status_snapshot",
     "failed_automatic_tasks",
     "generate_analysis_report",
+    "generate_daily_profile",
     "generate_information_briefing",
     "install_system_automation",
     "information_briefing_path",

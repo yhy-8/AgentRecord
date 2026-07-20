@@ -496,6 +496,7 @@ def call_ai(
                 "http_attempts": http_attempts,
                 "usage": usage,
                 "search_queries": search_queries,
+                "completed_search_queries": sorted(completed_search_queries),
                 "rejected_search_queries": rejected_search_queries,
                 "duplicate_search_queries": duplicate_search_queries,
                 "search_evidence": search_evidence,

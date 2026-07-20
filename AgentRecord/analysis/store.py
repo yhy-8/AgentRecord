@@ -1,4 +1,4 @@
-"""SQLite persistence for report runs and the long-lived personal profile.
+"""SQLite persistence for analysis runs and the long-lived personal profile.
 
 The database is derived state. Markdown records remain the source of truth.
 The final schema stores the compact profile model together with validated-stage
@@ -232,10 +232,12 @@ class AnalysisStore:
         *,
         trigger: str | None = None,
     ) -> str:
-        if kind not in {"weekly", "monthly"}:
-            raise ValueError(f"不支持的报告类型: {kind}")
+        if kind not in {"daily_profile", "weekly", "monthly"}:
+            raise ValueError(f"不支持的分析类型: {kind}")
         if origin not in {"manual", "auto"}:
             raise ValueError(f"不支持的报告来源: {origin}")
+        if kind == "daily_profile" and origin != "auto":
+            raise ValueError("每日人物画像只支持自动来源")
         trigger = trigger or ("manual" if origin == "manual" else "scheduled")
         if trigger not in {"manual", "scheduled", "retry"}:
             raise ValueError(f"不支持的触发方式: {trigger}")
@@ -264,8 +266,12 @@ class AnalysisStore:
             )
         return run_id
 
-    def complete_run(self, run_id: str, report_path: Path) -> None:
-        self._finish_run(run_id, "completed", report_path=str(report_path))
+    def complete_run(self, run_id: str, report_path: Path | None = None) -> None:
+        self._finish_run(
+            run_id,
+            "completed",
+            report_path=str(report_path) if report_path is not None else None,
+        )
 
     def fail_run(self, run_id: str, error: str) -> None:
         self._finish_run(run_id, "failed", error=error)
@@ -296,7 +302,7 @@ class AnalysisStore:
                 ).fetchone()
                 if stale:
                     raise RuntimeError(
-                        "报告生成期间人物画像已被其他操作更新，本次候选不能覆盖新状态"
+                        "分析运行期间人物画像已被其他操作更新，本次候选不能覆盖新状态"
                     )
                 connection.execute(
                     """
@@ -356,6 +362,36 @@ class AnalysisStore:
                 ),
             )
         return artifact_id
+
+    @staticmethod
+    def has_completed_run(
+        kind: str,
+        period_start: str,
+        period_end: str,
+        origin: str = "auto",
+        *,
+        path: Path | None = None,
+    ) -> bool:
+        database_path = path or settings.ANALYSIS_DIR / ".analysis.sqlite3"
+        if not database_path.is_file():
+            return False
+        try:
+            connection = sqlite3.connect(database_path, timeout=10)
+            try:
+                row = connection.execute(
+                    """
+                    SELECT 1 FROM analysis_runs
+                    WHERE kind = ? AND period_start = ? AND period_end = ?
+                      AND origin = ? AND status = 'completed'
+                    LIMIT 1
+                    """,
+                    (kind, period_start, period_end, origin),
+                ).fetchone()
+            finally:
+                connection.close()
+        except sqlite3.DatabaseError:
+            return False
+        return row is not None
 
     def reusable_artifact(
         self,
