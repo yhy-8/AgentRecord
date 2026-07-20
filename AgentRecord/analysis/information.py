@@ -14,6 +14,7 @@ from ..ai_client import (
     _normalized_query,
     call_ai,
     response_telemetry,
+    third_party_search_available,
     web_search_available,
 )
 from .context import _existing_logs, _period_records
@@ -405,7 +406,11 @@ def generate_information_briefing(
             [item["topic_id"] for item in targeted],
         )
         completed_queries = telemetry.get("completed_search_queries")
-        if isinstance(completed_queries, list):
+        if (
+            not model_config.get("search", False)
+            and third_party_search_available()
+            and isinstance(completed_queries, list)
+        ):
             missing_queries = [
                 item["query"]
                 for item in queries

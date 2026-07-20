@@ -277,6 +277,28 @@ class InformationBriefingTests(unittest.TestCase):
         self.assertIsNone(path)
         self.assertIn("没有逐项执行全部授权查询", message)
 
+    def test_native_search_does_not_require_third_party_query_telemetry(self):
+        date = datetime.date(2026, 7, 15)
+        response = AIResponse(
+            self.valid_briefing(),
+            True,
+            1,
+            {},
+            5,
+            telemetry={
+                "completed_search_queries": [],
+                "search_evidence": [],
+            },
+        )
+
+        with patch.object(information, "call_ai", return_value=response):
+            _, success, path = information.generate_information_briefing(
+                date, {"name": "mock", "search": True}
+            )
+
+        self.assertTrue(success)
+        self.assertTrue(path.exists())
+
     def test_briefing_fails_when_web_search_is_not_configured(self):
         settings.CONFIG["third_search"] = {"enabled": False, "api_key": ""}
 
