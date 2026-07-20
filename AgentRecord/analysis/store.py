@@ -441,6 +441,7 @@ class AnalysisStore:
         with self.transaction() as connection:
             for record in records:
                 text = str(record.get("text", ""))
+                content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
                 values = (
                     record["source_id"],
                     record["path"],
@@ -449,10 +450,31 @@ class AnalysisStore:
                     int(record["record_index"]),
                     record.get("speaker", "user"),
                     record.get("tag", ""),
-                    hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    content_hash,
                     text[:500],
                     now,
                 )
+                existing = connection.execute(
+                    """
+                    SELECT relative_path, source_date, source_time, record_index,
+                           speaker, tag, content_hash
+                    FROM source_catalog WHERE source_id = ?
+                    """,
+                    (record["source_id"],),
+                ).fetchone()
+                immutable_values = (
+                    record["path"],
+                    record["date"],
+                    record["time"],
+                    int(record["record_index"]),
+                    record.get("speaker", "user"),
+                    record.get("tag", ""),
+                    content_hash,
+                )
+                if existing and tuple(existing) != immutable_values:
+                    raise RuntimeError(
+                        f"来源 ID {record['source_id']} 已指向不同记录，拒绝覆写历史证据"
+                    )
                 connection.execute(
                     """
                     INSERT INTO source_catalog(
@@ -460,14 +482,6 @@ class AnalysisStore:
                         record_index, speaker, tag, content_hash, excerpt, last_seen_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(source_id) DO UPDATE SET
-                        relative_path=excluded.relative_path,
-                        source_date=excluded.source_date,
-                        source_time=excluded.source_time,
-                        record_index=excluded.record_index,
-                        speaker=excluded.speaker,
-                        tag=excluded.tag,
-                        content_hash=excluded.content_hash,
-                        excerpt=excluded.excerpt,
                         last_seen_at=excluded.last_seen_at
                     """,
                     values,

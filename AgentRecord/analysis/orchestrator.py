@@ -28,6 +28,7 @@ from .context import (
     _information_briefings,
     _monthly_supporting_reports,
     _period_records,
+    _record_chunks,
     _recent_summary_context,
     _referenced_records_context,
     _referenced_source_records,
@@ -39,7 +40,10 @@ from .store import AnalysisStore
 logger = logging.getLogger(__name__)
 _LONG_ID_PATTERN = re.compile(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])")
 _MAX_AGENT_ATTEMPTS = 3
-_PIPELINE_VERSION = 4
+_MAX_AGENT_INPUT_CHARACTERS = 120000
+_MAX_RECORD_CHUNK_CHARACTERS = 30000
+_MAX_PROFILE_CONTEXT_CHARACTERS = 24000
+_PIPELINE_VERSION = 5
 
 
 def _analysis_config_signature(model_config: settings.ModelDict) -> dict:
@@ -82,9 +86,27 @@ def _replace_id_substrings(value: object, replacements: dict[str, str]) -> objec
 
 
 def _profile_input(profiles: list[dict]) -> tuple[list[dict], dict[str, str]]:
+    selected = []
+    size = 0
+    for profile in sorted(
+        profiles,
+        key=lambda item: (
+            str(item.get("last_observed", "")),
+            str(item.get("updated_at", "")),
+            str(item.get("id", "")),
+        ),
+        reverse=True,
+    ):
+        profile_size = len(json.dumps(profile, ensure_ascii=False))
+        if profile_size > _MAX_PROFILE_CONTEXT_CHARACTERS:
+            continue
+        if size + profile_size > _MAX_PROFILE_CONTEXT_CHARACTERS:
+            continue
+        selected.append(profile)
+        size += profile_size
     id_to_alias = {
         profile["id"]: f"P{index:03d}"
-        for index, profile in enumerate(sorted(profiles, key=lambda item: item["id"]), 1)
+        for index, profile in enumerate(sorted(selected, key=lambda item: item["id"]), 1)
     }
     alias_to_id = {alias: entry_id for entry_id, alias in id_to_alias.items()}
     compact = [
@@ -98,7 +120,7 @@ def _profile_input(profiles: list[dict]) -> tuple[list[dict], dict[str, str]]:
             "first_observed": profile["first_observed"],
             "last_observed": profile["last_observed"],
         }
-        for profile in profiles
+        for profile in selected
     ]
     return _replace_id_substrings(compact, id_to_alias), alias_to_id
 
@@ -172,6 +194,17 @@ def _call_agent(
 ) -> dict:
     logger.info("agent_start run=%s agent=%s", run_id, spec.name)
     try:
+        input_size = len(json.dumps(input_data, ensure_ascii=False))
+        revision_size = (
+            len(json.dumps(revision_context, ensure_ascii=False))
+            if revision_context
+            else 0
+        )
+        if input_size + revision_size > _MAX_AGENT_INPUT_CHARACTERS:
+            raise AgentPipelineError(
+                f"{spec.name} 输入超过安全上限（{input_size + revision_size} > "
+                f"{_MAX_AGENT_INPUT_CHARACTERS} 字符）"
+            )
         payload = invoke_agent(
             spec,
             task,
@@ -531,6 +564,127 @@ def _retrospective_section(
             source="Reviewer 实质审查",
         )
     raise AgentPipelineError("整理与回顾修订次数耗尽: " + "; ".join(last_feedback))
+
+
+def _merge_chunk_profile_entries(
+    chunk_results: list[tuple[str, list[dict], dict[str, str]]],
+) -> tuple[str, list[dict], dict[str, str]]:
+    markdown_sections = []
+    entries = []
+    decisions = {}
+    signatures = set()
+    superseded_ids = set()
+    candidates_with_decisions = []
+    for markdown, candidates, chunk_decisions in chunk_results:
+        markdown_sections.append(markdown)
+        candidates_with_decisions.extend(
+            (
+                candidate,
+                chunk_decisions.get(candidate["temp_id"], "rejected"),
+            )
+            for candidate in candidates
+        )
+    candidates_with_decisions.sort(
+        key=lambda item: item[1] != "accepted"
+    )
+    for candidate, decision in candidates_with_decisions:
+        signature = (
+            candidate["category"],
+            re.sub(r"\s+", "", candidate["title"]).casefold(),
+            re.sub(r"\s+", "", candidate["statement"]).casefold(),
+        )
+        supersedes_id = candidate.get("supersedes_id")
+        if (
+            signature in signatures
+            or (supersedes_id and supersedes_id in superseded_ids)
+            or len(entries) == 12
+        ):
+            continue
+        new_temp_id = f"p{len(entries) + 1}"
+        entries.append({**candidate, "temp_id": new_temp_id})
+        decisions[new_temp_id] = decision
+        signatures.add(signature)
+        if supersedes_id:
+            superseded_ids.add(supersedes_id)
+    return "\n\n".join(markdown_sections), entries, decisions
+
+
+def _retrospective_with_input_budget(
+    base_input: dict,
+    allowed_source_ids: set[str],
+    current_source_ids: set[str],
+    profile_aliases: dict[str, str],
+    model_config: settings.ModelDict,
+    store: AnalysisStore,
+    run_id: str,
+    *,
+    visible_profiles_by_id: dict[str, dict] | None = None,
+    task: str = (
+        "生成整理与回顾板块和人物画像候选。"
+        "没有值得长期保存的画像时返回空数组，不要凑数。"
+    ),
+) -> tuple[str, list[dict], dict[str, str]]:
+    if len(json.dumps(base_input, ensure_ascii=False)) <= _MAX_AGENT_INPUT_CHARACTERS:
+        return _retrospective_section(
+            base_input,
+            allowed_source_ids,
+            current_source_ids,
+            profile_aliases,
+            model_config,
+            store,
+            run_id,
+            visible_profiles_by_id=visible_profiles_by_id,
+            task=task,
+        )
+
+    records = [*base_input["records"], *base_input.get("referenced_records", [])]
+    if not records:
+        raise AgentPipelineError("Retrospective 固定上下文超过安全上限")
+    chunks = _record_chunks(records, _MAX_RECORD_CHUNK_CHARACTERS)
+    chunk_results = []
+    for index, chunk in enumerate(chunks, 1):
+        chunk_ids = {record["source_id"] for record in chunk}
+        chunk_current_ids = chunk_ids & current_source_ids
+        chunk_input = {
+            **base_input,
+            "records": [
+                record for record in chunk if record["source_id"] in current_source_ids
+            ],
+            "referenced_records": [
+                record for record in chunk if record["source_id"] not in current_source_ids
+            ],
+            "chunk": {"index": index, "total": len(chunks)},
+        }
+        chunk_results.append(
+            _retrospective_section(
+                chunk_input,
+                allowed_source_ids
+                & (chunk_ids | (allowed_source_ids - current_source_ids)),
+                chunk_current_ids,
+                profile_aliases,
+                model_config,
+                store,
+                run_id,
+                visible_profiles_by_id=visible_profiles_by_id,
+                task=(
+                    task
+                    + f" 当前只处理第 {index}/{len(chunks)} 个原文分块；"
+                    "不得声称覆盖未提供的分块。"
+                ),
+            )
+        )
+    markdown, entries, decisions = _merge_chunk_profile_entries(chunk_results)
+    store.save_artifact(
+        run_id,
+        retrospective.SPEC.name,
+        {
+            "markdown": markdown,
+            "profile_entries": entries,
+            "entry_decisions": decisions,
+            "input_chunks": len(chunks),
+        },
+    )
+    return markdown, entries, decisions
 
 
 def _research_topics(
@@ -1072,11 +1226,15 @@ def generate_daily_profile(
         store = AnalysisStore()
         current_source_ids = {record["source_id"] for record in records}
         profiles = store.active_profiles(date.isoformat())
-        profiles_by_id = {profile["id"]: profile for profile in profiles}
         historical_source_ids = {
             ref for profile in profiles for ref in profile["source_refs"]
         }
         compact_profiles, profile_aliases = _profile_input(profiles)
+        profiles_by_id = {
+            profile["id"]: profile
+            for profile in profiles
+            if profile["id"] in profile_aliases.values()
+        }
         referenced_records = _referenced_source_records(logs)
         referenced_sources = _referenced_records_context(referenced_records)
         referenced_source_ids = {
@@ -1116,11 +1274,11 @@ def generate_daily_profile(
             "records": records,
             "referenced_records": referenced_records,
             "historical_profiles": compact_profiles,
-            "referenced_sources": referenced_sources,
+            "historical_profile_omissions": len(profiles) - len(compact_profiles),
             "recent_summaries": recent_summaries,
             "supporting_reports": "（每日人物画像不读取周期报告）",
         }
-        _, entries, decisions = _retrospective_section(
+        _, entries, decisions = _retrospective_with_input_budget(
             retrospective_input,
             current_source_ids | referenced_source_ids | historical_source_ids,
             current_source_ids,
@@ -1212,7 +1370,6 @@ def generate_analysis_report(
         store = AnalysisStore()
         current_source_ids = {record["source_id"] for record in records}
         profiles = store.active_profiles(end.isoformat())
-        profiles_by_id = {profile["id"]: profile for profile in profiles}
         historical_source_ids = {
             ref for profile in profiles for ref in profile["source_refs"]
         }
@@ -1275,12 +1432,17 @@ def generate_analysis_report(
         )
 
         compact_profiles, profile_aliases = _profile_input(profiles)
+        profiles_by_id = {
+            profile["id"]: profile
+            for profile in profiles
+            if profile["id"] in profile_aliases.values()
+        }
         retrospective_input = {
             "period": {"kind": kind, "start": start.isoformat(), "end": end.isoformat()},
             "records": records,
             "referenced_records": referenced_records,
             "historical_profiles": compact_profiles,
-            "referenced_sources": referenced_sources,
+            "historical_profile_omissions": len(profiles) - len(compact_profiles),
             "recent_summaries": recent_summaries,
             "supporting_reports": supporting_reports,
         }
@@ -1298,15 +1460,17 @@ def generate_analysis_report(
             if not retrospective_markdown or not isinstance(entries, list):
                 cache_run_id = None
         if cache_run_id is None:
-            retrospective_markdown, entries, decisions = _retrospective_section(
-                retrospective_input,
-                allowed_source_ids,
-                current_source_ids,
-                profile_aliases,
-                model_config,
-                store,
-                run_id,
-                visible_profiles_by_id=profiles_by_id,
+            retrospective_markdown, entries, decisions = (
+                _retrospective_with_input_budget(
+                    retrospective_input,
+                    allowed_source_ids,
+                    current_source_ids,
+                    profile_aliases,
+                    model_config,
+                    store,
+                    run_id,
+                    visible_profiles_by_id=profiles_by_id,
+                )
             )
         else:
             store.save_artifact(
@@ -1334,6 +1498,12 @@ def generate_analysis_report(
             "retrospective": retrospective_markdown,
             "daily_information_briefings": information_leads,
         }
+        if len(json.dumps(planner_input, ensure_ascii=False)) > _MAX_AGENT_INPUT_CHARACTERS:
+            planner_input["records"] = []
+            planner_input["record_input_note"] = (
+                "原始记录已由 Retrospective 分块审查；请从带 R-* 引用的 retrospective "
+                "中选择记录驱动主题，source_refs 只能复制其中出现的来源 ID。"
+            )
         cached_planner = store.reusable_artifact(
             *cache_arguments, research_planner.SPEC.name
         )

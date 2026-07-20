@@ -15,6 +15,7 @@ from .file_lock import FileLock
 
 
 RECORD_MARKER = "<!-- agentrecord-record -->"
+ESCAPED_RECORD_MARKER = "<!-- agentrecord-record-text -->"
 
 
 def _acquire_journal_lock() -> FileLock:
@@ -160,6 +161,12 @@ def append_log(
 ) -> None:
     """按回车提交时间追加记录；一次写入只使用一个时间值。"""
     submitted_at = submitted_at or datetime.datetime.now()
+    content = re.sub(
+        rf"^{re.escape(RECORD_MARKER)}\s*$",
+        ESCAPED_RECORD_MARKER,
+        content,
+        flags=re.MULTILINE,
+    )
     lock = _acquire_journal_lock()
     try:
         file_path = init_file_if_not_exists(submitted_at)
@@ -247,7 +254,12 @@ def delete_last_record() -> bool:
             return False
         content = file_path.read_text(encoding="utf-8")
         marker_matches = list(
-            re.finditer(rf"^{re.escape(RECORD_MARKER)}\s*$", content, re.MULTILINE)
+            re.finditer(
+                rf"^{re.escape(RECORD_MARKER)}\s*\n"
+                r"(?=\*\*\d{2}:\d{2}(?: [^\n]*?)?:\*\*)",
+                content,
+                re.MULTILINE,
+            )
         )
         header_matches = list(
             re.finditer(r"^\*\*\d{2}:\d{2}", content, re.MULTILINE)

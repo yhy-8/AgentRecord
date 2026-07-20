@@ -80,7 +80,9 @@ def cited_source_ids(markdown: str) -> set[str]:
     """Return source IDs appearing inside Markdown citation brackets."""
     refs: set[str] = set()
     for citation in re.findall(r"\[([^\]\n]+)\]", markdown):
-        refs.update(re.findall(r"R-\d{8}-\d{3}", citation))
+        refs.update(
+            re.findall(r"R-\d{8}-\d{3}(?:-[0-9a-f]{12})?", citation)
+        )
         for match in re.finditer(
             r"R-(\d{8})-(\d{3})\s*(?:~|～|–|—|至)\s*"
             r"(?:(?:R-(\d{8})-)?(\d{3}))",

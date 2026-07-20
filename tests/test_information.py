@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from AgentRecord import settings
-from AgentRecord.ai_client import AIResponse
+from AgentRecord.ai_client import AIResponse, ToolResult
 from AgentRecord.analysis import context, information
 
 
@@ -84,8 +84,41 @@ class InformationBriefingTests(unittest.TestCase):
             "api_key": "test-key",
             "api_url": "https://search.example.test",
         }
+        evidence = [
+            {
+                "title": f"来源 {number}",
+                "url": f"https://example.com/{number}",
+                "snippet": "摘要",
+                "published": "2026-07-15",
+            }
+            for number in range(1, 6)
+        ] + [
+            {
+                "title": f"定向来源 {number}",
+                "url": f"https://example.com/target-{number}",
+                "snippet": "定向摘要",
+                "published": "2026-07-15",
+            }
+            for number in range(1, 4)
+        ]
+        self.search_patch = patch.object(
+            information,
+            "search_web_once",
+            side_effect=lambda query: (
+                ToolResult(
+                    "\n".join(
+                        f"[{item['title']}]({item['url']})" for item in evidence
+                    ),
+                    len(evidence),
+                    evidence,
+                ),
+                "",
+            ),
+        )
+        self.search_mock = self.search_patch.start()
 
     def tearDown(self):
+        self.search_patch.stop()
         settings.DIARY_DIR = self.original_diary_dir
         settings.ANALYSIS_DIR = self.original_analysis_dir
         if self.original_third_search is None:
@@ -111,7 +144,7 @@ class InformationBriefingTests(unittest.TestCase):
             allowed_tools=None,
             allowed_search_queries=None,
         ):
-            if allowed_tools == ():
+            if prompt.startswith("[程序每日信息选题任务]"):
                 payload = {
                     "queries": [
                         {
@@ -172,7 +205,7 @@ class InformationBriefingTests(unittest.TestCase):
             allowed_tools=None,
             allowed_search_queries=None,
         ):
-            if allowed_tools == ():
+            if prompt.startswith("[程序每日信息选题任务]"):
                 planner_prompts.append(prompt)
                 return (
                     json.dumps(
@@ -347,61 +380,94 @@ class InformationBriefingTests(unittest.TestCase):
         self.assertTrue(revision_prompt.startswith(original_prompt))
         self.assertIn("缺少章节和链接", revision_prompt)
         self.assertIn("缺少必需章节", revision_prompt)
-        self.assertIn(
-            "allowed_search_queries", call.call_args_list[0].kwargs
-        )
+        self.assertEqual((), call.call_args_list[0].kwargs["allowed_tools"])
         self.assertEqual((), call.call_args_list[1].kwargs["allowed_tools"])
-        self.assertNotIn(
-            "allowed_search_queries", call.call_args_list[1].kwargs
-        )
+        self.assertNotIn("allowed_search_queries", call.call_args_list[0].kwargs)
+        self.assertNotIn("allowed_search_queries", call.call_args_list[1].kwargs)
 
-    def test_third_party_collector_must_execute_every_authorized_query(self):
+    def test_controller_executes_every_query_before_collector(self):
         date = datetime.date(2026, 7, 15)
-        first_query = f"{date:%Y-%m-%d} 全球重要新闻 国际 科技 科学 经济"
-        response = AIResponse(
-            self.valid_briefing(),
-            True,
-            0,
-            {"web_search": 1},
-            5,
-            telemetry={
-                "completed_search_queries": [
-                    information._normalized_query(first_query)
-                ],
-                "search_evidence": [],
-            },
-        )
+        with patch.object(
+            information,
+            "call_ai",
+            return_value=self.audited_response(self.valid_briefing()),
+        ) as collector:
+            _, success, path = information.generate_information_briefing(
+                date, {"name": "mock", "search": False}
+            )
 
-        with patch.object(information, "call_ai", return_value=response):
+        self.assertTrue(success)
+        self.assertIsNotNone(path)
+        self.assertEqual(2, self.search_mock.call_count)
+        collector.assert_called_once()
+        self.assertIn("【中控已审计搜索证据】", collector.call_args.args[0])
+
+    def test_collector_is_not_called_when_all_searches_have_no_evidence(self):
+        date = datetime.date(2026, 7, 15)
+        self.search_mock.side_effect = lambda query: (ToolResult("搜索无结果"), "")
+        with patch.object(information, "call_ai") as collector:
             message, success, path = information.generate_information_briefing(
                 date, {"name": "mock", "search": False}
             )
 
         self.assertFalse(success)
         self.assertIsNone(path)
-        self.assertIn("没有逐项执行全部授权查询", message)
+        self.assertIn("没有返回可审计的来源证据", message)
+        collector.assert_not_called()
 
-    def test_native_search_model_still_requires_auditable_third_party_results(self):
+    def test_zero_evidence_target_is_dropped_before_collector_generation(self):
         date = datetime.date(2026, 7, 15)
-        response = AIResponse(
-            self.valid_briefing(),
-            True,
-            1,
-            {},
-            5,
-            telemetry={
-                "completed_search_queries": [],
-                "search_evidence": [],
-            },
+        (settings.DIARY_DIR / "2026-07-15.md").write_text(
+            "**09:00:** 想研究一个定向问题。\n", encoding="utf-8"
         )
+        general_evidence = [
+            {
+                "title": f"来源 {number}",
+                "url": f"https://example.com/{number}",
+                "snippet": "摘要",
+                "published": "2026-07-15",
+            }
+            for number in range(1, 6)
+        ]
 
-        with patch.object(information, "call_ai", return_value=response):
+        def search(query):
+            if "全球重要新闻" in query or "中国重要新闻" in query:
+                return ToolResult("综合搜索结果", 5, general_evidence), ""
+            return ToolResult("搜索无结果"), ""
+
+        collector_calls = []
+
+        def fake_call_ai(prompt, model_config, *, allowed_tools=None, **kwargs):
+            if prompt.startswith("[程序每日信息选题任务]"):
+                return (
+                    json.dumps(
+                        {
+                            "queries": [
+                                {"query": "无公开资料的定向问题", "reason": "核查"}
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                    True,
+                    0,
+                    {},
+                    0,
+                )
+            collector_calls.append(prompt)
+            return self.audited_response(self.valid_briefing())
+
+        self.search_mock.side_effect = search
+        with patch.object(information, "call_ai", side_effect=fake_call_ai):
             _, success, path = information.generate_information_briefing(
-                date, {"name": "mock", "search": True}
+                date, {"name": "mock", "search": False}
             )
 
-        self.assertFalse(success)
-        self.assertIsNone(path)
+        self.assertTrue(success)
+        self.assertEqual(1, len(collector_calls))
+        self.assertNotIn("无公开资料的定向问题", collector_calls[0])
+        saved = path.read_text(encoding="utf-8")
+        self.assertIn("零证据移除 1 项", saved)
+        self.assertIn("无公开资料的定向问题", saved)
 
     def test_briefing_fails_when_web_search_is_not_configured(self):
         settings.CONFIG["third_search"] = {"enabled": False, "api_key": ""}

@@ -48,6 +48,13 @@ logger = logging.getLogger(__name__)
 
 _MAX_AUTOMATIC_CONTENT_FAILURES = 2
 _CONTENT_FAILURE_POLICY_VERSION = 2
+_AUTOMATION_TASK_ORDER = (
+    "daily_summary",
+    "daily_profile",
+    "daily_information",
+    "weekly_report",
+    "monthly_report",
+)
 
 
 class _AutomationLock:
@@ -154,6 +161,65 @@ def _stored_task_target(
     return _default_task_target(task, now)
 
 
+def _pending_task_targets(state: dict, task: str) -> list[dict[str, str]]:
+    """Return validated pending targets in deterministic chronological order."""
+    raw_targets = state.get("pending_targets", {}).get(task, [])
+    if not isinstance(raw_targets, list):
+        return []
+    targets = []
+    seen = set()
+    for value in raw_targets:
+        if not isinstance(value, dict) or not value.get("start") or not value.get("end"):
+            continue
+        target = {"start": str(value["start"]), "end": str(value["end"])}
+        try:
+            start = datetime.date.fromisoformat(target["start"])
+            end = datetime.date.fromisoformat(target["end"])
+        except ValueError:
+            continue
+        if start > end:
+            continue
+        key = (target["start"], target["end"])
+        if key in seen:
+            continue
+        targets.append(target)
+        seen.add(key)
+    return sorted(targets, key=lambda item: (item["start"], item["end"]))
+
+
+def _enqueue_task_target(state: dict, task: str, target: dict[str, str]) -> None:
+    targets = _pending_task_targets(state, task)
+    normalized = {"start": str(target["start"]), "end": str(target["end"])}
+    if normalized not in targets:
+        targets.append(normalized)
+        targets.sort(key=lambda item: (item["start"], item["end"]))
+    state.setdefault("pending_targets", {})[task] = targets
+
+
+def _dequeue_task_target(state: dict, task: str, target: dict[str, str]) -> None:
+    targets = [
+        item for item in _pending_task_targets(state, task) if item != target
+    ]
+    pending = state.get("pending_targets", {})
+    if targets:
+        pending[task] = targets
+    else:
+        pending.pop(task, None)
+    if not pending:
+        state.pop("pending_targets", None)
+
+
+def _clear_pending_task(state: dict, task: str) -> None:
+    pending = state.get("pending_targets", {})
+    pending.pop(task, None)
+    if not pending:
+        state.pop("pending_targets", None)
+
+
+def _has_pending_targets(state: dict) -> bool:
+    return any(_pending_task_targets(state, task) for task in _AUTOMATION_TASK_ORDER)
+
+
 def _content_failure_key(
     task: str,
     now: datetime.datetime,
@@ -247,6 +313,7 @@ def _set_task_error(
     if task in AUTOMATION_TASK_LABELS:
         target = target or _stored_task_target(state, task, now)
         state.setdefault("failure_targets", {})[task] = target
+        _enqueue_task_target(state, task, target)
         if is_config_failure(message):
             state.setdefault("retry_kind", {})[task] = "blocked"
             retry_after = state.get("retry_after", {})
@@ -441,6 +508,14 @@ def _task_missing(
     return False
 
 
+def _task_missing_for_target(
+    task: str, now: datetime.datetime, target: dict[str, str]
+) -> bool:
+    if target == _default_task_target(task, now):
+        return _task_missing(task, now)
+    return _task_missing(task, now, target=target)
+
+
 def _task_artifact_status(task: str, now: datetime.datetime) -> str:
     today = now.date()
     if task == "daily_summary":
@@ -478,13 +553,13 @@ def _task_should_run(
     now: datetime.datetime,
     *,
     initial_detection_due: bool,
+    target: dict[str, str] | None = None,
 ) -> bool:
     stored_target = state.get("failure_targets", {}).get(task)
-    target = (
-        _stored_task_target(state, task, now)
-        if task in state.get("errors", {}) and isinstance(stored_target, dict)
-        else None
-    )
+    if target is None and task in state.get("errors", {}) and isinstance(
+        stored_target, dict
+    ):
+        target = _stored_task_target(state, task, now)
     if task in state.get("errors", {}):
         if state.get("retry_kind", {}).get(task) == "content_blocked":
             previous_key = str(state.get("failure_keys", {}).get(task, ""))
@@ -498,10 +573,11 @@ def _task_should_run(
             return False
     elif not initial_detection_due:
         return False
-    if target is None:
-        missing = _task_missing(task, now)
-    else:
-        missing = _task_missing(task, now, target=target)
+    missing = (
+        _task_missing(task, now)
+        if target is None
+        else _task_missing_for_target(task, now, target)
+    )
     if missing:
         return True
     _clear_task_error(state, task)
@@ -540,6 +616,168 @@ def _run_daily_summaries(
     _save_automation_state(state)
 
 
+def _scan_missing_targets(
+    state: dict,
+    now: datetime.datetime,
+    automation: dict,
+    *,
+    hourly_detection_due: bool,
+    daily_information_due: bool,
+) -> None:
+    """Persist exact targets before a predecessor can block their execution."""
+    initial_due = {
+        "daily_summary": hourly_detection_due or daily_information_due,
+        "daily_profile": hourly_detection_due or daily_information_due,
+        "daily_information": hourly_detection_due or daily_information_due,
+        "weekly_report": hourly_detection_due,
+        "monthly_report": hourly_detection_due,
+    }
+    for task in _AUTOMATION_TASK_ORDER:
+        if not automation.get(task, True):
+            _clear_task_error(state, task)
+            _clear_pending_task(state, task)
+            continue
+        if initial_due[task]:
+            target = _default_task_target(task, now)
+            if _task_missing(task, now):
+                _enqueue_task_target(state, task, target)
+            else:
+                _dequeue_task_target(state, task, target)
+        if task in state.get("errors", {}):
+            _enqueue_task_target(state, task, _stored_task_target(state, task, now))
+
+
+def _failure_batch_date(task: str, target: dict[str, str]) -> datetime.date:
+    if task in {"daily_summary", "daily_profile"}:
+        return datetime.date.fromisoformat(target["start"]) + datetime.timedelta(days=1)
+    if task == "daily_information":
+        return datetime.date.fromisoformat(target["start"])
+    return datetime.date.fromisoformat(target["end"]) + datetime.timedelta(days=1)
+
+
+def _enqueue_legacy_failure_followups(
+    state: dict, now: datetime.datetime, automation: dict
+) -> None:
+    """Upgrade pre-queue failure state without losing its blocked downstream work."""
+    errors = state.get("errors", {})
+    for index, task in enumerate(_AUTOMATION_TASK_ORDER):
+        if task not in errors:
+            continue
+        target = _stored_task_target(state, task, now)
+        try:
+            batch_date = _failure_batch_date(task, target)
+        except (KeyError, ValueError):
+            continue
+        batch_now = datetime.datetime.combine(batch_date, datetime.time(12, 0))
+        for downstream in _AUTOMATION_TASK_ORDER[index + 1 :]:
+            if not automation.get(downstream, True):
+                continue
+            downstream_target = _default_task_target(downstream, batch_now)
+            if _task_missing_for_target(downstream, now, downstream_target):
+                _enqueue_task_target(state, downstream, downstream_target)
+        break
+
+
+def _run_pending_task(
+    task: str,
+    target: dict[str, str],
+    now: datetime.datetime,
+    state: dict,
+    model: settings.ModelDict,
+    *,
+    retry_trigger: bool,
+) -> None:
+    if retry_trigger and task in state.get("errors", {}):
+        _retry_one_task(task, now, state, model)
+        return
+    trigger = (
+        "retry"
+        if retry_trigger or task in state.get("errors", {})
+        else "scheduled"
+    )
+    if task == "daily_summary":
+        _run_daily_summaries(now.date(), state, model, target=target)
+    elif task == "daily_profile":
+        _run_daily_profile(now.date(), state, model, trigger=trigger, target=target)
+    elif task == "daily_information":
+        _run_daily_information(
+            now,
+            state,
+            model,
+            target=target,
+            ignore_schedule=retry_trigger,
+        )
+    elif task == "weekly_report":
+        _run_weekly_reports(
+            now.date(), state, model, trigger=trigger, target=target
+        )
+    elif task == "monthly_report":
+        _run_monthly_reports(
+            now.date(), state, model, trigger=trigger, target=target
+        )
+
+
+def _process_pending_targets(
+    now: datetime.datetime,
+    state: dict,
+    model: settings.ModelDict,
+    *,
+    manual_retry: bool = False,
+    process_all: bool = False,
+) -> None:
+    """Run queued targets in dependency order without crossing an older target."""
+    maximum_rounds = 100 if process_all else 1
+    for _ in range(maximum_rounds):
+        progressed = False
+        for task in _AUTOMATION_TASK_ORDER:
+            targets = _pending_task_targets(state, task)
+            if not targets:
+                continue
+            target = targets[0]
+            if manual_retry and task in state.get("errors", {}):
+                should_run = True
+            else:
+                should_run = _task_should_run(
+                    state,
+                    task,
+                    now,
+                    initial_detection_due=True,
+                    target=target,
+                )
+            if not should_run:
+                if task in state.get("errors", {}):
+                    _save_automation_state(state)
+                    return
+                _dequeue_task_target(state, task, target)
+                _save_automation_state(state)
+                progressed = True
+                if _pending_task_targets(state, task):
+                    break
+                continue
+
+            _run_pending_task(
+                task,
+                target,
+                now,
+                state,
+                model,
+                retry_trigger=manual_retry,
+            )
+            if manual_retry:
+                fresh_state = _load_automation_state()
+                state.clear()
+                state.update(fresh_state)
+            progressed = True
+            if task in state.get("errors", {}):
+                return
+            _dequeue_task_target(state, task, target)
+            _save_automation_state(state)
+            if _pending_task_targets(state, task):
+                break
+        if not process_all or not progressed or not _has_pending_targets(state):
+            return
+
+
 def run_due_automatic_tasks() -> None:
     """执行到期的日总结、每日信息简报和闭合周期报告。"""
     automation = settings.CONFIG.get("automation", {})
@@ -567,117 +805,19 @@ def run_due_automatic_tasks() -> None:
             now.time() >= _daily_information_scheduled_time()
             and _task_missing("daily_information", now)
         )
-        due_tasks = []
-        task_settings = (
-            (
-                "daily_summary",
-                "daily_summary",
-                hourly_detection_due or daily_information_due,
-            ),
-            (
-                "daily_profile",
-                "daily_profile",
-                hourly_detection_due or daily_information_due,
-            ),
-            (
-                "daily_information",
-                "daily_information",
-                hourly_detection_due or daily_information_due,
-            ),
-            ("weekly_report", "weekly_report", hourly_detection_due),
-            ("monthly_report", "monthly_report", hourly_detection_due),
+        _scan_missing_targets(
+            state,
+            now,
+            automation,
+            hourly_detection_due=hourly_detection_due,
+            daily_information_due=daily_information_due,
         )
-        for task, config_key, initial_due in task_settings:
-            if not automation.get(config_key, True):
-                _clear_task_error(state, task)
-                continue
-            if _task_should_run(
-                state, task, now, initial_detection_due=initial_due
-            ):
-                due_tasks.append(task)
-            elif task in state.get("errors", {}):
-                # A recorded predecessor failure is a dependency barrier even
-                # while its own retry deadline has not arrived.
-                break
+        _enqueue_legacy_failure_followups(state, now, automation)
         _save_automation_state(state)
 
-        if due_tasks:
+        if _has_pending_targets(state):
             model_config = _automation_model()
-            today = now.date()
-            halt = False
-            if "daily_summary" in due_tasks and not halt:
-                target = (
-                    _stored_task_target(state, "daily_summary", now)
-                    if "daily_summary" in state.get("errors", {})
-                    else None
-                )
-                _run_daily_summaries(today, state, model_config, target=target)
-                halt = "daily_summary" in state.get("errors", {})
-            if "daily_profile" in due_tasks and not halt:
-                trigger = (
-                    "retry"
-                    if "daily_profile" in state.get("errors", {})
-                    else "scheduled"
-                )
-                _run_daily_profile(
-                    today,
-                    state,
-                    model_config,
-                    trigger=trigger,
-                    target=(
-                        _stored_task_target(state, "daily_profile", now)
-                        if "daily_profile" in state.get("errors", {})
-                        else None
-                    ),
-                )
-                halt = "daily_profile" in state.get("errors", {})
-            if "daily_information" in due_tasks and not halt:
-                _run_daily_information(
-                    now,
-                    state,
-                    model_config,
-                    target=(
-                        _stored_task_target(state, "daily_information", now)
-                        if "daily_information" in state.get("errors", {})
-                        else None
-                    ),
-                )
-                halt = "daily_information" in state.get("errors", {})
-            if "weekly_report" in due_tasks and not halt:
-                trigger = (
-                    "retry"
-                    if "weekly_report" in state.get("errors", {})
-                    else "scheduled"
-                )
-                _run_weekly_reports(
-                    today,
-                    state,
-                    model_config,
-                    trigger=trigger,
-                    target=(
-                        _stored_task_target(state, "weekly_report", now)
-                        if "weekly_report" in state.get("errors", {})
-                        else None
-                    ),
-                )
-                halt = "weekly_report" in state.get("errors", {})
-            if "monthly_report" in due_tasks and not halt:
-                trigger = (
-                    "retry"
-                    if "monthly_report" in state.get("errors", {})
-                    else "scheduled"
-                )
-                _run_monthly_reports(
-                    today,
-                    state,
-                    model_config,
-                    trigger=trigger,
-                    target=(
-                        _stored_task_target(state, "monthly_report", now)
-                        if "monthly_report" in state.get("errors", {})
-                        else None
-                    ),
-                )
+            _process_pending_targets(now, state, model_config)
         if hourly_detection_due:
             # This is only a scheduler watermark. Writing it after the work means
             # a killed process is detected again on the next minute invocation.
@@ -919,18 +1059,26 @@ def retry_failed_automatic_tasks() -> tuple[str, bool]:
         if not tasks:
             return "当前没有失败的自动任务可重试。", True
         now = datetime.datetime.now()
+        automation = settings.CONFIG.get("automation", {})
+        for task in tasks:
+            _enqueue_task_target(state, task, _stored_task_target(state, task, now))
+        _enqueue_legacy_failure_followups(state, now, automation)
         state["last_retry_started_at"] = now.isoformat(timespec="seconds")
         _save_automation_state(state)
         logger.info("automation_retry_started tasks=%s", ",".join(tasks))
         model = _automation_model()
-        for task in tasks:
-            _retry_one_task(task, now, state, model)
-            state = _load_automation_state()
-            if task in state.get("errors", {}):
-                break
+        _process_pending_targets(
+            now,
+            state,
+            model,
+            manual_retry=True,
+            process_all=True,
+        )
         state = _load_automation_state()
-        remaining = [task for task in tasks if task in state.get("errors", {})]
-        success = not remaining
+        remaining = [
+            task for task in _AUTOMATION_TASK_ORDER if task in state.get("errors", {})
+        ]
+        success = not remaining and not _has_pending_targets(state)
         logger.info(
             "automation_retry_completed success=%s remaining=%s",
             success,
@@ -938,6 +1086,8 @@ def retry_failed_automatic_tasks() -> tuple[str, bool]:
         )
         if success:
             return "全部失败自动任务重试成功。", True
+        if not remaining:
+            return "失败任务已恢复，但仍有排队中的后续自动任务。", False
         labels = "、".join(AUTOMATION_TASK_LABELS[task] for task in remaining)
         return f"以下自动任务仍失败：{labels}", False
     except Exception as error:
@@ -1122,6 +1272,11 @@ def automation_status_snapshot() -> dict:
         "retry_after": dict(state.get("retry_after", {})),
         "retry_kind": dict(state.get("retry_kind", {})),
         "failure_counts": dict(state.get("failure_counts", {})),
+        "pending_targets": {
+            task: _pending_task_targets(state, task)
+            for task in _AUTOMATION_TASK_ORDER
+            if _pending_task_targets(state, task)
+        },
         "errors": dict(state.get("errors", {})),
     }
 

@@ -78,6 +78,30 @@ class AnalysisStoreTests(unittest.TestCase):
         self.assertEqual(64, len(source["content_hash"]))
         self.assertEqual(500, len(source["excerpt"]))
 
+    def test_source_catalog_rejects_reusing_an_id_for_different_content(self):
+        run_id = self.start_run()
+        self.save_source(run_id)
+
+        with self.assertRaisesRegex(RuntimeError, "拒绝覆写历史证据"):
+            self.store.save_sources(
+                run_id,
+                [
+                    {
+                        "source_id": "R-20260707-001",
+                        "path": "2026-07-07.md",
+                        "date": "2026-07-07",
+                        "time": "09:00",
+                        "record_index": 1,
+                        "speaker": "user",
+                        "tag": "",
+                        "text": "后来变更的内容",
+                    }
+                ],
+            )
+
+        source = self.store.source_records(["R-20260707-001"])[0]
+        self.assertIn("原始记录", source["excerpt"])
+
     def test_accepted_profile_revision_supersedes_previous(self):
         first = self.start_run()
         self.save_source(first)

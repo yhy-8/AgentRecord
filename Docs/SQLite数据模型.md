@@ -70,7 +70,7 @@
 
 ## 5. source_catalog 与 run_sources
 
-`source_catalog` 以稳定 `R-YYYYMMDD-NNN` 为主键，保存：
+`source_catalog` 以稳定 `R-YYYYMMDD-NNN-HHHHHHHHHHHH` 为主键；旧数据的无哈希 `R-YYYYMMDD-NNN` 仍兼容。目录保存：
 
 - `relative_path`
 - `source_date`、`source_time`
@@ -80,7 +80,7 @@
 - 最多 500 字符 `excerpt`
 - `last_seen_at`
 
-同一位置的日记内容发生变化时，目录项更新为最近一次看到的哈希和摘录。每次运行自身的完整输入状态由 `analysis_runs.input_hash` 审计。
+末尾 12 位哈希覆盖日期、时间、标签、说话者和完整正文。同一位置的日记内容发生变化时会产生新的来源 ID，旧目录项不会被改写；保存阶段还会比较路径、日期、时间、序号、说话者、标签和正文 SHA-256，若同一 ID 指向任何不同记录则整笔事务失败，冲突时只允许刷新 `last_seen_at`。每次运行自身的完整输入状态仍由 `analysis_runs.input_hash` 审计。
 
 `run_sources` 以 `(run_id, source_id)` 为联合主键，表示一次运行使用过哪些记录。外键保证运行不能指向不存在的来源目录项。
 

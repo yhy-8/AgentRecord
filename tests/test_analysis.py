@@ -1163,6 +1163,122 @@ class AnalysisWorkflowTests(unittest.TestCase):
             run.call_args.kwargs,
         )
 
+    def test_retry_processes_cross_day_followups_with_original_targets(self):
+        summary_target = {"start": "2026-07-16", "end": "2026-07-16"}
+        information_target = {"start": "2026-07-17", "end": "2026-07-17"}
+        state = {
+            "errors": {"daily_summary": "2026-07-17 09:00 失败"},
+            "failure_targets": {"daily_summary": summary_target},
+            "pending_targets": {
+                "daily_summary": [summary_target],
+                "daily_profile": [summary_target],
+                "daily_information": [information_target],
+            },
+        }
+        automation._save_automation_state(state)
+        calls = []
+
+        def retry_summary(task, now, current_state, model):
+            calls.append((task, summary_target))
+            automation._clear_task_error(current_state, task)
+            automation._save_automation_state(current_state)
+
+        def run_profile(today, current_state, model, *, trigger, target):
+            calls.append(("daily_profile", target))
+
+        def run_information(now, current_state, model, *, target, ignore_schedule):
+            calls.append(("daily_information", target))
+
+        with patch.object(
+            automation, "_retry_one_task", side_effect=retry_summary
+        ), patch.object(
+            automation, "_task_should_run", return_value=True
+        ), patch.object(
+            automation, "_run_daily_profile", side_effect=run_profile
+        ), patch.object(
+            automation, "_run_daily_information", side_effect=run_information
+        ):
+            automation._process_pending_targets(
+                datetime.datetime(2026, 7, 18, 9, 0),
+                state,
+                {"name": "mock"},
+                manual_retry=True,
+                process_all=True,
+            )
+
+        self.assertEqual(
+            [
+                ("daily_summary", summary_target),
+                ("daily_profile", summary_target),
+                ("daily_information", information_target),
+            ],
+            calls,
+        )
+        self.assertNotIn("pending_targets", automation._load_automation_state())
+
+    def test_oversized_retrospective_records_are_processed_in_ordered_chunks(self):
+        text = "内容" * 1800
+        source_id = "R-20260714-001-123456789abc"
+        base_input = {
+            "period": {"kind": "weekly", "start": "2026-07-13", "end": "2026-07-19"},
+            "records": [{"source_id": source_id, "text": text}],
+            "referenced_records": [],
+            "historical_profiles": [],
+        }
+        seen_parts = []
+
+        def process_chunk(chunk_input, *args, **kwargs):
+            seen_parts.extend(record["text"] for record in chunk_input["records"])
+            return f"分块 {chunk_input['chunk']['index']} [{source_id}]", [], {}
+
+        store = Mock()
+        with patch.object(
+            orchestrator, "_MAX_AGENT_INPUT_CHARACTERS", 1000
+        ), patch.object(
+            orchestrator, "_MAX_RECORD_CHUNK_CHARACTERS", 1000
+        ), patch.object(
+            orchestrator, "_retrospective_section", side_effect=process_chunk
+        ) as section:
+            markdown, entries, decisions = orchestrator._retrospective_with_input_budget(
+                base_input,
+                {source_id},
+                {source_id},
+                {},
+                {"name": "mock"},
+                store,
+                "run-id",
+            )
+
+        self.assertGreater(section.call_count, 1)
+        self.assertEqual(text, "".join(seen_parts))
+        self.assertIn("分块 1", markdown)
+        self.assertEqual([], entries)
+        self.assertEqual({}, decisions)
+
+    def test_profile_context_budget_prefers_recent_observations(self):
+        def profile(entry_id, observed, text):
+            return {
+                "id": entry_id,
+                "category": "interest",
+                "title": entry_id,
+                "statement": text,
+                "confidence": 0.8,
+                "source_refs": [],
+                "first_observed": observed,
+                "last_observed": observed,
+                "updated_at": observed,
+            }
+
+        profiles = [
+            profile("old", "2026-01-01", "旧" * 600),
+            profile("new", "2026-07-14", "新" * 600),
+        ]
+        with patch.object(orchestrator, "_MAX_PROFILE_CONTEXT_CHARACTERS", 1000):
+            compact, aliases = orchestrator._profile_input(profiles)
+
+        self.assertEqual(["new"], list(aliases.values()))
+        self.assertEqual("new", compact[0]["title"])
+
     def test_same_content_failure_stops_after_one_automatic_retry(self):
         state = {}
         with patch.object(

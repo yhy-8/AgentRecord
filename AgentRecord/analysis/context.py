@@ -1,6 +1,7 @@
 """Report input preparation, source resolution, and period paths."""
 
 import datetime
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -231,8 +232,14 @@ _RECORD_PATTERN = re.compile(
 _MARKED_RECORD_PATTERN = re.compile(
     rf"^{re.escape(journal.RECORD_MARKER)}\s*\n"
     r"\*\*(\d{2}:\d{2})(?: ([^\n]*?))?:\*\*\s?(.*?)"
-    rf"(?=^{re.escape(journal.RECORD_MARKER)}\s*\n|\Z)",
+    rf"(?=^{re.escape(journal.RECORD_MARKER)}\s*\n"
+    r"(?=\*\*\d{2}:\d{2}(?: [^\n]*?)?:\*\*)|\Z)",
     re.MULTILINE | re.DOTALL,
+)
+_VALID_RECORD_MARKER_PATTERN = re.compile(
+    rf"^{re.escape(journal.RECORD_MARKER)}\s*\n"
+    r"(?=\*\*\d{2}:\d{2}(?: [^\n]*?)?:\*\*)",
+    re.MULTILINE,
 )
 
 
@@ -240,10 +247,11 @@ def _period_records(logs: list[tuple[str, str]]) -> list[dict]:
     """Parse immutable report input into addressable journal records."""
     records = []
     for date, content in logs:
-        marker_index = content.find(journal.RECORD_MARKER)
-        if marker_index < 0:
+        first_marker = _VALID_RECORD_MARKER_PATTERN.search(content)
+        if first_marker is None:
             matches = list(_RECORD_PATTERN.finditer(content))
         else:
+            marker_index = first_marker.start()
             matches = [
                 *_RECORD_PATTERN.finditer(content[:marker_index]),
                 *_MARKED_RECORD_PATTERN.finditer(content[marker_index:]),
@@ -251,33 +259,78 @@ def _period_records(logs: list[tuple[str, str]]) -> list[dict]:
         for index, match in enumerate(matches, 1):
             tag = (match.group(2) or "").strip()
             speaker = "quoted_ai" if "[AI回复]" in tag else "user"
+            text = match.group(3).strip()
+            text = re.sub(
+                rf"^{re.escape(journal.ESCAPED_RECORD_MARKER)}\s*$",
+                journal.RECORD_MARKER,
+                text,
+                flags=re.MULTILINE,
+            )
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    {
+                        "date": date,
+                        "time": match.group(1),
+                        "tag": tag,
+                        "speaker": speaker,
+                        "text": text,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()[:12]
             records.append(
                 {
-                    "source_id": f"R-{date.replace('-', '')}-{index:03d}",
+                    "source_id": (
+                        f"R-{date.replace('-', '')}-{index:03d}-{fingerprint}"
+                    ),
                     "path": f"{date}.md",
                     "date": date,
                     "time": match.group(1),
                     "record_index": index,
                     "tag": tag,
                     "speaker": speaker,
-                    "text": match.group(3).strip(),
+                    "text": text,
                 }
             )
     return records
 
 
 def _record_chunks(records: list[dict], max_characters: int = 24000) -> list[list[dict]]:
+    if max_characters < 1000:
+        raise ValueError("记录分块上限不能小于 1000 字符")
     chunks: list[list[dict]] = []
     current: list[dict] = []
     current_size = 0
     for record in records:
-        size = len(json.dumps(record, ensure_ascii=False))
-        if current and current_size + size > max_characters:
-            chunks.append(current)
-            current = []
-            current_size = 0
-        current.append(record)
-        current_size += size
+        serialized_size = len(json.dumps(record, ensure_ascii=False))
+        parts = [record]
+        if serialized_size > max_characters:
+            text = str(record.get("text", ""))
+            overhead = len(
+                json.dumps({**record, "text": "", "text_part": "1/1"}, ensure_ascii=False)
+            )
+            part_size = max(1, max_characters - overhead - 32)
+            text_parts = [
+                text[index : index + part_size]
+                for index in range(0, len(text), part_size)
+            ] or [""]
+            parts = [
+                {
+                    **record,
+                    "text": text_part,
+                    "text_part": f"{index}/{len(text_parts)}",
+                }
+                for index, text_part in enumerate(text_parts, 1)
+            ]
+        for part in parts:
+            size = len(json.dumps(part, ensure_ascii=False))
+            if current and current_size + size > max_characters:
+                chunks.append(current)
+                current = []
+                current_size = 0
+            current.append(part)
+            current_size += size
     if current:
         chunks.append(current)
     return chunks

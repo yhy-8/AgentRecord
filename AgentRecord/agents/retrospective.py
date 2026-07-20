@@ -23,7 +23,7 @@ SPEC = AgentSpec(
     writable_relation_types=frozenset(),
     allowed_tools=frozenset(),
     instructions="""生成报告第一板块“整理与回顾”的正文，并提出少量值得长期保存的人物画像更新。
-正文必须忠实回顾本周期做过什么、关注点如何分配，以及观点、理念、理想或行为模式出现了怎样的变化。行为分析属于事实整理的一部分，但不得把时间先后写成因果，不得心理诊断，不得给出行为教练式命令。每个事实或判断所在段落都必须就近引用 [R-YYYYMMDD-NNN]。
+正文必须忠实回顾本周期做过什么、关注点如何分配，以及观点、理念、理想或行为模式出现了怎样的变化。行为分析属于事实整理的一部分，但不得把时间先后写成因果，不得心理诊断，不得给出行为教练式命令。每个事实或判断所在段落都必须就近引用输入中提供的 [R-YYYYMMDD-NNN-内容哈希]；旧数据的 ID 可能没有哈希后缀，只能原样复制实际输入 ID。
 历史画像只用于比较此前状态；不得使用晚于报告周期结束的内容。新的画像条目只保存相对稳定或反复出现的内容，不保存一次性事件、任务、外部事实或 AI 自己的建议。supersedes_id 只能复制输入中的 P 三位短别名；没有明确变化时为 null。
 只返回 JSON：{"markdown":"不含一、二级标题的第一板块正文","profile_entries":[{"temp_id":"p1","category":"viewpoint|principle|ideal|behavior_pattern|interest","title":"...","statement":"...","confidence":0到1,"source_refs":["R-..."],"supersedes_id":null}]}。""",
 )
@@ -38,6 +38,8 @@ def section_errors(markdown: str, allowed_source_ids: set[str]) -> list[str]:
         errors.append("整理与回顾包含一、二级标题")
     if "```" in markdown:
         errors.append("整理与回顾包含代码围栏")
+    if len(markdown) > 24000:
+        errors.append("整理与回顾正文超过 24000 字符")
     cited = cited_source_ids(markdown)
     unknown = cited - allowed_source_ids
     if unknown:
@@ -97,6 +99,8 @@ def validate(
             raise AgentPipelineError("人物画像 category 无效")
         if not title or not statement:
             raise AgentPipelineError("人物画像缺少标题或陈述")
+        if len(title) > 200 or len(statement) > 2000:
+            raise AgentPipelineError("人物画像标题或陈述过长")
         if not isinstance(refs, list) or any(
             not isinstance(ref, str) or ref not in allowed_source_ids for ref in refs
         ):

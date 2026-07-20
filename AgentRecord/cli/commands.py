@@ -211,6 +211,26 @@ def _handle_status() -> None:
             f"  [cyan]当前任务：{status.get('current_task_detail') or status['current_task']}"
             f"（{status.get('current_task_started_at', '')}）[/cyan]"
         )
+    pending_targets = status.get("pending_targets", {})
+    if pending_targets:
+        lines.append("  [cyan]待处理目标（严格按以下任务顺序执行）：[/cyan]")
+        for task in (
+            "daily_summary",
+            "daily_profile",
+            "daily_information",
+            "weekly_report",
+            "monthly_report",
+        ):
+            targets = pending_targets.get(task, [])
+            if not targets:
+                continue
+            labels = [
+                target["start"]
+                if target.get("start") == target.get("end")
+                else f"{target.get('start')} 至 {target.get('end')}"
+                for target in targets
+            ]
+            lines.append(f"    - {task}: {'、'.join(labels)}")
     errors = status["errors"]
     if errors:
         lines.append("  [yellow]当前失败（/retry 可立即按依赖顺序重试）：[/yellow]")
@@ -246,8 +266,15 @@ def _handle_status() -> None:
 
 
 def _handle_feedback() -> None:
-    store = AnalysisStore()
-    nodes = store.feedback_candidates()
+    try:
+        store = AnalysisStore()
+        nodes = store.feedback_candidates()
+    except Exception as error:
+        console.print(
+            f"[red][x][/red] 无法读取人物画像反馈列表: "
+            f"{str(error) or error.__class__.__name__}"
+        )
+        return
     if not nodes:
         console.print("[yellow][!][/yellow] 暂无可反馈的人物画像条目。")
         return
@@ -287,7 +314,14 @@ def _handle_feedback() -> None:
     if action == "correct":
         title = safe_input("新标题 [空=保留原标题] >> ").strip()
         body = safe_input("新内容 [空=保留原内容] >> ").strip()
-    store.record_user_feedback(node["id"], action, title=title, body=body)
+    try:
+        store.record_user_feedback(node["id"], action, title=title, body=body)
+    except Exception as error:
+        console.print(
+            f"[red][x][/red] 人物画像反馈未写入: "
+            f"{str(error) or error.__class__.__name__}"
+        )
+        return
     console.print("[cyan][*][/cyan] 反馈已记录；将影响以后的分析，不会改写已有报告。")
 
 

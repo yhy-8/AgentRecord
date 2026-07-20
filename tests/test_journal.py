@@ -109,6 +109,42 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(1, len(records))
         self.assertIn("**10:15:**", records[0]["text"])
 
+    def test_literal_record_marker_is_content_and_last_record_still_deletes(self):
+        fixed_now = datetime.datetime(2026, 7, 15, 9, 0)
+        with patch("AgentRecord.journal.datetime.datetime") as mock_datetime:
+            mock_datetime.now.return_value = fixed_now
+            journal.append_log(
+                f"标记前\n{journal.RECORD_MARKER}\n标记后"
+            )
+            journal.append_log("第二条")
+
+        path = settings.DIARY_DIR / "2026-07-15.md"
+        content = path.read_text(encoding="utf-8")
+        self.assertIn(journal.ESCAPED_RECORD_MARKER, content)
+
+        from AgentRecord.analysis.context import _period_records
+
+        records = _period_records([("2026-07-15", content)])
+        self.assertEqual(2, len(records))
+        self.assertIn(journal.RECORD_MARKER, records[0]["text"])
+        with patch("AgentRecord.journal.datetime.datetime") as mock_datetime:
+            mock_datetime.now.return_value = fixed_now
+            self.assertTrue(journal.delete_last_record())
+        remaining = _period_records([("2026-07-15", path.read_text(encoding="utf-8"))])
+        self.assertEqual(1, len(remaining))
+        self.assertIn("标记后", remaining[0]["text"])
+
+    def test_record_source_id_changes_when_same_position_content_changes(self):
+        from AgentRecord.analysis.context import _period_records
+
+        first = _period_records([("2026-07-15", "**09:00:** 原内容")])[0]
+        unchanged = _period_records([("2026-07-15", "**09:00:** 原内容")])[0]
+        changed = _period_records([("2026-07-15", "**09:00:** 新内容")])[0]
+
+        self.assertEqual(first["source_id"], unchanged["source_id"])
+        self.assertNotEqual(first["source_id"], changed["source_id"])
+        self.assertRegex(first["source_id"], r"^R-20260715-001-[0-9a-f]{12}$")
+
     def test_tool_date_cannot_escape_diary_directory(self):
         message = journal.read_daily_log(date="../Docs/设计基线")
 
