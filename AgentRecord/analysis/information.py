@@ -15,7 +15,6 @@ from ..ai_client import (
     call_ai,
     response_telemetry,
     third_party_search_available,
-    web_search_available,
 )
 from .context import _existing_logs, _period_records
 
@@ -54,17 +53,21 @@ def information_briefing_path(date: datetime.date) -> Path:
 def _week_record_context(date: datetime.date, limit: int = 18000) -> str:
     week_start = date - datetime.timedelta(days=date.weekday())
     records = _period_records(_existing_logs(week_start, date))
-    sections = []
+    sections: list[str] = []
     size = 0
-    for record in records:
+    for record in reversed(records):
         if record.get("speaker") != "user":
             continue
         text = str(record.get("text", "")).strip()
         section = f"[{record['date']} {record['time']}] {text}\n"
         if size + len(section) > limit:
+            if not sections:
+                prefix = f"[{record['date']} {record['time']}] "
+                sections.append(prefix + text[: max(0, limit - len(prefix) - 1)] + "\n")
             break
         sections.append(section)
         size += len(section)
+    sections.reverse()
     return "".join(sections) or "（本周暂无用户记录）"
 
 
@@ -266,8 +269,13 @@ def _has_five_daily_highlights(markdown: str) -> bool:
     )
     if not match:
         return False
-    numbers = re.findall(r"^###\s+([1-5])[.、]\s+\S", match.group(1), re.MULTILINE)
-    return numbers == ["1", "2", "3", "4", "5"]
+    headings = re.findall(r"^###\s+(.+?)\s*$", match.group(1), re.MULTILINE)
+    numbers = [
+        heading_match.group(1)
+        for heading in headings
+        if (heading_match := re.fullmatch(r"([1-5])[.、]\s+\S.*", heading))
+    ]
+    return len(headings) == 5 and numbers == ["1", "2", "3", "4", "5"]
 
 
 def _targeted_exploration_ids(markdown: str) -> list[str]:
@@ -281,20 +289,53 @@ def _targeted_exploration_ids(markdown: str) -> list[str]:
     return re.findall(r"^###\s+(T\d{3})[.、]\s+\S", match.group(1), re.MULTILINE)
 
 
+def _targeted_exploration_headings(markdown: str) -> list[str]:
+    match = re.search(
+        r"^## 与本周思考相关的探索\s*$([\s\S]*?)(?=^##\s|\Z)",
+        markdown,
+        re.MULTILINE,
+    )
+    if not match:
+        return []
+    return re.findall(r"^###\s+(.+?)\s*$", match.group(1), re.MULTILINE)
+
+
+def _heading_link_map(markdown: str, section: str, id_pattern: str) -> dict[str, set]:
+    match = re.search(
+        rf"^## {re.escape(section)}\s*$([\s\S]*?)(?=^##\s|\Z)",
+        markdown,
+        re.MULTILINE,
+    )
+    if not match:
+        return {}
+    result = {}
+    block_pattern = re.compile(
+        rf"^###\s+({id_pattern})[.、]\s+\S.*?$([\s\S]*?)(?=^###\s|\Z)",
+        re.MULTILINE,
+    )
+    for item in block_pattern.finditer(match.group(1)):
+        result[item.group(1)] = markdown_urls(item.group(2))
+    return result
+
+
 def _briefing_errors(
     markdown: str,
     used_search: bool,
     evidence_urls: set[tuple] | None = None,
     targeted_ids: list[str] | None = None,
+    targeted_evidence_urls: dict[str, set[tuple]] | None = None,
 ) -> list[str]:
     errors = []
     if not used_search:
         errors.append("没有实际执行联网搜索")
-    if not re.search(r"https?://", markdown):
-        errors.append("没有可验证的来源链接")
     linked_urls = markdown_urls(markdown)
-    if evidence_urls and linked_urls - evidence_urls:
-        errors.append("正文包含未出现在本轮搜索证据中的 URL")
+    if not linked_urls:
+        errors.append("没有可验证的 Markdown 来源链接")
+    if evidence_urls is not None:
+        if not evidence_urls:
+            errors.append("联网搜索没有返回可审计的来源证据")
+        elif linked_urls - evidence_urls:
+            errors.append("正文包含未出现在本轮搜索证据中的 URL")
     if markdown.lstrip().startswith(("```", "# ")):
         errors.append("输出包含代码围栏或一级标题")
     required_sections = (
@@ -307,12 +348,46 @@ def _briefing_errors(
         errors.append("缺少必需章节: " + "、".join(missing))
     if not _has_five_daily_highlights(markdown):
         errors.append("“今日值得关注”没有严格生成编号 1 至 5 的五项")
+    highlight_links = _heading_link_map(
+        markdown, "今日值得关注", r"[1-5]"
+    )
+    missing_highlight_links = [
+        str(number)
+        for number in range(1, 6)
+        if not highlight_links.get(str(number))
+    ]
+    if missing_highlight_links:
+        errors.append(
+            "“今日值得关注”存在没有就近来源链接的项: "
+            + "、".join(missing_highlight_links)
+        )
     actual_targeted_ids = _targeted_exploration_ids(markdown)
-    if actual_targeted_ids != (targeted_ids or []):
+    targeted_headings = _targeted_exploration_headings(markdown)
+    if (
+        actual_targeted_ids != (targeted_ids or [])
+        or len(targeted_headings) != len(actual_targeted_ids)
+    ):
         errors.append(
             "“与本周思考相关的探索”没有按定向选题逐项生成: "
             f"期望 {targeted_ids or []}，实际 {actual_targeted_ids}"
         )
+    if targeted_evidence_urls is not None:
+        targeted_links = _heading_link_map(
+            markdown, "与本周思考相关的探索", r"T\d{3}"
+        )
+        unsupported = [
+            topic_id
+            for topic_id in (targeted_ids or [])
+            if not (
+                targeted_links.get(topic_id, set())
+                & targeted_evidence_urls.get(topic_id, set())
+            )
+        ]
+        if unsupported:
+            errors.append(
+                "定向探索没有引用对应查询返回的来源: "
+                + "、".join(unsupported)
+            )
     return errors
 
 
@@ -321,9 +396,10 @@ def generate_information_briefing(
     model_config: settings.ModelDict,
 ) -> tuple[str, bool, Path | None]:
     """Search current information and atomically save one briefing for ``date``."""
-    if not web_search_available(model_config):
+    if not third_party_search_available():
         return (
-            f"{CONFIG_ERROR_MARKER} 当前模型和第三方搜索都未启用联网能力。",
+            f"{CONFIG_ERROR_MARKER} 每日信息收集需要启用第三方搜索，"
+            "以便中控逐条审计查询和来源。",
             False,
             None,
         )
@@ -351,7 +427,7 @@ def generate_information_briefing(
         *targeted,
     ]
     prompt = f"""[程序每日信息收集任务]
-今天是 {date:%Y-%m-%d}。你必须使用 web_search 逐项搜索下列查询，生成一份可独立阅读的中文信息简报。每次输出（包括修订稿）都必须重新执行联网搜索。
+今天是 {date:%Y-%m-%d}。中控会在调用前逐项执行下列固定查询，并把本轮结果作为附加输入提供。你不得改写或补充查询，只基于这些已审计结果生成一份可独立阅读的中文信息简报。格式修订会复用同一证据集，不再重复搜索。
 
 要求：
 - 只收录具有较高信息量、可验证且对理解变化有价值的内容，不做热搜堆砌。
@@ -373,44 +449,72 @@ def generate_information_briefing(
     markdown = ""
     citations = result_count = 0
     tool_counts: dict[str, int] = {}
+    audit_telemetry: dict = {}
+    audit_used_search = False
+    revision_evidence = ""
     for attempt in range(1, _MAX_MODEL_ATTEMPTS + 1):
-        try:
+        if attempt == 1:
+            try:
+                response = call_ai(
+                    current_prompt,
+                    model_config,
+                    allowed_tools={"web_search"},
+                    allowed_search_queries=[item["query"] for item in queries],
+                )
+            except TypeError as error:
+                if "allowed_search_queries" not in str(error):
+                    raise
+                response = call_ai(
+                    current_prompt, model_config, allowed_tools={"web_search"}
+                )
+        else:
             response = call_ai(
-                current_prompt,
+                current_prompt
+                + "\n\n【中控复用的已审计搜索证据】\n"
+                + revision_evidence,
                 model_config,
-                allowed_tools={"web_search"},
-                allowed_search_queries=[item["query"] for item in queries],
-            )
-        except TypeError as error:
-            if "allowed_search_queries" not in str(error):
-                raise
-            response = call_ai(
-                current_prompt, model_config, allowed_tools={"web_search"}
+                allowed_tools=(),
             )
         markdown, success, citations, tool_counts, result_count = response
         if not success:
             return markdown, False, None
-        telemetry = response_telemetry(response)
+        if attempt == 1:
+            audit_telemetry = response_telemetry(response)
+            audit_used_search = bool(citations or result_count)
+            revision_evidence = json.dumps(
+                audit_telemetry.get("search_evidence", []),
+                ensure_ascii=False,
+            )
+        telemetry = audit_telemetry
         evidence_urls = {
             canonical_url(str(item.get("url", "")))
             for item in telemetry.get("search_evidence", [])
             if isinstance(item, dict) and item.get("url")
         }
-        used_search = bool(
-            citations or result_count
-        )
+        evidence_by_query: dict[str, set[tuple]] = {}
+        for item in telemetry.get("search_evidence", []):
+            if not isinstance(item, dict) or not item.get("url"):
+                continue
+            evidence_by_query.setdefault(
+                _normalized_query(item.get("query", "")), set()
+            ).add(canonical_url(str(item["url"])))
+        targeted_evidence_urls = {
+            item["topic_id"]: evidence_by_query.get(
+                _normalized_query(item["query"]), set()
+            )
+            for item in targeted
+        }
         errors = _briefing_errors(
             markdown,
-            used_search,
+            audit_used_search,
             evidence_urls,
             [item["topic_id"] for item in targeted],
+            targeted_evidence_urls,
         )
         completed_queries = telemetry.get("completed_search_queries")
-        if (
-            not model_config.get("search", False)
-            and third_party_search_available()
-            and isinstance(completed_queries, list)
-        ):
+        if not isinstance(completed_queries, list):
+            errors.append("联网搜索缺少可审计的已完成查询记录")
+        else:
             missing_queries = [
                 item["query"]
                 for item in queries

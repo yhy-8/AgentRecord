@@ -72,7 +72,9 @@ class JournalAITests(unittest.TestCase):
 
     @patch("AgentRecord.ai_client.execute_tool")
     @patch("AgentRecord.ai_client.requests.post")
-    def test_search_query_must_match_central_allowlist(self, post, execute_tool):
+    def test_strict_search_preexecutes_allowlist_and_rejects_model_added_query(
+        self, post, execute_tool
+    ):
         settings.CONFIG["third_search"] = {
             "enabled": True,
             "api_key": "search-key",
@@ -106,6 +108,17 @@ class JournalAITests(unittest.TestCase):
                 {"choices": [{"message": {"role": "assistant", "content": "{}"}}]}
             ),
         ]
+        execute_tool.return_value = ai_client.ToolResult(
+            "授权查询结果",
+            1,
+            [
+                {
+                    "query": "中控给定的查询",
+                    "title": "来源",
+                    "url": "https://example.com/source",
+                }
+            ],
+        )
 
         response = ai_client.call_ai(
             "研究",
@@ -115,64 +128,75 @@ class JournalAITests(unittest.TestCase):
         )
 
         self.assertTrue(response.success)
-        execute_tool.assert_not_called()
-        self.assertEqual(["私自改写的查询"], response.telemetry["rejected_search_queries"])
-        self.assertEqual(0, response.search_results)
+        execute_tool.assert_called_once_with(
+            "web_search", {"query": "中控给定的查询"}
+        )
+        self.assertEqual(["web_search"], response.telemetry["rejected_tool_calls"])
+        self.assertEqual(1, response.search_results)
 
     @patch("AgentRecord.ai_client.execute_tool")
     @patch("AgentRecord.ai_client.requests.post")
-    def test_duplicate_search_query_reuses_previous_result(self, post, execute_tool):
+    def test_strict_search_executes_each_authorized_query_before_model_call(
+        self, post, execute_tool
+    ):
         settings.CONFIG["third_search"] = {
             "enabled": True,
             "api_key": "search-key",
             "api_url": "https://search.example.test",
             "max_rounds": 3,
         }
-        tool_message = lambda call_id: FakeResponse(
-            {
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": [
-                                {
-                                    "id": call_id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": "web_search",
-                                        "arguments": '{"query":"同一查询"}',
-                                    },
-                                }
-                            ],
-                        }
-                    }
-                ]
-            }
+        post.return_value = FakeResponse(
+            {"choices": [{"message": {"role": "assistant", "content": "{}"}}]}
         )
-        post.side_effect = [
-            tool_message("search-1"),
-            tool_message("search-2"),
-            FakeResponse(
-                {"choices": [{"message": {"role": "assistant", "content": "{}"}}]}
-            ),
-        ]
         execute_tool.return_value = ai_client.ToolResult("首次结果", 10)
 
         response = ai_client.call_ai(
             "研究",
             self.model,
             allowed_tools={"web_search"},
-            allowed_search_queries=["同一查询"],
+            allowed_search_queries=["查询一", "查询二"],
         )
 
         self.assertTrue(response.success)
-        self.assertEqual(1, execute_tool.call_count)
-        self.assertEqual(10, response.search_results)
+        self.assertEqual(2, execute_tool.call_count)
+        self.assertEqual(20, response.search_results)
         self.assertEqual(
-            ["同一查询"], response.telemetry["completed_search_queries"]
+            ["查询一", "查询二"], response.telemetry["completed_search_queries"]
         )
-        self.assertEqual(["同一查询"], response.telemetry["duplicate_search_queries"])
+        request_messages = post.call_args.kwargs["json"]["messages"]
+        self.assertIn("查询一", request_messages[-1]["content"])
+        self.assertIn("查询二", request_messages[-1]["content"])
+        self.assertNotIn("tools", post.call_args.kwargs["json"])
+
+    @patch("AgentRecord.ai_client.execute_tool")
+    @patch("AgentRecord.ai_client.requests.post")
+    def test_strict_search_prefers_auditable_third_party_for_native_search_model(
+        self, post, execute_tool
+    ):
+        settings.CONFIG["third_search"] = {
+            "enabled": True,
+            "api_key": "search-key",
+            "api_url": "https://search.example.test",
+        }
+        post.return_value = FakeResponse(
+            {"choices": [{"message": {"role": "assistant", "content": "简报"}}]}
+        )
+        execute_tool.return_value = ai_client.ToolResult("搜索结果", 1)
+
+        response = ai_client.call_ai(
+            "严格收集",
+            {**self.model, "search": True},
+            allowed_tools={"web_search"},
+            allowed_search_queries=["固定查询"],
+        )
+
+        self.assertTrue(response.success)
+        execute_tool.assert_called_once_with(
+            "web_search", {"query": "固定查询"}
+        )
+        payload = post.call_args.kwargs["json"]
+        self.assertNotIn("web_search", payload)
+        self.assertNotIn("tools", payload)
 
     @patch("AgentRecord.ai_client._post_with_transient_retry")
     def test_third_party_search_caps_noisy_result_count(self, request):
@@ -221,6 +245,51 @@ class JournalAITests(unittest.TestCase):
         payload = post.call_args.kwargs["json"]
         self.assertNotIn("tools", payload)
         self.assertNotIn("tool_choice", payload)
+
+    @patch("AgentRecord.ai_client.execute_tool")
+    @patch("AgentRecord.ai_client.requests.post")
+    def test_model_cannot_execute_a_tool_absent_from_runtime_allowlist(
+        self, post, execute_tool
+    ):
+        post.side_effect = [
+            FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "unauthorized-1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "read_daily_log",
+                                            "arguments": '{"date":"2026-07-14"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            ),
+            FakeResponse(
+                {"choices": [{"message": {"role": "assistant", "content": "已放弃"}}]}
+            ),
+        ]
+
+        response = ai_client.call_ai(
+            "不允许读日记", self.model, allowed_tools=frozenset()
+        )
+
+        self.assertTrue(response.success)
+        execute_tool.assert_not_called()
+        self.assertEqual(
+            ["read_daily_log"], response.telemetry["rejected_tool_calls"]
+        )
+        refusal = post.call_args_list[1].kwargs["json"]["messages"][-1]
+        self.assertIn("未获中控授权", refusal["content"])
 
     @patch("AgentRecord.ai_client.requests.post")
     def test_structured_output_uses_configured_json_mode(self, post):

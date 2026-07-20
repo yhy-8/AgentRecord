@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 from AgentRecord.analysis.store import AnalysisStore
 
@@ -208,6 +209,92 @@ class AnalysisStoreTests(unittest.TestCase):
         )
         self.store.complete_run(run_id, Path("future.md"))
         self.assertEqual([], self.store.active_profiles("2026-07-12"))
+
+    def test_profile_cutoff_uses_originating_run_period_not_only_observation_date(self):
+        run_id = self.store.start_run(
+            "weekly", "2026-07-13", "2026-07-19", "manual", "mock", "hash"
+        )
+        self.save_source(run_id)
+        self.store.save_profile_entries(
+            run_id,
+            [
+                {
+                    "temp_id": "p1",
+                    "category": "viewpoint",
+                    "title": "后一周才得出的结论",
+                    "statement": "虽引用较早记录，但是后一周的分析结果。",
+                    "confidence": 0.8,
+                    "source_refs": ["R-20260707-001"],
+                    "first_observed": "2026-07-07",
+                    "last_observed": "2026-07-07",
+                    "supersedes_id": None,
+                }
+            ],
+            {"p1": "accepted"},
+        )
+        self.store.complete_run(run_id, Path("later.md"))
+
+        self.assertEqual([], self.store.active_profiles("2026-07-12"))
+
+    def test_future_feedback_does_not_rewrite_historical_profile_snapshot(self):
+        run_id = self.start_run()
+        self.save_source(run_id)
+        entry_id = self.store.save_profile_entries(
+            run_id,
+            [
+                {
+                    "temp_id": "p1",
+                    "category": "viewpoint",
+                    "title": "原观点",
+                    "statement": "原内容",
+                    "confidence": 0.8,
+                    "source_refs": ["R-20260707-001"],
+                    "first_observed": "2026-07-07",
+                    "last_observed": "2026-07-07",
+                    "supersedes_id": None,
+                }
+            ],
+            {"p1": "accepted"},
+        )["p1"]
+        self.store.complete_run(run_id, Path("report.md"))
+        with patch(
+            "AgentRecord.analysis.store._now",
+            return_value="2026-07-20T09:00:00",
+        ):
+            replacement_id = self.store.record_user_feedback(
+                entry_id, "correct", title="修正观点", body="修正内容"
+            )
+
+        before = self.store.active_profiles("2026-07-19")
+        after = self.store.active_profiles("2026-07-20")
+        self.assertEqual([entry_id], [item["id"] for item in before])
+        self.assertEqual([replacement_id], [item["id"] for item in after])
+
+    def test_stale_profile_feedback_is_rejected(self):
+        run_id = self.start_run()
+        self.save_source(run_id)
+        entry_id = self.store.save_profile_entries(
+            run_id,
+            [
+                {
+                    "temp_id": "p1",
+                    "category": "interest",
+                    "title": "关注领域",
+                    "statement": "持续关注。",
+                    "confidence": 0.8,
+                    "source_refs": ["R-20260707-001"],
+                    "first_observed": "2026-07-07",
+                    "last_observed": "2026-07-07",
+                    "supersedes_id": None,
+                }
+            ],
+            {"p1": "accepted"},
+        )["p1"]
+        self.store.complete_run(run_id, Path("report.md"))
+        self.store.record_user_feedback(entry_id, "reject")
+
+        with self.assertRaisesRegex(ValueError, "已不是可反馈状态"):
+            self.store.record_user_feedback(entry_id, "accept")
 
     def test_user_feedback_is_auditable(self):
         run_id = self.start_run()

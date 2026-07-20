@@ -492,19 +492,73 @@ class AnalysisStore:
             connection.close()
         return [dict(row) for row in rows]
 
-    def active_profiles(self, period_end: str, limit: int = 80) -> list[dict]:
+    def active_profiles(
+        self, period_end: str, limit: int | None = None
+    ) -> list[dict]:
         connection = self._connect()
         try:
-            rows = connection.execute(
-                """
+            query = """
                 SELECT p.* FROM profile_entries AS p
                 JOIN analysis_runs AS r ON r.id = p.run_id
-                WHERE p.status = 'accepted' AND p.last_observed <= ?
+                WHERE p.last_observed <= ?
+                  AND r.period_end <= ?
                   AND r.status = 'completed'
-                ORDER BY p.updated_at DESC LIMIT ?
-                """,
-                (period_end, limit),
-            ).fetchall()
+                  AND (
+                    p.status = 'accepted'
+                    OR (
+                      p.status = 'superseded'
+                      AND (
+                        EXISTS (
+                          SELECT 1 FROM profile_feedback AS f
+                          WHERE f.entry_id = p.id
+                            AND f.action IN ('accept', 'correct')
+                            AND substr(f.created_at, 1, 10) > ?
+                        )
+                        OR (
+                          NOT EXISTS (
+                            SELECT 1 FROM profile_feedback AS f
+                            WHERE f.entry_id = p.id
+                              AND f.action IN ('accept', 'correct')
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM profile_entries AS child
+                            JOIN analysis_runs AS child_run
+                              ON child_run.id = child.run_id
+                            WHERE child.supersedes_id = p.id
+                              AND child.created_by = 'retrospective'
+                              AND child_run.status = 'completed'
+                              AND child_run.period_end <= ?
+                          )
+                        )
+                      )
+                    )
+                    OR (
+                      p.status = 'rejected'
+                      AND EXISTS (
+                        SELECT 1 FROM profile_feedback AS f
+                        WHERE f.entry_id = p.id AND f.action = 'reject'
+                          AND substr(f.created_at, 1, 10) > ?
+                      )
+                    )
+                  )
+                  AND (
+                    p.created_by != 'user'
+                    OR substr(p.created_at, 1, 10) <= ?
+                  )
+                ORDER BY p.updated_at DESC
+                """
+            parameters: list[object] = [
+                period_end,
+                period_end,
+                period_end,
+                period_end,
+                period_end,
+                period_end,
+            ]
+            if limit is not None:
+                query += " LIMIT ?"
+                parameters.append(limit)
+            rows = connection.execute(query, parameters).fetchall()
         finally:
             connection.close()
         return [self._profile_dict(row) for row in rows]
@@ -581,10 +635,16 @@ class AnalysisStore:
             raise ValueError(f"未知反馈操作: {action}")
         with self.transaction() as connection:
             entry = connection.execute(
-                "SELECT * FROM profile_entries WHERE id = ?", (entry_id,)
+                """
+                SELECT p.* FROM profile_entries AS p
+                JOIN analysis_runs AS r ON r.id = p.run_id
+                WHERE p.id = ? AND p.status = 'accepted'
+                  AND r.status = 'completed'
+                """,
+                (entry_id,),
             ).fetchone()
             if not entry:
-                raise ValueError(f"找不到人物画像条目: {entry_id}")
+                raise ValueError(f"人物画像条目不存在或已不是可反馈状态: {entry_id}")
             now = _now()
             replacement_id = None
             if action == "reject":

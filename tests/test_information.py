@@ -1,5 +1,6 @@
 import datetime
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,13 +22,52 @@ class InformationBriefingTests(unittest.TestCase):
         )
         if targeted_ids:
             exploration = "\n\n".join(
-                f"### {topic_id}. 选题\n\n{exploration}"
-                for topic_id in targeted_ids
+                f"### {topic_id}. 选题\n\n{exploration} "
+                f"[来源](https://example.com/target-{index})"
+                for index, topic_id in enumerate(targeted_ids, 1)
             )
         return (
             f"## 今日值得关注\n\n{highlights}\n\n"
             f"## 与本周思考相关的探索\n\n{exploration}\n\n"
             "## 可继续追踪\n\n后续更新。"
+        )
+
+    @staticmethod
+    def audited_response(
+        markdown: str,
+        allowed_search_queries: tuple[str, ...] | list[str] | None = None,
+    ) -> AIResponse:
+        urls = re.findall(r"https://example\.com/[\w-]+", markdown) or [
+            f"https://example.com/{number}" for number in range(1, 6)
+        ]
+        targeted_queries = list((allowed_search_queries or ())[2:])
+        telemetry = {
+            "search_evidence": [
+                {
+                    "url": url,
+                    "query": (
+                        targeted_queries[int(url.rsplit("-", 1)[1]) - 1]
+                        if "/target-" in url
+                        and int(url.rsplit("-", 1)[1]) <= len(targeted_queries)
+                        else str((allowed_search_queries or ("",))[0])
+                    ),
+                    "title": "来源",
+                }
+                for url in dict.fromkeys(urls)
+            ]
+        }
+        if allowed_search_queries is not None:
+            telemetry["completed_search_queries"] = [
+                information._normalized_query(query)
+                for query in allowed_search_queries
+            ]
+        return AIResponse(
+            markdown,
+            True,
+            len(urls),
+            {"web_search": len(allowed_search_queries or ())},
+            len(urls),
+            telemetry=telemetry,
         )
 
     def setUp(self):
@@ -64,7 +104,13 @@ class InformationBriefingTests(unittest.TestCase):
         )
         collector_prompts = []
 
-        def fake_call_ai(prompt, model_config, *, allowed_tools=None):
+        def fake_call_ai(
+            prompt,
+            model_config,
+            *,
+            allowed_tools=None,
+            allowed_search_queries=None,
+        ):
             if allowed_tools == ():
                 payload = {
                     "queries": [
@@ -76,12 +122,9 @@ class InformationBriefingTests(unittest.TestCase):
                 }
                 return json.dumps(payload), True, 0, {}, 0
             collector_prompts.append(prompt)
-            return (
+            return self.audited_response(
                 self.valid_briefing(targeted_ids=("T001",)),
-                True,
-                0,
-                {"web_search": 2},
-                12,
+                allowed_search_queries,
             )
 
         with patch.object(information, "call_ai", side_effect=fake_call_ai):
@@ -122,7 +165,13 @@ class InformationBriefingTests(unittest.TestCase):
         planner_prompts = []
         collector_prompts = []
 
-        def fake_call_ai(prompt, model_config, *, allowed_tools=None):
+        def fake_call_ai(
+            prompt,
+            model_config,
+            *,
+            allowed_tools=None,
+            allowed_search_queries=None,
+        ):
             if allowed_tools == ():
                 planner_prompts.append(prompt)
                 return (
@@ -147,12 +196,9 @@ class InformationBriefingTests(unittest.TestCase):
                     0,
                 )
             collector_prompts.append(prompt)
-            return (
+            return self.audited_response(
                 self.valid_briefing("新增内容。", ("T001",)),
-                True,
-                0,
-                {"web_search": 3},
-                8,
+                allowed_search_queries,
             )
 
         with patch.object(information, "call_ai", side_effect=fake_call_ai):
@@ -203,6 +249,12 @@ class InformationBriefingTests(unittest.TestCase):
             "### 5. 事项 5\n\n新资料 [来源](https://example.com/5)\n\n", ""
         )
         self.assertFalse(information._has_five_daily_highlights(only_four))
+        six = self.valid_briefing().replace(
+            "\n\n## 与本周思考相关的探索",
+            "\n\n### 6. 额外事项\n\n新资料 [来源](https://example.com/6)"
+            "\n\n## 与本周思考相关的探索",
+        )
+        self.assertFalse(information._has_five_daily_highlights(six))
 
     def test_briefing_rejects_links_absent_from_search_evidence(self):
         errors = information._briefing_errors(
@@ -212,6 +264,15 @@ class InformationBriefingTests(unittest.TestCase):
         )
 
         self.assertTrue(any("搜索证据" in error for error in errors))
+
+    def test_each_daily_highlight_requires_its_own_nearby_link(self):
+        markdown = self.valid_briefing().replace(
+            "新资料 [来源](https://example.com/3)", "新资料但没有链接"
+        )
+
+        errors = information._briefing_errors(markdown, True, None)
+
+        self.assertTrue(any("没有就近来源链接" in error for error in errors))
 
     def test_briefing_requires_every_record_driven_topic_in_order(self):
         missing = information._briefing_errors(
@@ -230,14 +291,50 @@ class InformationBriefingTests(unittest.TestCase):
         self.assertTrue(any("定向选题" in error for error in missing))
         self.assertFalse(any("定向选题" in error for error in covered))
 
+    def test_briefing_rejects_extra_targeted_exploration_heading(self):
+        markdown = self.valid_briefing(targeted_ids=("T001",)).replace(
+            "\n\n## 可继续追踪",
+            "\n\n### T999. 未授权选题\n\n不应出现。\n\n## 可继续追踪",
+        )
+
+        errors = information._briefing_errors(
+            markdown, True, None, ["T001"]
+        )
+
+        self.assertTrue(any("没有按定向选题逐项生成" in error for error in errors))
+
+    def test_targeted_exploration_requires_evidence_from_its_own_query(self):
+        markdown = self.valid_briefing(targeted_ids=("T001",))
+        errors = information._briefing_errors(
+            markdown,
+            True,
+            None,
+            ["T001"],
+            {
+                "T001": {
+                    information.canonical_url("https://example.com/other")
+                }
+            },
+        )
+
+        self.assertTrue(any("对应查询" in error for error in errors))
+
     def test_invalid_briefing_is_revised_with_original_draft_and_reason(self):
         date = datetime.date(2026, 7, 15)
-        responses = [
-            ("缺少章节和链接", True, 0, {"web_search": 1}, 5),
-            (self.valid_briefing(), True, 0, {"web_search": 2}, 8),
-        ]
+        drafts = iter(["缺少章节和链接", self.valid_briefing()])
 
-        with patch.object(information, "call_ai", side_effect=responses) as call:
+        def fake_call_ai(
+            prompt,
+            model_config,
+            *,
+            allowed_tools=None,
+            allowed_search_queries=None,
+        ):
+            return self.audited_response(
+                next(drafts), allowed_search_queries
+            )
+
+        with patch.object(information, "call_ai", side_effect=fake_call_ai) as call:
             _, success, path = information.generate_information_briefing(
                 date, {"name": "mock", "search": False}
             )
@@ -250,6 +347,13 @@ class InformationBriefingTests(unittest.TestCase):
         self.assertTrue(revision_prompt.startswith(original_prompt))
         self.assertIn("缺少章节和链接", revision_prompt)
         self.assertIn("缺少必需章节", revision_prompt)
+        self.assertIn(
+            "allowed_search_queries", call.call_args_list[0].kwargs
+        )
+        self.assertEqual((), call.call_args_list[1].kwargs["allowed_tools"])
+        self.assertNotIn(
+            "allowed_search_queries", call.call_args_list[1].kwargs
+        )
 
     def test_third_party_collector_must_execute_every_authorized_query(self):
         date = datetime.date(2026, 7, 15)
@@ -277,7 +381,7 @@ class InformationBriefingTests(unittest.TestCase):
         self.assertIsNone(path)
         self.assertIn("没有逐项执行全部授权查询", message)
 
-    def test_native_search_does_not_require_third_party_query_telemetry(self):
+    def test_native_search_model_still_requires_auditable_third_party_results(self):
         date = datetime.date(2026, 7, 15)
         response = AIResponse(
             self.valid_briefing(),
@@ -296,8 +400,8 @@ class InformationBriefingTests(unittest.TestCase):
                 date, {"name": "mock", "search": True}
             )
 
-        self.assertTrue(success)
-        self.assertTrue(path.exists())
+        self.assertFalse(success)
+        self.assertIsNone(path)
 
     def test_briefing_fails_when_web_search_is_not_configured(self):
         settings.CONFIG["third_search"] = {"enabled": False, "api_key": ""}
@@ -308,7 +412,7 @@ class InformationBriefingTests(unittest.TestCase):
 
         self.assertFalse(success)
         self.assertIsNone(path)
-        self.assertIn("未启用联网能力", message)
+        self.assertIn("需要启用第三方搜索", message)
 
     def test_query_dedup_allows_a_concrete_new_event_in_the_same_field(self):
         result = information._deduplicate_queries(
@@ -370,6 +474,19 @@ class InformationBriefingTests(unittest.TestCase):
         self.assertIn("周一原始记录", value)
         self.assertNotIn("暂无今日总结", value)
         self.assertNotIn("上周记录", value)
+
+    def test_week_context_keeps_newest_records_when_character_budget_is_small(self):
+        monday = settings.DIARY_DIR / "2026-07-13.md"
+        tuesday = settings.DIARY_DIR / "2026-07-14.md"
+        monday.write_text("**09:00:** 较旧记录-" + "甲" * 80, encoding="utf-8")
+        tuesday.write_text("**09:00:** 最新记录-" + "乙" * 80, encoding="utf-8")
+
+        value = information._week_record_context(
+            datetime.date(2026, 7, 14), limit=120
+        )
+
+        self.assertIn("最新记录", value)
+        self.assertNotIn("较旧记录", value)
 
     def test_period_information_context_reads_only_matching_dates(self):
         directory = settings.ANALYSIS_DIR / "Information"

@@ -115,7 +115,7 @@ Retrospective 的候选只有通过 Reviewer 才能为 `accepted`，但只有所
 
 失败运行的候选不会在下一轮自动清除，而是和失败 Agent 产物一起保留审计。重试创建新的运行；任何读取有效画像的查询都会排除这些失败运行，因此保留它们不会污染后续报告。
 
-历史上下文只读取 `status=accepted` 且 `last_observed <= 报告周期结束日` 的条目。这个日期截断是防止未来信息进入过去报告的硬边界。
+历史上下文是截至报告周期结束日的版本快照：条目 `last_observed` 和产生它的运行 `period_end` 都不得晚于截止日。对当前已为 `superseded` 或 `rejected` 的条目，查询会按替代运行周期或 `profile_feedback.created_at` 回放它在当时是否仍有效；用户后来的修正、认可或否决不会进入过去报告。
 
 ## 7. profile_feedback
 

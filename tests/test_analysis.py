@@ -20,7 +20,9 @@ class AnalysisWorkflowTests(unittest.TestCase):
         self.original_diary = settings.DIARY_DIR
         self.original_analysis = settings.ANALYSIS_DIR
         self.original_automation = settings.CONFIG.get("automation")
+        self.original_third_search = settings.CONFIG.get("third_search")
         self.original_call_ai = orchestrator.call_ai
+        self.original_search_web_once = orchestrator.search_web_once
         settings.DIARY_DIR = root / "Records"
         settings.ANALYSIS_DIR = root / "AnalysisReports"
         settings.DIARY_DIR.mkdir()
@@ -32,20 +34,50 @@ class AnalysisWorkflowTests(unittest.TestCase):
             "weekly_report": False,
             "monthly_report": False,
         }
+        settings.CONFIG["third_search"] = {
+            "enabled": True,
+            "api_key": "test-key",
+            "api_url": "https://search.example.test",
+        }
         self.ai_calls = []
         orchestrator.call_ai = self.fake_call_ai
+        orchestrator.search_web_once = self.fake_search_web_once
 
     def tearDown(self):
         settings.DIARY_DIR = self.original_diary
         settings.ANALYSIS_DIR = self.original_analysis
         orchestrator.call_ai = self.original_call_ai
+        orchestrator.search_web_once = self.original_search_web_once
         if self.original_automation is None:
             settings.CONFIG.pop("automation", None)
         else:
             settings.CONFIG["automation"] = self.original_automation
+        if self.original_third_search is None:
+            settings.CONFIG.pop("third_search", None)
+        else:
+            settings.CONFIG["third_search"] = self.original_third_search
         self.temp_dir.cleanup()
 
-    def fake_call_ai(self, prompt, model_cfg, *, allowed_tools=None):
+    @staticmethod
+    def fake_search_web_once(query):
+        return (
+            ToolResult(
+                "搜索结果",
+                1,
+                [
+                    {
+                        "query": query,
+                        "title": "测试来源",
+                        "url": "https://example.com/source",
+                        "snippet": "外部研究提供了不同边界与反例。",
+                        "published": "2026-07-14",
+                    }
+                ],
+            ),
+            "",
+        )
+
+    def fake_call_ai(self, prompt, model_cfg, *, allowed_tools=None, **kwargs):
         self.ai_calls.append(prompt)
         if "[程序 Agent 任务:" not in prompt:
             return "测试总结", True, 0, {}, 0
@@ -56,19 +88,20 @@ class AnalysisWorkflowTests(unittest.TestCase):
         if "任务:retrospective]" in prompt:
             record = data["records"][0]
             source = record["source_id"]
+            profile_entries = [] if data.get("historical_profiles") else [
+                {
+                    "temp_id": "p1",
+                    "category": "viewpoint",
+                    "title": "重视可验证性",
+                    "statement": "用户开始重视可验证的记录。",
+                    "confidence": 0.8,
+                    "source_refs": [source],
+                    "supersedes_id": None,
+                }
+            ]
             payload = {
                 "markdown": f"### 本期回顾\n\n本期完成了一次记录与思考。 [{source}]",
-                "profile_entries": [
-                    {
-                        "temp_id": "p1",
-                        "category": "viewpoint",
-                        "title": "重视可验证性",
-                        "statement": "用户开始重视可验证的记录。",
-                        "confidence": 0.8,
-                        "source_refs": [source],
-                        "supersedes_id": None,
-                    }
-                ],
+                "profile_entries": profile_entries,
             }
         elif "任务:research_planner]" in prompt:
             source = data["records"][0]["source_id"]
@@ -86,24 +119,14 @@ class AnalysisWorkflowTests(unittest.TestCase):
             }
         elif "任务:researcher]" in prompt:
             source = data["research_topics"][0]["source_refs"][0]
+            evidence = data["evidence_sources"][0]["source_id"]
             payload = {
                 "markdown": (
                     "### 记录与反思方法\n\n"
                     f"该问题由本期记录引出 [{source}]；"
-                    "外部研究提供了不同边界与反例"
-                    "（[测试来源](https://example.com/source)）。"
-                ),
-                "sources": [
-                    {
-                        "topic_id": "Q001",
-                        "title": "测试来源",
-                        "url": "https://example.com/source",
-                        "published": "2026-07-14",
-                    }
-                ],
+                    f"外部研究提供了不同边界与反例 [{evidence}]。"
+                )
             }
-            tool_counts = {"web_search": 1}
-            result_count = 1
         else:
             decisions = [
                 {
@@ -232,7 +255,10 @@ class AnalysisWorkflowTests(unittest.TestCase):
         report.parent.mkdir(parents=True)
         report.write_text("不应读取的报告内容", encoding="utf-8")
         older = settings.DIARY_DIR / "2026-07-13.md"
-        older.write_text("可以读取的日记内容", encoding="utf-8")
+        older.write_text(
+            "# 2026-07-13\n\n**08:00:** 可以读取的日记内容\n",
+            encoding="utf-8",
+        )
         logs = [
             (
                 day,
@@ -243,6 +269,58 @@ class AnalysisWorkflowTests(unittest.TestCase):
         loaded = context._referenced_source_context(logs)
         self.assertIn("可以读取的日记内容", loaded)
         self.assertNotIn("不应读取的报告内容", loaded)
+
+    def test_referenced_diary_records_are_addressable_and_reach_reviewer(self):
+        old = settings.DIARY_DIR / "2026-07-13.md"
+        old.write_text(
+            "# 2026-07-13\n\n**08:00:** 被引用的旧记录\n",
+            encoding="utf-8",
+        )
+        current = settings.DIARY_DIR / "2026-07-14.md"
+        current.write_text(
+            "# 2026-07-14\n\n"
+            "**09:00 [引用]:** [日记](<2026-07-13.md>)\n\n",
+            encoding="utf-8",
+        )
+        default_fake = self.fake_call_ai
+
+        def reference_fake(prompt, model_cfg, *, allowed_tools=None, **kwargs):
+            if "任务:retrospective]" not in prompt:
+                return default_fake(
+                    prompt, model_cfg, allowed_tools=allowed_tools, **kwargs
+                )
+            self.ai_calls.append(prompt)
+            input_text = prompt.split("【中控提供的输入 JSON】\n", 1)[1]
+            data = json.loads(input_text.split("\n\n只输出一个符合契约", 1)[0])
+            source = data["referenced_records"][0]["source_id"]
+            return (
+                json.dumps(
+                    {
+                        "markdown": f"引用记录中的事实 [{source}]",
+                        "profile_entries": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                True,
+                0,
+                {},
+                0,
+            )
+
+        orchestrator.call_ai = reference_fake
+        message, success = orchestrator.generate_daily_profile(
+            datetime.date(2026, 7, 14), {"name": "mock"}
+        )
+
+        self.assertTrue(success, message)
+        review_prompt = next(
+            prompt
+            for prompt in self.ai_calls
+            if "任务:reviewer]" in prompt
+            and '"mode": "retrospective_review"' in prompt
+        )
+        self.assertIn("被引用的旧记录", review_prompt)
+        self.assertIn("R-20260713-001", review_prompt)
 
     def test_information_briefing_reaches_research_planner(self):
         day = datetime.date(2026, 7, 14)
@@ -555,6 +633,8 @@ class AnalysisWorkflowTests(unittest.TestCase):
         with patch.object(
             orchestrator, "_call_agent", side_effect=[first, second]
         ) as call_agent, patch.object(
+            orchestrator, "third_party_search_available", return_value=False
+        ), patch.object(
             orchestrator,
             "_review",
             return_value=(True, {}, [], {"pass": True}),
@@ -900,6 +980,48 @@ class AnalysisWorkflowTests(unittest.TestCase):
 
         run_information.assert_not_called()
 
+    def test_information_time_scan_still_runs_predecessor_checks_in_same_hour(self):
+        class FixedDateTime(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 7, 17, 8, 5)
+
+        settings.CONFIG["automation"] = {
+            "enabled": True,
+            "daily_summary": True,
+            "daily_profile": False,
+            "daily_information": True,
+            "daily_information_time": "08:05",
+            "weekly_report": False,
+            "monthly_report": False,
+        }
+        settings.ANALYSIS_DIR.mkdir()
+        automation._save_automation_state(
+            {"last_detection_hour": "2026-07-17T08"}
+        )
+
+        def fail_summary(today, state, model, *, target=None):
+            state.setdefault("errors", {})["daily_summary"] = "总结失败"
+
+        with patch.object(
+            automation.datetime, "datetime", FixedDateTime
+        ), patch.object(
+            automation,
+            "_task_missing",
+            side_effect=lambda task, now: task
+            in {"daily_summary", "daily_information"},
+        ), patch.object(
+            automation, "_automation_model", return_value={"name": "mock"}
+        ), patch.object(
+            automation, "_run_daily_summaries", side_effect=fail_summary
+        ) as run_summary, patch.object(
+            automation, "_run_daily_information"
+        ) as run_information:
+            automation.run_due_automatic_tasks()
+
+        run_summary.assert_called_once()
+        run_information.assert_not_called()
+
     def test_minute_scheduler_does_not_repeat_recorded_failures(self):
         settings.CONFIG["automation"] = {
             "enabled": True,
@@ -1004,12 +1126,42 @@ class AnalysisWorkflowTests(unittest.TestCase):
         )
         self.assertEqual("hourly", state["retry_kind"]["weekly_report"])
         self.assertEqual(1, state["failure_counts"]["weekly_report"])
+        self.assertEqual(
+            {"start": "2026-07-06", "end": "2026-07-12"},
+            state["failure_targets"]["weekly_report"],
+        )
         automation._clear_task_error(state, "weekly_report")
         self.assertNotIn("errors", state)
         self.assertNotIn("retry_after", state)
         self.assertNotIn("retry_kind", state)
         self.assertNotIn("failure_counts", state)
         self.assertNotIn("failure_keys", state)
+        self.assertNotIn("failure_targets", state)
+
+    def test_retry_uses_original_daily_target_after_date_changes(self):
+        state = {
+            "errors": {"daily_information": "2026-07-17 09:00 失败"},
+            "failure_targets": {
+                "daily_information": {
+                    "start": "2026-07-17",
+                    "end": "2026-07-17",
+                }
+            },
+        }
+        now = datetime.datetime(2026, 7, 18, 9, 0)
+
+        with patch.object(automation, "_run_daily_information") as run:
+            automation._retry_one_task(
+                "daily_information", now, state, {"name": "mock"}
+            )
+
+        self.assertEqual(
+            {
+                "target": {"start": "2026-07-17", "end": "2026-07-17"},
+                "ignore_schedule": True,
+            },
+            run.call_args.kwargs,
+        )
 
     def test_same_content_failure_stops_after_one_automatic_retry(self):
         state = {}
@@ -1144,6 +1296,25 @@ class AnalysisWorkflowTests(unittest.TestCase):
 
         self.assertEqual({"errors": {"weekly_report": "失败"}}, state)
 
+    def test_non_object_automation_state_is_ignored(self):
+        settings.ANALYSIS_DIR.mkdir()
+        (settings.ANALYSIS_DIR / ".automation-state.json").write_text(
+            "[]", encoding="utf-8"
+        )
+
+        self.assertEqual({}, automation._load_automation_state())
+
+    def test_analysis_cache_signature_tracks_effective_model_and_search_config(self):
+        first = orchestrator._analysis_config_signature(
+            {"name": "mock", "model_id": "v1", "temperature": 0.2}
+        )
+        second = orchestrator._analysis_config_signature(
+            {"name": "mock", "model_id": "v2", "temperature": 0.8}
+        )
+
+        self.assertNotEqual(first, second)
+        self.assertNotIn("api_key", json.dumps(first))
+
     def test_retry_command_launches_detached_process(self):
         settings.ANALYSIS_DIR.mkdir()
         (settings.ANALYSIS_DIR / ".automation-state.json").write_text(
@@ -1198,6 +1369,58 @@ class AnalysisWorkflowTests(unittest.TestCase):
 
         self.assertFalse(installed)
         self.assertIn("旧入口", message)
+
+    def test_windows_status_requires_exact_executable_and_arguments(self):
+        expected = [r"C:\New\AgentRecordBackground.exe", "--run-automation"]
+
+        def task_xml(command, arguments):
+            return (
+                '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+                f"<Actions><Exec><Command>{command}</Command>"
+                f"<Arguments>{arguments}</Arguments></Exec></Actions></Task>"
+            )
+
+        stale = Mock(
+            returncode=0,
+            stdout=task_xml(
+                r"C:\Old\AgentRecordBackground.exe", "--run-automation"
+            ),
+            stderr="",
+        )
+        current = Mock(
+            returncode=0,
+            stdout=task_xml(expected[0], "--run-automation"),
+            stderr="",
+        )
+        with patch.object(automation, "_is_windows", return_value=True), patch.object(
+            automation, "_automation_command", return_value=expected
+        ), patch.object(
+            automation.subprocess, "run", side_effect=[stale, stale]
+        ):
+            self.assertFalse(automation.system_automation_status()[0])
+
+        with patch.object(automation, "_is_windows", return_value=True), patch.object(
+            automation, "_automation_command", return_value=expected
+        ), patch.object(
+            automation.subprocess, "run", side_effect=[current, current]
+        ):
+            self.assertTrue(automation.system_automation_status()[0])
+
+    def test_cron_status_rejects_marker_lines_for_an_old_command(self):
+        stale = Mock(
+            returncode=0,
+            stdout=(
+                "@reboot /old/agent --run-automation # AgentRecord automation startup\n"
+                "* * * * * /old/agent --run-automation # AgentRecord automation minute\n"
+            ),
+            stderr="",
+        )
+        with patch.object(automation, "_is_windows", return_value=False), patch.object(
+            automation, "_automation_command", return_value=["/new/agent", "--run-automation"]
+        ), patch.object(automation.subprocess, "run", return_value=stale):
+            installed, _ = automation.system_automation_status()
+
+        self.assertFalse(installed)
 
 
 if __name__ == "__main__":

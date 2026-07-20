@@ -20,7 +20,6 @@ from ..ai_client import (
     call_ai,
     search_web_once,
     third_party_search_available,
-    web_search_available,
 )
 from ..file_lock import FileLock
 from .context import (
@@ -30,7 +29,8 @@ from .context import (
     _monthly_supporting_reports,
     _period_records,
     _recent_summary_context,
-    _referenced_source_context,
+    _referenced_records_context,
+    _referenced_source_records,
     _log_without_summary,
 )
 from .store import AnalysisStore
@@ -39,7 +39,29 @@ from .store import AnalysisStore
 logger = logging.getLogger(__name__)
 _LONG_ID_PATTERN = re.compile(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])")
 _MAX_AGENT_ATTEMPTS = 3
-_PIPELINE_VERSION = 3
+_PIPELINE_VERSION = 4
+
+
+def _analysis_config_signature(model_config: settings.ModelDict) -> dict:
+    """Return the non-secret effective configuration used by stage caches."""
+    model = {
+        key: model_config.get(key)
+        for key in (
+            "name",
+            "model_id",
+            "api_url",
+            "search",
+            "json_mode",
+            "max_tokens",
+            "temperature",
+        )
+    }
+    third_search = settings.CONFIG.get("third_search", {})
+    search = {
+        key: third_search.get(key)
+        for key in ("enabled", "api_url", "count", "timeout", "max_rounds")
+    }
+    return {"model": model, "third_search": search}
 
 
 def _replace_id_substrings(value: object, replacements: dict[str, str]) -> object:
@@ -403,6 +425,7 @@ def _retrospective_section(
     store: AnalysisStore,
     run_id: str,
     *,
+    visible_profiles_by_id: dict[str, dict] | None = None,
     task: str = (
         "生成整理与回顾板块和人物画像候选。"
         "没有值得长期保存的画像时返回空数组，不要凑数。"
@@ -439,6 +462,7 @@ def _retrospective_section(
                 allowed_source_ids=allowed_source_ids,
                 current_source_ids=current_source_ids,
                 visible_profile_ids=set(profile_aliases.values()),
+                visible_profiles=visible_profiles_by_id,
             )
         except AgentPipelineError as error:
             _save_validation_failure(
@@ -457,11 +481,15 @@ def _retrospective_section(
         normalized_payload = {"markdown": markdown, "profile_entries": entries}
         cited_ids = cited_source_ids(markdown)
         cited_ids.update(ref for entry in entries for ref in entry["source_refs"])
+        reviewable_records = [
+            *base_input["records"],
+            *base_input.get("referenced_records", []),
+        ]
         review_context = {
             "period": base_input["period"],
             "records": [
                 record
-                for record in base_input["records"]
+                for record in reviewable_records
                 if record["source_id"] in cited_ids
             ],
             "historical_profiles": base_input["historical_profiles"],
@@ -962,7 +990,7 @@ def _research_section(
     run_id: str,
     cached_search: tuple[str, dict] | None = None,
 ) -> str:
-    if third_party_search_available() and not model_config.get("search", False):
+    if third_party_search_available():
         return _grounded_research_section(
             topics,
             current_source_ids,
@@ -1049,12 +1077,18 @@ def generate_daily_profile(
             ref for profile in profiles for ref in profile["source_refs"]
         }
         compact_profiles, profile_aliases = _profile_input(profiles)
-        referenced_sources = _referenced_source_context(logs)
+        referenced_records = _referenced_source_records(logs)
+        referenced_sources = _referenced_records_context(referenced_records)
+        referenced_source_ids = {
+            record["source_id"] for record in referenced_records
+        }
         recent_summaries = _recent_summary_context(date)
         snapshot = {
             "pipeline_version": _PIPELINE_VERSION,
+            "analysis_config": _analysis_config_signature(model_config),
             "kind": "daily_profile",
             "records": records,
+            "referenced_records": referenced_records,
             "profiles": profiles,
             "referenced_sources": referenced_sources,
             "recent_summaries": recent_summaries,
@@ -1072,7 +1106,7 @@ def generate_daily_profile(
             trigger=trigger,
         )
         logger.info("daily_profile_started run=%s date=%s", run_id, date)
-        store.save_sources(run_id, records)
+        store.save_sources(run_id, [*records, *referenced_records])
         retrospective_input = {
             "period": {
                 "kind": "daily_profile",
@@ -1080,6 +1114,7 @@ def generate_daily_profile(
                 "end": date.isoformat(),
             },
             "records": records,
+            "referenced_records": referenced_records,
             "historical_profiles": compact_profiles,
             "referenced_sources": referenced_sources,
             "recent_summaries": recent_summaries,
@@ -1087,12 +1122,13 @@ def generate_daily_profile(
         }
         _, entries, decisions = _retrospective_section(
             retrospective_input,
-            current_source_ids | historical_source_ids,
+            current_source_ids | referenced_source_ids | historical_source_ids,
             current_source_ids,
             profile_aliases,
             model_config,
             store,
             run_id,
+            visible_profiles_by_id=profiles_by_id,
             task=(
                 "只为昨日记录生成内部审查摘要和人物画像候选；摘要不会作为日报交付。"
                 "画像仍只保存相对稳定、值得跨日比较的内容，没有合适更新时返回空数组。"
@@ -1158,10 +1194,10 @@ def generate_analysis_report(
     records = _period_records(logs)
     if not records:
         return "日记中没有可识别的标准记录。", False, None
-    if model_config.get("api_url") and not web_search_available(model_config):
+    if not third_party_search_available():
         return (
-            f"{CONFIG_ERROR_MARKER} 当前模型和第三方搜索都未启用联网能力，"
-            "报告必然无法完成领域研究。",
+            f"{CONFIG_ERROR_MARKER} 周报和月报需要启用第三方搜索，"
+            "以便中控逐条执行查询并审计来源。",
             False,
             None,
         )
@@ -1180,8 +1216,14 @@ def generate_analysis_report(
         historical_source_ids = {
             ref for profile in profiles for ref in profile["source_refs"]
         }
-        allowed_source_ids = current_source_ids | historical_source_ids
-        referenced_sources = _referenced_source_context(logs)
+        referenced_records = _referenced_source_records(logs)
+        referenced_sources = _referenced_records_context(referenced_records)
+        referenced_source_ids = {
+            record["source_id"] for record in referenced_records
+        }
+        allowed_source_ids = (
+            current_source_ids | referenced_source_ids | historical_source_ids
+        )
         recent_summaries = _recent_summary_context(start)
         supporting_reports = (
             _monthly_supporting_reports(start, end)
@@ -1191,7 +1233,9 @@ def generate_analysis_report(
         information_leads = _information_briefings(start, end)
         snapshot = {
             "pipeline_version": _PIPELINE_VERSION,
+            "analysis_config": _analysis_config_signature(model_config),
             "records": records,
+            "referenced_records": referenced_records,
             "profiles": profiles,
             "referenced_sources": referenced_sources,
             "recent_summaries": recent_summaries,
@@ -1219,7 +1263,7 @@ def generate_analysis_report(
             start,
             end,
         )
-        store.save_sources(run_id, records)
+        store.save_sources(run_id, [*records, *referenced_records])
 
         cache_arguments = (
             input_hash,
@@ -1234,6 +1278,7 @@ def generate_analysis_report(
         retrospective_input = {
             "period": {"kind": kind, "start": start.isoformat(), "end": end.isoformat()},
             "records": records,
+            "referenced_records": referenced_records,
             "historical_profiles": compact_profiles,
             "referenced_sources": referenced_sources,
             "recent_summaries": recent_summaries,
@@ -1261,6 +1306,7 @@ def generate_analysis_report(
                 model_config,
                 store,
                 run_id,
+                visible_profiles_by_id=profiles_by_id,
             )
         else:
             store.save_artifact(

@@ -90,6 +90,25 @@ class JournalTests(unittest.TestCase):
         self.assertIn("先前记录", content)
         self.assertNotIn("关联想法", content)
 
+    def test_fake_timestamp_inside_multiline_record_is_not_a_record_boundary(self):
+        fixed_now = datetime.datetime(2026, 7, 15, 9, 0)
+        with patch("AgentRecord.journal.datetime.datetime") as mock_datetime:
+            mock_datetime.now.return_value = fixed_now
+            journal.append_log("第一条\n**10:15:** 这是内容，不是新记录")
+            journal.append_log("第二条")
+            self.assertTrue(journal.delete_last_record())
+
+        path = settings.DIARY_DIR / "2026-07-15.md"
+        content = path.read_text(encoding="utf-8")
+        self.assertIn("**10:15:** 这是内容，不是新记录", content)
+        self.assertNotIn("第二条", content)
+
+        from AgentRecord.analysis.context import _period_records
+
+        records = _period_records([("2026-07-15", content)])
+        self.assertEqual(1, len(records))
+        self.assertIn("**10:15:**", records[0]["text"])
+
     def test_tool_date_cannot_escape_diary_directory(self):
         message = journal.read_daily_log(date="../Docs/设计基线")
 

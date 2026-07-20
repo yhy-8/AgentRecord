@@ -6,7 +6,7 @@
 models:
   - name: deepseek-v4-pro
     model_id: deepseek-v4-pro
-    search: false         # false 时可按 third_search 配置使用第三方搜索
+    search: false         # 通用 AI 调用是否开放模型原生搜索
     json_mode: true       # DeepSeek 官方接口支持 JSON Output
     max_tokens: 32768     # 给长月报留足输出空间，避免 JSON 中途截断
     api_url: https://api.deepseek.com/chat/completions
@@ -15,7 +15,7 @@ models:
 # 总结、手动报告和自动报告统一使用此模型；/m 会永久更新该项
 current_model: "deepseek-v4-pro"
 
-# 第三方搜索配置（仅当模型无原生搜索能力时生效）
+# 第三方搜索：每日信息简报和周/月报必需，用于审计固定查询与来源
 third_search:
   enabled: false               # 全局开关
   api_url: "https://api.bocha.cn/v1/web-search"

@@ -105,6 +105,77 @@ class AgentModuleTests(unittest.TestCase):
                 visible_profile_ids=set(),
             )
 
+    def test_behavior_pattern_requires_two_distinct_records(self):
+        with self.assertRaisesRegex(AgentPipelineError, "至少两条"):
+            retrospective.validate(
+                {
+                    "markdown": "整理内容 [R-20260714-001]",
+                    "profile_entries": [
+                        {
+                            "temp_id": "p1",
+                            "category": "behavior_pattern",
+                            "title": "行为模式",
+                            "statement": "反复表现出的模式",
+                            "confidence": 0.8,
+                            "source_refs": ["R-20260714-001"],
+                            "supersedes_id": None,
+                        }
+                    ],
+                },
+                allowed_source_ids={"R-20260714-001"},
+                current_source_ids={"R-20260714-001"},
+                visible_profile_ids=set(),
+            )
+
+    def test_profile_candidate_cannot_duplicate_an_existing_profile(self):
+        profile = {
+            "category": "viewpoint",
+            "title": "已有观点",
+            "statement": "已有内容",
+        }
+        with self.assertRaisesRegex(AgentPipelineError, "与现有条目重复"):
+            retrospective.validate(
+                {
+                    "markdown": "整理内容 [R-20260714-001]",
+                    "profile_entries": [
+                        {
+                            "temp_id": "p1",
+                            **profile,
+                            "confidence": 0.8,
+                            "source_refs": ["R-20260714-001"],
+                            "supersedes_id": None,
+                        }
+                    ],
+                },
+                allowed_source_ids={"R-20260714-001"},
+                current_source_ids={"R-20260714-001"},
+                visible_profile_ids={"entry-id"},
+                visible_profiles={"entry-id": profile},
+            )
+
+    def test_one_output_cannot_repeat_the_same_profile_candidate(self):
+        candidate = {
+            "category": "interest",
+            "title": "长期关注",
+            "statement": "持续关注同一领域",
+            "confidence": 0.8,
+            "source_refs": ["R-20260714-001"],
+            "supersedes_id": None,
+        }
+        with self.assertRaisesRegex(AgentPipelineError, "重复的人物画像候选"):
+            retrospective.validate(
+                {
+                    "markdown": "整理内容 [R-20260714-001]",
+                    "profile_entries": [
+                        {"temp_id": "p1", **candidate},
+                        {"temp_id": "p2", **candidate},
+                    ],
+                },
+                allowed_source_ids={"R-20260714-001"},
+                current_source_ids={"R-20260714-001"},
+                visible_profile_ids=set(),
+            )
+
     def test_research_planner_sanitizes_private_query_data(self):
         topics = research_planner.validate(
             {

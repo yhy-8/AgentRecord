@@ -14,6 +14,9 @@ from . import settings
 from .file_lock import FileLock
 
 
+RECORD_MARKER = "<!-- agentrecord-record -->"
+
+
 def _acquire_journal_lock() -> FileLock:
     lock = FileLock.acquire(settings.DIARY_DIR / ".journal.lock", blocking=True)
     if lock is None:
@@ -163,9 +166,14 @@ def append_log(
         submitted_time = submitted_at.strftime("%H:%M")
         with file_path.open("a", encoding="utf-8") as file:
             if tag:
-                file.write(f"**{submitted_time} {tag}:** {content}\n\n")
+                file.write(
+                    f"{RECORD_MARKER}\n"
+                    f"**{submitted_time} {tag}:** {content}\n\n"
+                )
             else:
-                file.write(f"**{submitted_time}:** {content}\n\n")
+                file.write(
+                    f"{RECORD_MARKER}\n**{submitted_time}:** {content}\n\n"
+                )
     finally:
         lock.release()
 
@@ -238,10 +246,19 @@ def delete_last_record() -> bool:
         if not file_path.exists():
             return False
         content = file_path.read_text(encoding="utf-8")
-        matches = list(re.finditer(r"^\*\*\d{2}:\d{2}", content, re.MULTILINE))
-        if not matches:
+        marker_matches = list(
+            re.finditer(rf"^{re.escape(RECORD_MARKER)}\s*$", content, re.MULTILINE)
+        )
+        header_matches = list(
+            re.finditer(r"^\*\*\d{2}:\d{2}", content, re.MULTILINE)
+        )
+        if not header_matches:
             return False
-        start = matches[-1].start()
+        start = (
+            marker_matches[-1].start()
+            if marker_matches
+            else header_matches[-1].start()
+        )
         if start > 0 and content[start - 1] == "\n":
             start -= 1
         temp_path = file_path.with_suffix(

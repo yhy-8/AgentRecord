@@ -36,41 +36,71 @@ def _existing_logs(start: datetime.date, end: datetime.date) -> list[tuple[str, 
     return logs
 
 
-def _referenced_source_context(
+def _referenced_source_records(
     logs: list[tuple[str, str]], max_characters: int = 30000
-) -> str:
-    """读取本周期标准引用指向的日记；拒绝日记目录以外的路径。"""
+) -> list[dict]:
+    """Parse referenced diaries into addressable records within a bounded context."""
     reference_pattern = re.compile(
         r"^\*\*\d{2}:\d{2} \[引用\]:\*\* \[[^\]]+\]\(<([^>]+)>\)",
         re.MULTILINE,
     )
     allowed_root = settings.DIARY_DIR.resolve()
-    seen = set()
-    sections = []
+    seen_paths = set()
+    seen_source_ids = set()
+    records: list[dict] = []
     size = 0
 
     for _, content in logs:
         for relative_path in reference_pattern.findall(content):
             source_path = (settings.DIARY_DIR / relative_path).resolve()
-            if source_path in seen or source_path.suffix.lower() != ".md":
+            if source_path in seen_paths or source_path.suffix.lower() != ".md":
                 continue
             if not source_path.is_relative_to(allowed_root):
                 continue
             if not source_path.is_file():
                 continue
             try:
+                source_date = datetime.date.fromisoformat(source_path.stem).isoformat()
+            except ValueError:
+                continue
+            try:
                 source_content = source_path.read_text(encoding="utf-8")
             except OSError:
                 continue
-            section = f"### {source_path.name}\n{source_content[:12000]}"
-            if size + len(section) > max_characters:
-                return "\n\n".join(sections) or "（本周期没有可读取的显式引用来源）"
-            seen.add(source_path)
-            sections.append(section)
-            size += len(section)
-            if len(sections) == 10:
-                return "\n\n".join(sections)
-    return "\n\n".join(sections) or "（本周期没有可读取的显式引用来源）"
+            parsed = _period_records(
+                [(source_date, _log_without_summary(source_content)[:12000])]
+            )
+            for record in parsed:
+                if record["source_id"] in seen_source_ids:
+                    continue
+                record_size = len(json.dumps(record, ensure_ascii=False))
+                if size + record_size > max_characters:
+                    return records
+                records.append(record)
+                seen_source_ids.add(record["source_id"])
+                size += record_size
+            seen_paths.add(source_path)
+            if len(seen_paths) == 10:
+                return records
+    return records
+
+
+def _referenced_records_context(records: list[dict]) -> str:
+    if not records:
+        return "（本周期没有可读取的显式引用来源）"
+    return "\n\n".join(
+        f"[{record['source_id']}] {record['date']} {record['time']}\n{record['text']}"
+        for record in records
+    )
+
+
+def _referenced_source_context(
+    logs: list[tuple[str, str]], max_characters: int = 30000
+) -> str:
+    """读取本周期标准引用指向的日记；拒绝日记目录以外的路径。"""
+    return _referenced_records_context(
+        _referenced_source_records(logs, max_characters=max_characters)
+    )
 
 
 def _recent_summary_context(
@@ -198,13 +228,27 @@ _RECORD_PATTERN = re.compile(
     r"(?=^\*\*\d{2}:\d{2}(?: [^\n]*?)?:\*\*|\Z)",
     re.MULTILINE | re.DOTALL,
 )
+_MARKED_RECORD_PATTERN = re.compile(
+    rf"^{re.escape(journal.RECORD_MARKER)}\s*\n"
+    r"\*\*(\d{2}:\d{2})(?: ([^\n]*?))?:\*\*\s?(.*?)"
+    rf"(?=^{re.escape(journal.RECORD_MARKER)}\s*\n|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
 
 
 def _period_records(logs: list[tuple[str, str]]) -> list[dict]:
     """Parse immutable report input into addressable journal records."""
     records = []
     for date, content in logs:
-        for index, match in enumerate(_RECORD_PATTERN.finditer(content), 1):
+        marker_index = content.find(journal.RECORD_MARKER)
+        if marker_index < 0:
+            matches = list(_RECORD_PATTERN.finditer(content))
+        else:
+            matches = [
+                *_RECORD_PATTERN.finditer(content[:marker_index]),
+                *_MARKED_RECORD_PATTERN.finditer(content[marker_index:]),
+            ]
+        for index, match in enumerate(matches, 1):
             tag = (match.group(2) or "").strip()
             speaker = "quoted_ai" if "[AI回复]" in tag else "user"
             records.append(

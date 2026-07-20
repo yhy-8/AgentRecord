@@ -59,6 +59,7 @@ def validate(
     allowed_source_ids: set[str],
     current_source_ids: set[str],
     visible_profile_ids: set[str],
+    visible_profiles: dict[str, dict] | None = None,
 ) -> tuple[str, list[dict]]:
     markdown = payload.get("markdown", "")
     if not isinstance(markdown, str):
@@ -72,6 +73,15 @@ def validate(
     entries = []
     seen = set()
     superseded = set()
+    seen_signatures = set()
+    existing_signatures = {
+        (
+            str(profile.get("category", "")).strip(),
+            re.sub(r"\s+", "", str(profile.get("title", ""))).casefold(),
+            re.sub(r"\s+", "", str(profile.get("statement", ""))).casefold(),
+        ): profile_id
+        for profile_id, profile in (visible_profiles or {}).items()
+    }
     for raw in raw_entries:
         if not isinstance(raw, dict):
             raise AgentPipelineError("人物画像条目必须是对象")
@@ -93,10 +103,22 @@ def validate(
             raise AgentPipelineError("人物画像包含未知来源")
         if not set(refs) & current_source_ids:
             raise AgentPipelineError("人物画像更新必须有本周期来源")
+        if category == "behavior_pattern" and len(set(refs)) < 2:
+            raise AgentPipelineError("行为模式必须由至少两条不同记录共同支持")
         if supersedes_id and supersedes_id not in visible_profile_ids:
             raise AgentPipelineError("人物画像尝试替代不可见条目")
         if supersedes_id and supersedes_id in superseded:
             raise AgentPipelineError("一次报告不能用多个候选替代同一人物画像")
+        signature = (
+            category,
+            re.sub(r"\s+", "", title).casefold(),
+            re.sub(r"\s+", "", statement).casefold(),
+        )
+        if signature in seen_signatures:
+            raise AgentPipelineError("一次报告不能创建重复的人物画像候选")
+        existing_id = existing_signatures.get(signature)
+        if existing_id and supersedes_id != existing_id:
+            raise AgentPipelineError("人物画像与现有条目重复，必须明确替代原条目")
         entries.append(
             {
                 "temp_id": temp_id,
@@ -109,6 +131,7 @@ def validate(
             }
         )
         seen.add(temp_id)
+        seen_signatures.add(signature)
         if supersedes_id:
             superseded.add(supersedes_id)
     return markdown.strip(), entries
