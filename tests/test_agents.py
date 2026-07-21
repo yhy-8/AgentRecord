@@ -196,16 +196,56 @@ class AgentModuleTests(unittest.TestCase):
         self.assertNotIn("D:/private", topics[0]["title"])
         self.assertNotIn("12345678", topics[0]["query"])
 
+    def test_research_planner_accepts_up_to_five_topics(self):
+        topics = research_planner.validate(
+            {
+                "topics": [
+                    {
+                        "topic_id": f"Q{index:03d}",
+                        "title": f"主题 {index}",
+                        "query": f"公开查询 {index}",
+                        "reason": "值得研究",
+                        "origin": "news",
+                        "source_refs": [],
+                    }
+                    for index in range(1, 6)
+                ]
+            },
+            set(),
+        )
+
+        self.assertEqual(5, len(topics))
+
+    def test_research_planner_rejects_more_than_five_topics(self):
+        with self.assertRaisesRegex(AgentPipelineError, "一至五个"):
+            research_planner.validate(
+                {
+                    "topics": [
+                        {
+                            "topic_id": f"Q{index:03d}",
+                            "title": f"主题 {index}",
+                            "query": f"公开查询 {index}",
+                            "reason": "值得研究",
+                            "origin": "news",
+                            "source_refs": [],
+                        }
+                        for index in range(1, 7)
+                    ]
+                },
+                set(),
+            )
+
     def test_researcher_requires_external_url(self):
         with self.assertRaisesRegex(AgentPipelineError, "外部来源"):
             researcher.validate(
                 {
-                    "markdown": "研究内容 [R-20260714-001]",
+                    "markdown": "### 记录主题\n\n研究内容 [R-20260714-001]",
                     "sources": [],
                 },
                 [
                     {
                         "topic_id": "Q001",
+                        "title": "记录主题",
                         "origin": "records",
                         "source_refs": ["R-20260714-001"],
                     }
@@ -217,7 +257,7 @@ class AgentModuleTests(unittest.TestCase):
         markdown, _ = researcher.validate(
             {
                 "markdown": (
-                    "外部事实 [论文]"
+                    "### 公开主题\n\n外部事实 [论文]"
                     "(https://doi.org/10.1037%2F0022-006X.50.6.880)"
                 ),
                 "sources": [
@@ -228,7 +268,14 @@ class AgentModuleTests(unittest.TestCase):
                     }
                 ],
             },
-            [{"topic_id": "Q001", "origin": "news", "source_refs": []}],
+            [
+                {
+                    "topic_id": "Q001",
+                    "title": "公开主题",
+                    "origin": "news",
+                    "source_refs": [],
+                }
+            ],
             set(),
         )
 
@@ -238,7 +285,7 @@ class AgentModuleTests(unittest.TestCase):
         used = "https://example.com/used"
         markdown, sources = researcher.validate(
             {
-                "markdown": f"外部事实 [来源]({used})",
+                "markdown": f"### 公开主题\n\n外部事实 [来源]({used})",
                 "sources": [
                     {"topic_id": "Q001", "title": "采用", "url": used},
                     {
@@ -248,7 +295,14 @@ class AgentModuleTests(unittest.TestCase):
                     },
                 ],
             },
-            [{"topic_id": "Q001", "origin": "news", "source_refs": []}],
+            [
+                {
+                    "topic_id": "Q001",
+                    "title": "公开主题",
+                    "origin": "news",
+                    "source_refs": [],
+                }
+            ],
             set(),
         )
 
@@ -260,6 +314,7 @@ class AgentModuleTests(unittest.TestCase):
             researcher.validate(
                 {
                     "markdown": (
+                        "### 公开主题\n\n"
                         "事实 [已声明](https://example.com/declared)，"
                         "另一个事实 [未声明](https://example.com/undeclared)。"
                     ),
@@ -271,7 +326,14 @@ class AgentModuleTests(unittest.TestCase):
                         }
                     ],
                 },
-                [{"topic_id": "Q001", "origin": "news", "source_refs": []}],
+                [
+                    {
+                        "topic_id": "Q001",
+                        "title": "公开主题",
+                        "origin": "news",
+                        "source_refs": [],
+                    }
+                ],
                 set(),
             )
 
@@ -279,6 +341,7 @@ class AgentModuleTests(unittest.TestCase):
         topics = [
             {
                 "topic_id": "Q001",
+                "title": "记录与研究",
                 "origin": "records",
                 "source_refs": ["R-20260714-001"],
             }
@@ -296,6 +359,7 @@ class AgentModuleTests(unittest.TestCase):
         grounded, cited = researcher.validate_grounded(
             {
                 "markdown": (
+                    "### 记录与研究\n\n"
                     "该问题由记录引出 [R-20260714-001]，"
                     "外部证据说明了适用边界 [W-Q001-001]。"
                 )
@@ -317,7 +381,14 @@ class AgentModuleTests(unittest.TestCase):
         with self.assertRaisesRegex(AgentPipelineError, "不得自行输出 URL"):
             researcher.validate_grounded(
                 {"markdown": "事实 [来源](https://example.com) [W-Q001-001]"},
-                [{"topic_id": "Q001", "origin": "news", "source_refs": []}],
+                [
+                    {
+                        "topic_id": "Q001",
+                        "title": "公开主题",
+                        "origin": "news",
+                        "source_refs": [],
+                    }
+                ],
                 [
                     {
                         "source_id": "W-Q001-001",
@@ -331,10 +402,25 @@ class AgentModuleTests(unittest.TestCase):
     def test_grounded_researcher_requires_evidence_for_every_topic(self):
         with self.assertRaisesRegex(AgentPipelineError, "Q002"):
             researcher.validate_grounded(
-                {"markdown": "仅覆盖一个主题 [W-Q001-001]"},
+                {
+                    "markdown": (
+                        "### 主题一\n\n已覆盖 [W-Q001-001]。\n\n"
+                        "### 主题二\n\n暂无外部证据。"
+                    )
+                },
                 [
-                    {"topic_id": "Q001", "origin": "news", "source_refs": []},
-                    {"topic_id": "Q002", "origin": "news", "source_refs": []},
+                    {
+                        "topic_id": "Q001",
+                        "title": "主题一",
+                        "origin": "news",
+                        "source_refs": [],
+                    },
+                    {
+                        "topic_id": "Q002",
+                        "title": "主题二",
+                        "origin": "news",
+                        "source_refs": [],
+                    },
                 ],
                 [
                     {
@@ -356,31 +442,114 @@ class AgentModuleTests(unittest.TestCase):
             researcher.validate(
                 {
                     "markdown": (
-                        "Q001 [R-20260714-001] "
-                        "[来源](https://example.com/article_(one))"
+                        "### 主题一\n\n[R-20260714-001] "
+                        "[来源一](https://example.com/one)\n\n"
+                        "### 主题二\n\n缺少记录引用 "
+                        "[来源二](https://example.com/two)"
                     ),
                     "sources": [
                         {
-                            "topic_id": topic_id,
+                            "topic_id": f"Q{index:03d}",
                             "title": "来源",
-                            "url": "https://example.com/article_(one)",
+                            "url": f"https://example.com/{word}",
                         }
-                        for topic_id in ("Q001", "Q002")
+                        for index, word in ((1, "one"), (2, "two"))
                     ],
                 },
                 [
                     {
                         "topic_id": "Q001",
+                        "title": "主题一",
                         "origin": "records",
                         "source_refs": ["R-20260714-001"],
                     },
                     {
                         "topic_id": "Q002",
+                        "title": "主题二",
                         "origin": "records",
                         "source_refs": ["R-20260714-002"],
                     },
                 ],
                 {"R-20260714-001", "R-20260714-002"},
+            )
+
+    def test_grounded_researcher_requires_one_ordered_heading_per_topic(self):
+        topics = [
+            {
+                "topic_id": "Q001",
+                "title": "主题一",
+                "origin": "news",
+                "source_refs": [],
+            },
+            {
+                "topic_id": "Q002",
+                "title": "主题二",
+                "origin": "news",
+                "source_refs": [],
+            },
+        ]
+        evidence = [
+            {
+                "source_id": "W-Q001-001",
+                "topic_id": "Q001",
+                "url": "https://example.com/one",
+            },
+            {
+                "source_id": "W-Q002-001",
+                "topic_id": "Q002",
+                "url": "https://example.com/two",
+            },
+        ]
+
+        with self.assertRaisesRegex(AgentPipelineError, "三级标题"):
+            researcher.validate_grounded(
+                {
+                    "markdown": (
+                        "### 主题二\n\n[W-Q002-001]\n\n"
+                        "### 主题一\n\n[W-Q001-001]"
+                    )
+                },
+                topics,
+                evidence,
+                set(),
+            )
+
+    def test_grounded_researcher_rejects_evidence_under_wrong_topic(self):
+        with self.assertRaisesRegex(AgentPipelineError, "其他主题"):
+            researcher.validate_grounded(
+                {
+                    "markdown": (
+                        "### 主题一\n\n[W-Q002-001]\n\n"
+                        "### 主题二\n\n[W-Q002-001]"
+                    )
+                },
+                [
+                    {
+                        "topic_id": "Q001",
+                        "title": "主题一",
+                        "origin": "news",
+                        "source_refs": [],
+                    },
+                    {
+                        "topic_id": "Q002",
+                        "title": "主题二",
+                        "origin": "news",
+                        "source_refs": [],
+                    },
+                ],
+                [
+                    {
+                        "source_id": "W-Q001-001",
+                        "topic_id": "Q001",
+                        "url": "https://example.com/one",
+                    },
+                    {
+                        "source_id": "W-Q002-001",
+                        "topic_id": "Q002",
+                        "url": "https://example.com/two",
+                    },
+                ],
+                set(),
             )
 
     def test_profile_cannot_be_superseded_twice_in_one_report(self):

@@ -173,6 +173,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
         content = path.read_text(encoding="utf-8")
         self.assertIn("## 一、整理与回顾", content)
         self.assertIn("## 二、领域探索与研究", content)
+        self.assertIn("### 记录与反思方法", content)
         self.assertIn("https://example.com/source", content)
         self.assertEqual(original, diary.read_bytes())
         self.assertEqual(1, len(AnalysisStore().active_profiles("2026-07-20")))
@@ -613,7 +614,10 @@ class AnalysisWorkflowTests(unittest.TestCase):
             },
         }
         second = {
-            "markdown": f"修订稿使用已审计来源 [来源]({prior_url})。",
+            "markdown": (
+                "### 公开主题\n\n"
+                f"修订稿使用已审计来源 [来源]({prior_url})。"
+            ),
             "sources": [
                 {"topic_id": "Q001", "title": "来源", "url": prior_url}
             ],
@@ -674,7 +678,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
             ],
         )
         draft = {
-            "markdown": "基于证据可以确认边界 [W-Q001-001]。",
+            "markdown": "### 公开主题\n\n基于证据可以确认边界 [W-Q001-001]。",
             "_telemetry": {"usage": {"total_tokens": 100}},
         }
 
@@ -725,8 +729,13 @@ class AnalysisWorkflowTests(unittest.TestCase):
             ],
         )
         drafts = [
-            {"markdown": "缺少证据"},
-            {"markdown": "修订后引用证据 [W-Q001-001]。"},
+            {"markdown": "### 公开主题\n\n缺少证据"},
+            {
+                "markdown": (
+                    "### 公开主题\n\n"
+                    "修订后引用证据 [W-Q001-001]。"
+                )
+            },
         ]
         store = Mock()
 
