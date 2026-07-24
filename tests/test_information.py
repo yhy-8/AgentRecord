@@ -14,15 +14,28 @@ from AgentRecord.analysis import context, information
 class InformationBriefingTests(unittest.TestCase):
     @staticmethod
     def valid_briefing(
-        exploration: str = "可延伸。", targeted_ids: tuple[str, ...] = ()
+        exploration: str = "可延伸。",
+        targeted_ids: tuple[str, ...] = (),
+        targeted_refs: tuple[str, ...] = (),
     ) -> str:
         highlights = "\n\n".join(
-            f"### {number}. 事项 {number}\n\n新资料 [来源](https://example.com/{number})"
+            f"### {number}. 具体事项 {number}\n\n"
+            f"**具体变化**：事项 {number} 已经发布明确结果，"
+            "相关机构确认变化已经生效，不是尚待发生的日程预告。\n\n"
+            f"**关键细节**：结果包含数据 {number}0 与数据 {number}5，"
+            "分别对应两个可核查对象，并给出了明确发布日期和适用范围。"
+            f" [来源](https://example.com/{number})\n\n"
+            "**关注理由**：这些细节会直接改变相关对象当前的判断依据，"
+            "后续可用同一口径核对执行结果，而不是泛泛讨论长期影响。"
             for number in range(1, 6)
         )
         if targeted_ids:
+            refs = targeted_refs or tuple(
+                "R-20260715-001-aaaaaaaaaaaa" for _ in targeted_ids
+            )
             exploration = "\n\n".join(
                 f"### {topic_id}. 选题\n\n{exploration} "
+                f"\n\n本周记录依据：[{refs[index - 1]}]\n\n"
                 f"[来源](https://example.com/target-{index})"
                 for index, topic_id in enumerate(targeted_ids, 1)
             )
@@ -136,6 +149,7 @@ class InformationBriefingTests(unittest.TestCase):
             encoding="utf-8",
         )
         collector_prompts = []
+        record_refs = []
 
         def fake_call_ai(
             prompt,
@@ -145,18 +159,23 @@ class InformationBriefingTests(unittest.TestCase):
             allowed_search_queries=None,
         ):
             if prompt.startswith("[程序每日信息选题任务]"):
+                record_refs[:] = information._RECORD_REF_PATTERN.findall(prompt)[:1]
                 payload = {
                     "queries": [
                         {
                             "query": "个人知识管理 user@example.com /mnt/private/a.md",
                             "reason": "查找方法",
+                            "record_refs": record_refs,
                         }
                     ]
                 }
                 return json.dumps(payload), True, 0, {}, 0
             collector_prompts.append(prompt)
             return self.audited_response(
-                self.valid_briefing(targeted_ids=("T001",)),
+                self.valid_briefing(
+                    targeted_ids=("T001",),
+                    targeted_refs=tuple(record_refs),
+                ),
                 allowed_search_queries,
             )
 
@@ -197,6 +216,7 @@ class InformationBriefingTests(unittest.TestCase):
         )
         planner_prompts = []
         collector_prompts = []
+        record_refs = []
 
         def fake_call_ai(
             prompt,
@@ -207,6 +227,7 @@ class InformationBriefingTests(unittest.TestCase):
         ):
             if prompt.startswith("[程序每日信息选题任务]"):
                 planner_prompts.append(prompt)
+                record_refs[:] = information._RECORD_REF_PATTERN.findall(prompt)[:1]
                 return (
                     json.dumps(
                         {
@@ -214,10 +235,12 @@ class InformationBriefingTests(unittest.TestCase):
                                 {
                                     "query": "个人知识管理最新进展",
                                     "reason": "继续搜索相同主题",
+                                    "record_refs": record_refs,
                                 },
                                 {
                                     "query": "本地优先笔记软件数据迁移风险",
                                     "reason": "核查一个尚未覆盖的新角度",
+                                    "record_refs": record_refs,
                                 },
                             ]
                         },
@@ -230,7 +253,11 @@ class InformationBriefingTests(unittest.TestCase):
                 )
             collector_prompts.append(prompt)
             return self.audited_response(
-                self.valid_briefing("新增内容。", ("T001",)),
+                self.valid_briefing(
+                    "新增内容。",
+                    ("T001",),
+                    tuple(record_refs),
+                ),
                 allowed_search_queries,
             )
 
@@ -276,10 +303,52 @@ class InformationBriefingTests(unittest.TestCase):
         self.assertIn("【中控修订请求】", retry_prompt)
         self.assertIn("不是 JSON", retry_prompt)
 
+    def test_targeted_query_must_cite_a_current_week_record(self):
+        date = datetime.date(2026, 7, 15)
+        (settings.DIARY_DIR / "2026-07-15.md").write_text(
+            "**09:00:** 本周记录中的具体想法。\n", encoding="utf-8"
+        )
+        old_briefing = settings.ANALYSIS_DIR / "Information" / "2026-07-14.md"
+        old_briefing.parent.mkdir(parents=True)
+        old_briefing.write_text(
+            "## 可继续追踪\n\n欧洲央行决议结果。\n", encoding="utf-8"
+        )
+
+        response = json.dumps(
+            {
+                "queries": [
+                    {
+                        "query": "欧洲央行决议结果",
+                        "reason": "来自昨日可继续追踪",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+        with patch.object(
+            information,
+            "call_ai",
+            return_value=(response, True, 0, {}, 0),
+        ) as call:
+            message, success, path = information.generate_information_briefing(
+                date, {"name": "mock", "search": False}
+            )
+
+        self.assertFalse(success)
+        self.assertIsNone(path)
+        self.assertIn("没有返回有效 JSON", message)
+        self.assertEqual(3, call.call_count)
+        first_prompt = call.call_args_list[0].args[0]
+        self.assertIn("严禁从中产生选题", first_prompt)
+        self.assertIn("record_refs", first_prompt)
+
     def test_today_highlights_require_exactly_five_numbered_items(self):
         self.assertTrue(information._has_five_daily_highlights(self.valid_briefing()))
-        only_four = self.valid_briefing().replace(
-            "### 5. 事项 5\n\n新资料 [来源](https://example.com/5)\n\n", ""
+        only_four = re.sub(
+            r"\n\n### 5\..*?(?=\n\n## 与本周思考相关的探索)",
+            "",
+            self.valid_briefing(),
+            flags=re.DOTALL,
         )
         self.assertFalse(information._has_five_daily_highlights(only_four))
         six = self.valid_briefing().replace(
@@ -288,6 +357,22 @@ class InformationBriefingTests(unittest.TestCase):
             "\n\n## 与本周思考相关的探索",
         )
         self.assertFalse(information._has_five_daily_highlights(six))
+
+    def test_today_highlights_reject_terse_macro_items(self):
+        markdown = self.valid_briefing().replace(
+            "**具体变化**：事项 3 已经发布明确结果，"
+            "相关机构确认变化已经生效，不是尚待发生的日程预告。\n\n"
+            "**关键细节**：结果包含数据 30 与数据 35，"
+            "分别对应两个可核查对象，并给出了明确发布日期和适用范围。"
+            " [来源](https://example.com/3)\n\n"
+            "**关注理由**：这些细节会直接改变相关对象当前的判断依据，"
+            "后续可用同一口径核对执行结果，而不是泛泛讨论长期影响。",
+            "市场高度关注，影响深远。[来源](https://example.com/3)",
+        )
+
+        errors = information._briefing_errors(markdown, True, None)
+
+        self.assertTrue(any("第 3 项缺少具体度字段" in error for error in errors))
 
     def test_briefing_rejects_links_absent_from_search_evidence(self):
         errors = information._briefing_errors(
@@ -300,7 +385,7 @@ class InformationBriefingTests(unittest.TestCase):
 
     def test_each_daily_highlight_requires_its_own_nearby_link(self):
         markdown = self.valid_briefing().replace(
-            "新资料 [来源](https://example.com/3)", "新资料但没有链接"
+            " [来源](https://example.com/3)", ""
         )
 
         errors = information._briefing_errors(markdown, True, None)
@@ -351,6 +436,24 @@ class InformationBriefingTests(unittest.TestCase):
         )
 
         self.assertTrue(any("对应查询" in error for error in errors))
+
+    def test_targeted_exploration_must_show_its_week_record_basis(self):
+        expected_ref = "R-20260715-001-aaaaaaaaaaaa"
+        markdown = self.valid_briefing(
+            targeted_ids=("T001",),
+            targeted_refs=("R-20260715-002-bbbbbbbbbbbb",),
+        )
+
+        errors = information._briefing_errors(
+            markdown,
+            True,
+            None,
+            ["T001"],
+            None,
+            {"T001": {expected_ref}},
+        )
+
+        self.assertTrue(any("本周原始记录依据" in error for error in errors))
 
     def test_invalid_briefing_is_revised_with_original_draft_and_reason(self):
         date = datetime.date(2026, 7, 15)
@@ -431,7 +534,7 @@ class InformationBriefingTests(unittest.TestCase):
         ]
 
         def search(query):
-            if "全球重要新闻" in query or "中国重要新闻" in query:
+            if "全球 已公布" in query or "中国 已发布" in query:
                 return ToolResult("综合搜索结果", 5, general_evidence), ""
             return ToolResult("搜索无结果"), ""
 
@@ -439,11 +542,16 @@ class InformationBriefingTests(unittest.TestCase):
 
         def fake_call_ai(prompt, model_config, *, allowed_tools=None, **kwargs):
             if prompt.startswith("[程序每日信息选题任务]"):
+                record_ref = information._RECORD_REF_PATTERN.findall(prompt)[0]
                 return (
                     json.dumps(
                         {
                             "queries": [
-                                {"query": "无公开资料的定向问题", "reason": "核查"}
+                                {
+                                    "query": "无公开资料的定向问题",
+                                    "reason": "核查",
+                                    "record_refs": [record_ref],
+                                }
                             ]
                         },
                         ensure_ascii=False,

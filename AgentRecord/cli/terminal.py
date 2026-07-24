@@ -4,9 +4,11 @@ import ctypes
 import os
 import queue
 import select
+import shutil
 import sys
 import time
 
+from rich.cells import cell_len
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -65,8 +67,6 @@ _STD_INPUT_HANDLE = -10
 _KEY_EVENT = 0x0001
 _WAIT_OBJECT_0 = 0
 _WAIT_TIMEOUT = 258
-_CURSOR_SAVE = "\x1b7"
-_CURSOR_RESTORE = "\x1b8"
 
 
 class _WindowsCharacter(ctypes.Union):
@@ -116,16 +116,23 @@ def _pending_notifications() -> list[tuple[str, str | None]]:
 
 
 def _start_input(prompt: str) -> None:
-    """Save the prompt origin so redraws do not have to estimate wrapped rows."""
-    sys.stdout.write(_CURSOR_SAVE + prompt)
+    sys.stdout.write(prompt)
     sys.stdout.flush()
 
 
-def _redraw_line(prompt: str, characters: list[str]) -> None:
-    new_text = prompt + "".join(characters)
-    sys.stdout.write(
-        f"{_CURSOR_RESTORE}\x1b[0J{_CURSOR_SAVE}{new_text}"
-    )
+def _clear_rendered_input(prompt: str, characters: list[str]) -> None:
+    """Clear input relative to its live cursor so console scrolling is harmless."""
+    columns = max(1, shutil.get_terminal_size().columns)
+    wrapped_rows = cell_len(prompt + "".join(characters)) // columns
+    move_up = f"\x1b[{wrapped_rows}A" if wrapped_rows else ""
+    sys.stdout.write(f"{move_up}\r\x1b[0J")
+
+
+def _redraw_line(
+    prompt: str, characters: list[str], removed_character: str
+) -> None:
+    _clear_rendered_input(prompt, [*characters, removed_character])
+    sys.stdout.write(prompt + "".join(characters))
     sys.stdout.flush()
 
 
@@ -133,11 +140,11 @@ def _show_notifications(prompt: str, characters: list[str]) -> None:
     notifications = _pending_notifications()
     if not notifications:
         return
-    sys.stdout.write(f"{_CURSOR_RESTORE}\x1b[0J")
+    _clear_rendered_input(prompt, characters)
     sys.stdout.flush()
     for message, style in notifications:
         console.print(message, style=style, markup=False)
-    sys.stdout.write(_CURSOR_SAVE + prompt + "".join(characters))
+    sys.stdout.write(prompt + "".join(characters))
     sys.stdout.flush()
 
 
@@ -228,8 +235,8 @@ def _safe_input_unix(prompt: str) -> str:
                 break
             if byte in (b"\x7f", b"\x08"):
                 if characters:
-                    characters.pop()
-                    _redraw_line(prompt, characters)
+                    removed_character = characters.pop()
+                    _redraw_line(prompt, characters, removed_character)
                 continue
             if byte == b"\x03":
                 sys.stdout.write("^C\r\n")
@@ -331,8 +338,8 @@ def _safe_input_windows(prompt: str) -> str:
                         sys.stdout.flush()
                         pending_echo.clear()
                     if characters:
-                        characters.pop()
-                        _redraw_line(prompt, characters)
+                        removed_character = characters.pop()
+                        _redraw_line(prompt, characters, removed_character)
                     continue
                 if character == "\x03":
                     sys.stdout.write("".join(pending_echo) + "^C\r\n")

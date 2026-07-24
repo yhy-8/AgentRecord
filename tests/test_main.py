@@ -328,7 +328,40 @@ class MainCommandTests(unittest.TestCase):
 
         self.assertEqual("", value)
         rendered = output.getvalue().decode("utf-8")
-        self.assertIn("\x1b8\x1b[0J\x1b7>> ", rendered)
+        self.assertIn("\r\x1b[0J>> ", rendered)
+        self.assertNotIn("\x1b8", rendered)
+
+    def test_windows_backspace_redraw_is_relative_after_input_wraps(self):
+        output = io.BytesIO()
+        stream = io.TextIOWrapper(output, encoding="utf-8")
+        windows_console = Mock()
+        windows_console.kbhit.return_value = True
+        windows_console.getwch.side_effect = [
+            "甲",
+            "乙",
+            "丙",
+            "丁",
+            "\x08",
+            "\r",
+        ]
+
+        with patch.object(
+            terminal, "_windows_console_input_handle", return_value=None
+        ), patch.object(
+            terminal, "msvcrt", windows_console, create=True
+        ), patch.object(
+            terminal.shutil,
+            "get_terminal_size",
+            return_value=terminal.os.terminal_size((8, 24)),
+        ), patch.object(terminal.sys, "stdout", stream):
+            value = terminal._safe_input_windows(">> ")
+            stream.flush()
+
+        self.assertEqual("甲乙丙", value)
+        rendered = output.getvalue().decode("utf-8")
+        self.assertIn("\x1b[1A\r\x1b[0J>> 甲乙丙", rendered)
+        self.assertNotIn("\x1b7", rendered)
+        self.assertNotIn("\x1b8", rendered)
 
     def test_windows_native_reader_consumes_unicode_key_event(self):
         kernel32 = Mock()
@@ -372,7 +405,7 @@ class MainCommandTests(unittest.TestCase):
 
         self.assertEqual("中文", value)
         self.assertEqual(
-            ["\x1b7>> ", "中文\r\n"],
+            [">> ", "中文\r\n"],
             [call.args[0] for call in stream.write.call_args_list],
         )
 
