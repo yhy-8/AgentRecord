@@ -365,7 +365,16 @@ def _usage_values(data: dict) -> dict[str, int]:
             usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
         ),
         "total_tokens": int(usage.get("total_tokens", 0) or 0),
-        "cached_tokens": int(details.get("cached_tokens", 0) or 0),
+        "cached_tokens": int(
+            usage.get(
+                "prompt_cache_hit_tokens",
+                details.get("cached_tokens", 0),
+            )
+            or 0
+        ),
+        "cache_miss_tokens": int(
+            usage.get("prompt_cache_miss_tokens", 0) or 0
+        ),
     }
 
 
@@ -479,6 +488,7 @@ def call_ai(
         "completion_tokens": 0,
         "total_tokens": 0,
         "cached_tokens": 0,
+        "cache_miss_tokens": 0,
     }
     search_evidence: list[dict[str, str]] = []
     search_queries: list[str] = []

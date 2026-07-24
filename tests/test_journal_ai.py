@@ -70,6 +70,28 @@ class JournalAITests(unittest.TestCase):
         self.assertEqual(80, response.telemetry["usage"]["cached_tokens"])
         self.assertEqual(1, response.telemetry["http_attempts"])
 
+    @patch("AgentRecord.ai_client.requests.post")
+    def test_reads_deepseek_cache_hit_and_miss_usage(self, post):
+        post.return_value = FakeResponse(
+            {
+                "choices": [
+                    {"message": {"role": "assistant", "content": "最终回答"}}
+                ],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 20,
+                    "total_tokens": 120,
+                    "prompt_cache_hit_tokens": 70,
+                    "prompt_cache_miss_tokens": 30,
+                },
+            }
+        )
+
+        response = ai_client.call_ai("问题", self.model)
+
+        self.assertEqual(70, response.telemetry["usage"]["cached_tokens"])
+        self.assertEqual(30, response.telemetry["usage"]["cache_miss_tokens"])
+
     @patch("AgentRecord.ai_client.execute_tool")
     @patch("AgentRecord.ai_client.requests.post")
     def test_strict_search_preexecutes_allowlist_and_rejects_model_added_query(

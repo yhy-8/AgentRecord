@@ -1166,6 +1166,7 @@ class AnalysisWorkflowTests(unittest.TestCase):
 
         self.assertEqual(
             {
+                "trigger": "retry",
                 "target": {"start": "2026-07-17", "end": "2026-07-17"},
                 "ignore_schedule": True,
             },
@@ -1195,7 +1196,16 @@ class AnalysisWorkflowTests(unittest.TestCase):
         def run_profile(today, current_state, model, *, trigger, target):
             calls.append(("daily_profile", target))
 
-        def run_information(now, current_state, model, *, target, ignore_schedule):
+        def run_information(
+            now,
+            current_state,
+            model,
+            *,
+            trigger,
+            target,
+            ignore_schedule,
+        ):
+            self.assertEqual("retry", trigger)
             calls.append(("daily_information", target))
 
         with patch.object(
@@ -1304,6 +1314,24 @@ class AnalysisWorkflowTests(unittest.TestCase):
                 state, "weekly_report", datetime.datetime(2026, 7, 17, 12, 0)
             )
         )
+
+    def test_daily_information_content_failure_does_not_repeat_automatically(self):
+        state = {}
+        with patch.object(
+            automation, "_content_failure_key", return_value="same-input"
+        ):
+            automation._set_task_error(
+                state,
+                "daily_information",
+                "Collector JSON 校验失败",
+            )
+
+        self.assertEqual(
+            "content_blocked",
+            state["retry_kind"]["daily_information"],
+        )
+        self.assertEqual(1, state["failure_counts"]["daily_information"])
+        self.assertNotIn("daily_information", state.get("retry_after", {}))
 
     def test_changed_input_unlocks_content_failure_on_hourly_detection(self):
         state = {

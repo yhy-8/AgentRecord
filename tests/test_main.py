@@ -363,6 +363,53 @@ class MainCommandTests(unittest.TestCase):
         self.assertNotIn("\x1b7", rendered)
         self.assertNotIn("\x1b8", rendered)
 
+    def test_windows_wrap_math_handles_exact_width_and_wide_characters(self):
+        self.assertEqual(
+            1,
+            terminal._wrapped_input_rows(">> ", list("abcde"), 8),
+        )
+        self.assertEqual(
+            1,
+            terminal._wrapped_input_rows(">> ", list("中文a"), 8),
+        )
+        self.assertEqual(
+            0,
+            terminal._wrapped_input_rows(">> ", list("中文"), 8),
+        )
+
+    def test_windows_backspace_at_exact_terminal_width_clears_one_wrapped_row(self):
+        output = io.BytesIO()
+        stream = io.TextIOWrapper(output, encoding="utf-8")
+        windows_console = Mock()
+        windows_console.kbhit.return_value = True
+        windows_console.getwch.side_effect = [
+            "a",
+            "b",
+            "c",
+            "d",
+            "e",
+            "\x08",
+            "\r",
+        ]
+
+        with patch.object(
+            terminal, "_windows_console_input_handle", return_value=None
+        ), patch.object(
+            terminal, "msvcrt", windows_console, create=True
+        ), patch.object(
+            terminal.shutil,
+            "get_terminal_size",
+            return_value=terminal.os.terminal_size((8, 24)),
+        ), patch.object(terminal.sys, "stdout", stream):
+            value = terminal._safe_input_windows(">> ")
+            stream.flush()
+
+        self.assertEqual("abcd", value)
+        self.assertIn(
+            "\x1b[1A\r\x1b[0J>> abcd",
+            output.getvalue().decode("utf-8"),
+        )
+
     def test_windows_native_reader_consumes_unicode_key_event(self):
         kernel32 = Mock()
         kernel32.WaitForSingleObject.return_value = 0
@@ -512,6 +559,23 @@ class MainCommandTests(unittest.TestCase):
         console.print.assert_called_once_with(
             "后台报告完成", style="green", markup=False
         )
+
+    def test_wrapped_terminal_notification_restores_wide_character_input(self):
+        output = io.BytesIO()
+        stream = io.TextIOWrapper(output, encoding="utf-8")
+        terminal.post_notification("后台报告完成", "green")
+
+        with patch.object(terminal.sys, "stdout", stream), patch.object(
+            terminal.shutil,
+            "get_terminal_size",
+            return_value=terminal.os.terminal_size((8, 24)),
+        ), patch.object(terminal, "console"):
+            terminal._show_notifications(">> ", list("正在输入"))
+            stream.flush()
+
+        rendered = output.getvalue().decode("utf-8")
+        self.assertTrue(rendered.startswith("\x1b[1A\r\x1b[0J"))
+        self.assertTrue(rendered.endswith(">> 正在输入"))
 
 
 if __name__ == "__main__":

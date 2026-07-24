@@ -1,8 +1,9 @@
 import datetime
 import json
-import re
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,77 +13,6 @@ from AgentRecord.analysis import context, information
 
 
 class InformationBriefingTests(unittest.TestCase):
-    @staticmethod
-    def valid_briefing(
-        exploration: str = "可延伸。",
-        targeted_ids: tuple[str, ...] = (),
-        targeted_refs: tuple[str, ...] = (),
-    ) -> str:
-        highlights = "\n\n".join(
-            f"### {number}. 具体事项 {number}\n\n"
-            f"**具体变化**：事项 {number} 已经发布明确结果，"
-            "相关机构确认变化已经生效，不是尚待发生的日程预告。\n\n"
-            f"**关键细节**：结果包含数据 {number}0 与数据 {number}5，"
-            "分别对应两个可核查对象，并给出了明确发布日期和适用范围。"
-            f" [来源](https://example.com/{number})\n\n"
-            "**关注理由**：这些细节会直接改变相关对象当前的判断依据，"
-            "后续可用同一口径核对执行结果，而不是泛泛讨论长期影响。"
-            for number in range(1, 6)
-        )
-        if targeted_ids:
-            refs = targeted_refs or tuple(
-                "R-20260715-001-aaaaaaaaaaaa" for _ in targeted_ids
-            )
-            exploration = "\n\n".join(
-                f"### {topic_id}. 选题\n\n{exploration} "
-                f"\n\n本周记录依据：[{refs[index - 1]}]\n\n"
-                f"[来源](https://example.com/target-{index})"
-                for index, topic_id in enumerate(targeted_ids, 1)
-            )
-        return (
-            f"## 今日值得关注\n\n{highlights}\n\n"
-            f"## 与本周思考相关的探索\n\n{exploration}\n\n"
-            "## 可继续追踪\n\n后续更新。"
-        )
-
-    @staticmethod
-    def audited_response(
-        markdown: str,
-        allowed_search_queries: tuple[str, ...] | list[str] | None = None,
-    ) -> AIResponse:
-        urls = re.findall(r"https://example\.com/[\w-]+", markdown) or [
-            f"https://example.com/{number}" for number in range(1, 6)
-        ]
-        targeted_queries = list((allowed_search_queries or ())[2:])
-        telemetry = {
-            "search_evidence": [
-                {
-                    "url": url,
-                    "query": (
-                        targeted_queries[int(url.rsplit("-", 1)[1]) - 1]
-                        if "/target-" in url
-                        and int(url.rsplit("-", 1)[1]) <= len(targeted_queries)
-                        else str((allowed_search_queries or ("",))[0])
-                    ),
-                    "title": "来源",
-                }
-                for url in dict.fromkeys(urls)
-            ]
-        }
-        if allowed_search_queries is not None:
-            telemetry["completed_search_queries"] = [
-                information._normalized_query(query)
-                for query in allowed_search_queries
-            ]
-        return AIResponse(
-            markdown,
-            True,
-            len(urls),
-            {"web_search": len(allowed_search_queries or ())},
-            len(urls),
-            telemetry=telemetry,
-        )
-
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         root = Path(self.temp_dir.name)
@@ -97,36 +27,15 @@ class InformationBriefingTests(unittest.TestCase):
             "api_key": "test-key",
             "api_url": "https://search.example.test",
         }
-        evidence = [
-            {
-                "title": f"来源 {number}",
-                "url": f"https://example.com/{number}",
-                "snippet": "摘要",
-                "published": "2026-07-15",
-            }
-            for number in range(1, 6)
-        ] + [
-            {
-                "title": f"定向来源 {number}",
-                "url": f"https://example.com/target-{number}",
-                "snippet": "定向摘要",
-                "published": "2026-07-15",
-            }
-            for number in range(1, 4)
-        ]
+        self.model = {
+            "name": "mock",
+            "search": False,
+            "max_tokens": 32768,
+        }
         self.search_patch = patch.object(
             information,
             "search_web_once",
-            side_effect=lambda query: (
-                ToolResult(
-                    "\n".join(
-                        f"[{item['title']}]({item['url']})" for item in evidence
-                    ),
-                    len(evidence),
-                    evidence,
-                ),
-                "",
-            ),
+            side_effect=self._search_result,
         )
         self.search_mock = self.search_patch.start()
 
@@ -140,448 +49,748 @@ class InformationBriefingTests(unittest.TestCase):
             settings.CONFIG["third_search"] = self.original_third_search
         self.temp_dir.cleanup()
 
-    def test_briefing_searches_general_and_sanitized_week_topics(self):
-        date = datetime.date(2026, 7, 15)
-        (settings.DIARY_DIR / "2026-07-14.md").write_text(
-            "# 2026-07-14\n\n<summary>\n\n</summary>\n\n"
-            "---\n## 原始记录流\n\n"
-            "**09:00:** 研究个人知识管理 user@example.com /mnt/private/a.md\n",
-            encoding="utf-8",
+    @staticmethod
+    def _search_result(query: str) -> tuple[ToolResult, str]:
+        if "全球 已公布" in query:
+            prefix = "global"
+        elif "中国 已发布" in query:
+            prefix = "china"
+        else:
+            prefix = "target"
+        evidence = [
+            {
+                "title": f"{prefix} 来源 {number}",
+                "url": f"https://example.com/{prefix}-{number}",
+                "snippet": f"{prefix} 已公布具体数据 {number * 10}",
+                "published": "2026-07-15",
+            }
+            for number in range(1, 4)
+        ]
+        return (
+            ToolResult(
+                "RAW-SEARCH-PROSE-SHOULD-NOT-REACH-COLLECTOR",
+                len(evidence),
+                evidence,
+            ),
+            "",
         )
-        collector_prompts = []
-        record_refs = []
 
-        def fake_call_ai(
+    @staticmethod
+    def _response(text: str, success: bool = True) -> AIResponse:
+        return AIResponse(
+            text,
+            success,
+            0,
+            {},
+            0,
+            telemetry={
+                "http_attempts": 1,
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 20,
+                    "total_tokens": 120,
+                    "cached_tokens": 40,
+                    "cache_miss_tokens": 60,
+                },
+            },
+        )
+
+    @staticmethod
+    def _prompt_json(prompt: str, heading: str, next_heading: str | None = None):
+        value = prompt.split(heading, 1)[1].lstrip()
+        if next_heading:
+            value = value.split(next_heading, 1)[0]
+        payload, _ = json.JSONDecoder().raw_decode(value.strip())
+        return payload
+
+    @classmethod
+    def _collector_payload(
+        cls,
+        prompt: str,
+        *,
+        highlight_count: int = 2,
+        targeted_status: str = "supported",
+    ) -> dict:
+        topics = cls._prompt_json(
             prompt,
-            model_config,
-            *,
-            allowed_tools=None,
-            allowed_search_queries=None,
-        ):
-            if prompt.startswith("[程序每日信息选题任务]"):
-                record_refs[:] = information._RECORD_REF_PATTERN.findall(prompt)[:1]
-                payload = {
-                    "queries": [
-                        {
-                            "query": "个人知识管理 user@example.com /mnt/private/a.md",
-                            "reason": "查找方法",
-                            "record_refs": record_refs,
-                        }
-                    ]
+            "【本周记录产生的定向选题】",
+            "【本轮标准化证据；只能通过 source_id 引用】",
+        )
+        evidence = cls._prompt_json(
+            prompt,
+            "【本轮标准化证据；只能通过 source_id 引用】",
+        )
+        general = [item for item in evidence if item["kind"] == "general"]
+        highlights = []
+        for number, source in enumerate(general[:highlight_count], 1):
+            highlights.append(
+                {
+                    "title": f"具体变化 {number}",
+                    "change": f"机构 {number} 已发布正式结果",
+                    "details": [
+                        f"数据为 {number * 10}",
+                        f"生效日期为 2026-07-{number + 10:02d}",
+                    ],
+                    "why": f"这会改变对象 {number} 的当前判断依据",
+                    "new_since_prior": (
+                        "同一来源新增了正式结果"
+                        if source["previously_used"]
+                        else ""
+                    ),
+                    "evidence_ids": [source["source_id"]],
                 }
-                return json.dumps(payload), True, 0, {}, 0
-            collector_prompts.append(prompt)
-            return self.audited_response(
-                self.valid_briefing(
-                    targeted_ids=("T001",),
-                    targeted_refs=tuple(record_refs),
-                ),
-                allowed_search_queries,
             )
+        explorations = []
+        for topic in topics:
+            topic_evidence = [
+                item
+                for item in evidence
+                if item["topic_id"] == topic["topic_id"]
+            ]
+            if targeted_status == "insufficient_evidence":
+                explorations.append(
+                    {
+                        "topic_id": topic["topic_id"],
+                        "status": "insufficient_evidence",
+                        "reason": "搜索结果只谈相邻主题，不能回答记录中的问题",
+                    }
+                )
+            else:
+                explorations.append(
+                    {
+                        "topic_id": topic["topic_id"],
+                        "status": "supported",
+                        "finding": "公开资料给出了可核查的明确结果",
+                        "details": ["样本为 100", "结果在 2026-07-15 发布"],
+                        "connection": "这些结果直接回应了本周记录提出的判断",
+                        "evidence_ids": [topic_evidence[0]["source_id"]],
+                    }
+                )
+        return {
+            "highlights": highlights,
+            "explorations": explorations,
+            "followups": [],
+        }
 
-        with patch.object(information, "call_ai", side_effect=fake_call_ai):
-            _, success, path = information.generate_information_briefing(
-                date, {"name": "mock", "search": False}
+    @staticmethod
+    def _planner_payload(prompt: str, query: str = "本地优先软件迁移风险") -> dict:
+        record_ref = information._RECORD_REF_PATTERN.findall(prompt)[0]
+        return {
+            "queries": [
+                {
+                    "title": "本地优先软件的数据迁移风险",
+                    "query": query,
+                    "reason": "本周记录正在比较本地优先软件",
+                    "record_refs": [record_ref],
+                }
+            ]
+        }
+
+    def _default_model_call(self, prompt, model_config, **_kwargs):
+        if prompt.startswith("[程序每日信息选题任务]"):
+            return self._response(
+                json.dumps(self._planner_payload(prompt), ensure_ascii=False)
             )
-
-        self.assertTrue(success)
-        self.assertEqual(
-            settings.ANALYSIS_DIR / "Information" / "2026-07-15.md", path
+        return self._response(
+            json.dumps(self._collector_payload(prompt), ensure_ascii=False)
         )
-        self.assertIn("# 2026-07-15 每日信息简报", path.read_text(encoding="utf-8"))
-        self.assertIn(
-            "agentrecord-targeted-queries", path.read_text(encoding="utf-8")
-        )
-        self.assertNotIn("user@example.com", collector_prompts[0])
-        self.assertNotIn("/mnt/private", collector_prompts[0])
-        self.assertIn("[email]", collector_prompts[0])
-        self.assertIn("[local-path]", collector_prompts[0])
 
-    def test_briefing_uses_same_week_reports_and_drops_repeated_queries(self):
-        date = datetime.date(2026, 7, 16)
-        (settings.DIARY_DIR / "2026-07-16.md").write_text(
-            "# 2026-07-16\n\n<summary>\n\n</summary>\n\n"
+    def _write_record(self, date: str = "2026-07-15") -> None:
+        (settings.DIARY_DIR / f"{date}.md").write_text(
+            f"# {date}\n\n<summary>\n\n</summary>\n\n"
             "---\n## 原始记录流\n\n"
             "**09:00:** 继续考虑个人知识管理和本地优先软件。\n",
             encoding="utf-8",
         )
-        information_dir = settings.ANALYSIS_DIR / "Information"
-        information_dir.mkdir(parents=True)
-        (information_dir / "2026-07-15.md").write_text(
-            "# 2026-07-15 每日信息简报\n\n"
+
+    def test_briefing_uses_two_structured_calls_and_controller_renders_sources(self):
+        self._write_record()
+        prompts = []
+        configs = []
+
+        def call(prompt, model_config, **kwargs):
+            prompts.append(prompt)
+            configs.append(model_config)
+            self.assertTrue(kwargs["structured_output"])
+            self.assertEqual((), kwargs["allowed_tools"])
+            return self._default_model_call(prompt, model_config, **kwargs)
+
+        with patch.object(information, "call_ai", side_effect=call) as model_call:
+            body, success, path = information.generate_information_briefing(
+                datetime.date(2026, 7, 15),
+                self.model,
+            )
+
+        self.assertTrue(success)
+        self.assertEqual(2, model_call.call_count)
+        self.assertEqual(
+            [information._PLANNER_MAX_TOKENS, information._COLLECTOR_MAX_TOKENS],
+            [config["max_tokens"] for config in configs],
+        )
+        self.assertNotIn("https://", prompts[1])
+        self.assertIn("I-Q001-001", prompts[1])
+        self.assertIn("[global 来源 1](https://example.com/global-1)", body)
+        self.assertIn("本周记录依据：[R-", body)
+        saved = path.read_text(encoding="utf-8")
+        self.assertIn("agentrecord-information-index", saved)
+        self.assertIn("分析运行：", saved)
+
+    def test_planner_never_receives_old_briefing_or_followup(self):
+        self._write_record("2026-07-16")
+        directory = settings.ANALYSIS_DIR / "Information"
+        directory.mkdir(parents=True)
+        (directory / "2026-07-15.md").write_text(
+            "# 旧简报\n\n"
             '<!-- agentrecord-targeted-queries: [{"query":"个人知识管理 方法研究",'
-            '"reason":"比较不同方法"}] -->\n\n'
-            "## 今日值得关注\n\n昨日已讨论知识管理方法。\n",
+            '"reason":"旧记录"}] -->\n\n'
+            "## 今日值得关注\n\n### 1. 已覆盖的具体事项\n\n内容。\n\n"
+            "## 可继续追踪\n\n欧洲央行决议结果，明天继续搜索。\n",
             encoding="utf-8",
         )
         planner_prompts = []
-        collector_prompts = []
-        record_refs = []
 
-        def fake_call_ai(
-            prompt,
-            model_config,
-            *,
-            allowed_tools=None,
-            allowed_search_queries=None,
-        ):
+        def call(prompt, model_config, **kwargs):
             if prompt.startswith("[程序每日信息选题任务]"):
                 planner_prompts.append(prompt)
-                record_refs[:] = information._RECORD_REF_PATTERN.findall(prompt)[:1]
-                return (
+            return self._default_model_call(prompt, model_config, **kwargs)
+
+        with patch.object(information, "call_ai", side_effect=call):
+            _, success, _ = information.generate_information_briefing(
+                datetime.date(2026, 7, 16),
+                self.model,
+            )
+
+        self.assertTrue(success)
+        self.assertEqual(1, len(planner_prompts))
+        self.assertNotIn("欧洲央行", planner_prompts[0])
+        self.assertNotIn("已覆盖的具体事项", planner_prompts[0])
+        self.assertNotIn("个人知识管理 方法研究", planner_prompts[0])
+
+    def test_controller_deduplicates_old_query_without_exposing_it_to_planner(self):
+        self._write_record("2026-07-16")
+        directory = settings.ANALYSIS_DIR / "Information"
+        directory.mkdir(parents=True)
+        (directory / "2026-07-15.md").write_text(
+            '<!-- agentrecord-targeted-queries: '
+            '[{"query":"个人知识管理 方法研究","reason":"旧记录"}] -->\n',
+            encoding="utf-8",
+        )
+        collector_prompts = []
+
+        def call(prompt, _model_config, **_kwargs):
+            if prompt.startswith("[程序每日信息选题任务]"):
+                record_ref = information._RECORD_REF_PATTERN.findall(prompt)[0]
+                return self._response(
                     json.dumps(
                         {
                             "queries": [
                                 {
+                                    "title": "重复问题",
                                     "query": "个人知识管理最新进展",
-                                    "reason": "继续搜索相同主题",
-                                    "record_refs": record_refs,
+                                    "reason": "重复",
+                                    "record_refs": [record_ref],
                                 },
                                 {
+                                    "title": "新的迁移问题",
                                     "query": "本地优先笔记软件数据迁移风险",
-                                    "reason": "核查一个尚未覆盖的新角度",
-                                    "record_refs": record_refs,
+                                    "reason": "新角度",
+                                    "record_refs": [record_ref],
                                 },
                             ]
                         },
                         ensure_ascii=False,
-                    ),
-                    True,
-                    0,
-                    {},
-                    0,
+                    )
                 )
             collector_prompts.append(prompt)
-            return self.audited_response(
-                self.valid_briefing(
-                    "新增内容。",
-                    ("T001",),
-                    tuple(record_refs),
-                ),
-                allowed_search_queries,
+            return self._response(
+                json.dumps(self._collector_payload(prompt), ensure_ascii=False)
             )
 
-        with patch.object(information, "call_ai", side_effect=fake_call_ai):
+        with patch.object(information, "call_ai", side_effect=call):
             _, success, path = information.generate_information_briefing(
-                date, {"name": "mock", "search": False}
+                datetime.date(2026, 7, 16),
+                self.model,
             )
 
         self.assertTrue(success)
-        self.assertIn("昨日已讨论知识管理方法", planner_prompts[0])
-        self.assertIn("个人知识管理 方法研究", planner_prompts[0])
-        query_block = collector_prompts[0].split("【已去隐私的查询】", 1)[1].split(
-            "【本周此前的信息简报", 1
-        )[0]
-        self.assertNotIn("个人知识管理最新进展", query_block)
-        self.assertIn("本地优先笔记软件数据迁移风险", query_block)
-        generated = path.read_text(encoding="utf-8")
-        self.assertNotIn("个人知识管理最新进展", generated)
-        self.assertIn("本地优先笔记软件数据迁移风险", generated)
+        self.assertNotIn("重复问题", collector_prompts[0])
+        self.assertIn("新的迁移问题", collector_prompts[0])
+        self.assertNotIn(
+            "个人知识管理最新进展",
+            path.read_text(encoding="utf-8"),
+        )
 
-    def test_invalid_query_json_uses_bounded_correction(self):
-        date = datetime.date(2026, 7, 15)
-        (settings.DIARY_DIR / "2026-07-15.md").write_text(
-            "# 2026-07-15\n\n<summary>\n\n</summary>\n\n"
-            "---\n## 原始记录流\n\n**09:00:** 研究一个问题。\n",
+    def test_invalid_planner_spends_one_repair_then_degrades_to_general_news(self):
+        self._write_record()
+        calls = []
+
+        def call(prompt, _model_config, **_kwargs):
+            calls.append(prompt)
+            if len(calls) <= 2:
+                return self._response("不是 JSON")
+            return self._response(
+                json.dumps(self._collector_payload(prompt), ensure_ascii=False)
+            )
+
+        with patch.object(information, "call_ai", side_effect=call):
+            _, success, path = information.generate_information_briefing(
+                datetime.date(2026, 7, 15),
+                self.model,
+            )
+
+        self.assertTrue(success)
+        self.assertEqual(3, len(calls))
+        self.assertTrue(calls[1].startswith(calls[0]))
+        self.assertIn("唯一一次结构修订", calls[1])
+        self.assertIn("选题 0 项", path.read_text(encoding="utf-8"))
+
+    def test_only_one_repair_is_available_across_both_model_stages(self):
+        self._write_record()
+        calls = []
+
+        def call(prompt, _model_config, **_kwargs):
+            calls.append(prompt)
+            if len(calls) == 1:
+                return self._response("不是 JSON")
+            if len(calls) == 2:
+                return self._response(
+                    json.dumps(self._planner_payload(prompt), ensure_ascii=False)
+                )
+            return self._response("Collector 也不是 JSON")
+
+        with patch.object(information, "call_ai", side_effect=call):
+            message, success, path = information.generate_information_briefing(
+                datetime.date(2026, 7, 15),
+                self.model,
+            )
+
+        self.assertFalse(success)
+        self.assertIsNone(path)
+        self.assertEqual(3, len(calls))
+        self.assertIn("collector 输出结构无效", message)
+
+    def test_collector_can_use_the_single_repair(self):
+        calls = []
+
+        def call(prompt, _model_config, **_kwargs):
+            calls.append(prompt)
+            if len(calls) == 1:
+                return self._response("不是 JSON")
+            return self._response(
+                json.dumps(self._collector_payload(prompt), ensure_ascii=False)
+            )
+
+        with patch.object(information, "call_ai", side_effect=call):
+            _, success, _ = information.generate_information_briefing(
+                datetime.date(2026, 7, 15),
+                self.model,
+            )
+
+        self.assertTrue(success)
+        self.assertEqual(2, len(calls))
+        self.assertTrue(calls[1].startswith(calls[0]))
+
+    def test_highlights_allow_fewer_than_five_and_zero(self):
+        evidence = [
+            {
+                "source_id": "I-Q001-001",
+                "kind": "general",
+                "topic_id": "",
+                "previously_used": False,
+            }
+        ]
+        two = {
+            "highlights": [
+                {
+                    "title": f"事项 {number}",
+                    "change": "已经发布结果",
+                    "details": ["数据 10"],
+                    "why": "改变当前判断",
+                    "evidence_ids": ["I-Q001-001"],
+                }
+                for number in range(2)
+            ],
+            "explorations": [],
+            "followups": [],
+        }
+        empty = {"highlights": [], "explorations": [], "followups": []}
+
+        self.assertEqual(
+            2,
+            len(information._normalize_collector_payload(two, evidence, [])["highlights"]),
+        )
+        self.assertEqual(
+            [],
+            information._normalize_collector_payload(empty, evidence, [])["highlights"],
+        )
+
+    def test_more_than_five_highlights_are_deterministically_truncated(self):
+        evidence = [
+            {
+                "source_id": "I-Q001-001",
+                "kind": "general",
+                "topic_id": "",
+                "previously_used": False,
+            }
+        ]
+        payload = {
+            "highlights": [
+                {
+                    "title": f"事项 {number}",
+                    "change": "已经发布结果",
+                    "details": ["数据 10"],
+                    "why": "改变当前判断",
+                    "evidence_ids": ["I-Q001-001"],
+                }
+                for number in range(6)
+            ],
+            "explorations": [],
+            "followups": [],
+        }
+
+        normalized = information._normalize_collector_payload(payload, evidence, [])
+
+        self.assertEqual(5, len(normalized["highlights"]))
+
+    def test_highlight_cannot_use_targeted_evidence_or_raw_url(self):
+        evidence = [
+            {
+                "source_id": "I-Q003-001",
+                "kind": "targeted",
+                "topic_id": "T001",
+                "previously_used": False,
+            }
+        ]
+        payload = {
+            "highlights": [
+                {
+                    "title": "事项",
+                    "change": "参见 https://example.com",
+                    "details": ["数据 10"],
+                    "why": "改变判断",
+                    "evidence_ids": ["I-Q003-001"],
+                }
+            ],
+            "explorations": [],
+            "followups": [],
+        }
+
+        with self.assertRaisesRegex(ValueError, "证据 ID|URL"):
+            information._normalize_collector_payload(payload, evidence, [])
+
+    def test_targeted_generic_results_can_be_marked_insufficient_and_are_not_rendered(self):
+        self._write_record()
+
+        def call(prompt, model_config, **kwargs):
+            if prompt.startswith("[程序每日信息选题任务]"):
+                return self._default_model_call(prompt, model_config, **kwargs)
+            payload = self._collector_payload(
+                prompt,
+                targeted_status="insufficient_evidence",
+            )
+            return self._response(json.dumps(payload, ensure_ascii=False))
+
+        with patch.object(information, "call_ai", side_effect=call):
+            body, success, path = information.generate_information_briefing(
+                datetime.date(2026, 7, 15),
+                self.model,
+            )
+
+        self.assertTrue(success)
+        self.assertNotIn("### T001.", body)
+        self.assertIn("没有证据充分", body)
+        self.assertIn(
+            "证据不足或不相关跳过 1 项",
+            path.read_text(encoding="utf-8"),
+        )
+
+    def test_collector_receives_compact_evidence_not_raw_search_prose_or_urls(self):
+        directory = settings.ANALYSIS_DIR / "Information"
+        directory.mkdir(parents=True)
+        (directory / "2026-07-14.md").write_text(
+            '<!-- agentrecord-information-index: '
+            '{"version":2,"coverage":[{"kind":"highlight",'
+            '"title":"昨日事项","source_urls":'
+            '["https://example.com/global-1"]}]} -->\n',
             encoding="utf-8",
         )
+        collector_prompts = []
+
+        def call(prompt, _model_config, **_kwargs):
+            collector_prompts.append(prompt)
+            return self._response(
+                json.dumps(self._collector_payload(prompt), ensure_ascii=False)
+            )
+
+        with patch.object(information, "call_ai", side_effect=call):
+            _, success, _ = information.generate_information_briefing(
+                datetime.date(2026, 7, 15),
+                self.model,
+            )
+
+        self.assertTrue(success)
+        self.assertEqual(1, len(collector_prompts))
+        self.assertNotIn("RAW-SEARCH-PROSE", collector_prompts[0])
+        self.assertNotIn("https://", collector_prompts[0])
+        self.assertIn("global 已公布具体数据", collector_prompts[0])
+
+    def test_partial_search_failure_keeps_successful_evidence(self):
+        def search(query):
+            if "全球 已公布" in query:
+                return ToolResult(""), "网络异常: 临时 DNS 失败"
+            return self._search_result(query)
 
         with patch.object(
             information,
-            "call_ai",
-            return_value=("不是 JSON", True, 0, {}, 0),
-        ) as call:
-            message, success, path = information.generate_information_briefing(
-                date, {"name": "mock", "search": False}
-            )
-
-        self.assertFalse(success)
-        self.assertIsNone(path)
-        self.assertIn("没有返回有效 JSON", message)
-        self.assertEqual(3, call.call_count)
-        retry_prompt = call.call_args.args[0]
-        self.assertIn("【中控修订请求】", retry_prompt)
-        self.assertIn("不是 JSON", retry_prompt)
-
-    def test_targeted_query_must_cite_a_current_week_record(self):
-        date = datetime.date(2026, 7, 15)
-        (settings.DIARY_DIR / "2026-07-15.md").write_text(
-            "**09:00:** 本周记录中的具体想法。\n", encoding="utf-8"
-        )
-        old_briefing = settings.ANALYSIS_DIR / "Information" / "2026-07-14.md"
-        old_briefing.parent.mkdir(parents=True)
-        old_briefing.write_text(
-            "## 可继续追踪\n\n欧洲央行决议结果。\n", encoding="utf-8"
-        )
-
-        response = json.dumps(
-            {
-                "queries": [
-                    {
-                        "query": "欧洲央行决议结果",
-                        "reason": "来自昨日可继续追踪",
-                    }
-                ]
-            },
-            ensure_ascii=False,
-        )
-        with patch.object(
+            "search_web_once",
+            side_effect=search,
+        ), patch.object(
             information,
             "call_ai",
-            return_value=(response, True, 0, {}, 0),
-        ) as call:
-            message, success, path = information.generate_information_briefing(
-                date, {"name": "mock", "search": False}
-            )
-
-        self.assertFalse(success)
-        self.assertIsNone(path)
-        self.assertIn("没有返回有效 JSON", message)
-        self.assertEqual(3, call.call_count)
-        first_prompt = call.call_args_list[0].args[0]
-        self.assertIn("严禁从中产生选题", first_prompt)
-        self.assertIn("record_refs", first_prompt)
-
-    def test_today_highlights_require_exactly_five_numbered_items(self):
-        self.assertTrue(information._has_five_daily_highlights(self.valid_briefing()))
-        only_four = re.sub(
-            r"\n\n### 5\..*?(?=\n\n## 与本周思考相关的探索)",
-            "",
-            self.valid_briefing(),
-            flags=re.DOTALL,
-        )
-        self.assertFalse(information._has_five_daily_highlights(only_four))
-        six = self.valid_briefing().replace(
-            "\n\n## 与本周思考相关的探索",
-            "\n\n### 6. 额外事项\n\n新资料 [来源](https://example.com/6)"
-            "\n\n## 与本周思考相关的探索",
-        )
-        self.assertFalse(information._has_five_daily_highlights(six))
-
-    def test_today_highlights_reject_terse_macro_items(self):
-        markdown = self.valid_briefing().replace(
-            "**具体变化**：事项 3 已经发布明确结果，"
-            "相关机构确认变化已经生效，不是尚待发生的日程预告。\n\n"
-            "**关键细节**：结果包含数据 30 与数据 35，"
-            "分别对应两个可核查对象，并给出了明确发布日期和适用范围。"
-            " [来源](https://example.com/3)\n\n"
-            "**关注理由**：这些细节会直接改变相关对象当前的判断依据，"
-            "后续可用同一口径核对执行结果，而不是泛泛讨论长期影响。",
-            "市场高度关注，影响深远。[来源](https://example.com/3)",
-        )
-
-        errors = information._briefing_errors(markdown, True, None)
-
-        self.assertTrue(any("第 3 项缺少具体度字段" in error for error in errors))
-
-    def test_briefing_rejects_links_absent_from_search_evidence(self):
-        errors = information._briefing_errors(
-            self.valid_briefing(),
-            True,
-            {information.canonical_url("https://example.com/1")},
-        )
-
-        self.assertTrue(any("搜索证据" in error for error in errors))
-
-    def test_each_daily_highlight_requires_its_own_nearby_link(self):
-        markdown = self.valid_briefing().replace(
-            " [来源](https://example.com/3)", ""
-        )
-
-        errors = information._briefing_errors(markdown, True, None)
-
-        self.assertTrue(any("没有就近来源链接" in error for error in errors))
-
-    def test_briefing_requires_every_record_driven_topic_in_order(self):
-        missing = information._briefing_errors(
-            self.valid_briefing(),
-            True,
-            None,
-            ["T001", "T002"],
-        )
-        covered = information._briefing_errors(
-            self.valid_briefing(targeted_ids=("T001", "T002")),
-            True,
-            None,
-            ["T001", "T002"],
-        )
-
-        self.assertTrue(any("定向选题" in error for error in missing))
-        self.assertFalse(any("定向选题" in error for error in covered))
-
-    def test_briefing_rejects_extra_targeted_exploration_heading(self):
-        markdown = self.valid_briefing(targeted_ids=("T001",)).replace(
-            "\n\n## 可继续追踪",
-            "\n\n### T999. 未授权选题\n\n不应出现。\n\n## 可继续追踪",
-        )
-
-        errors = information._briefing_errors(
-            markdown, True, None, ["T001"]
-        )
-
-        self.assertTrue(any("没有按定向选题逐项生成" in error for error in errors))
-
-    def test_targeted_exploration_requires_evidence_from_its_own_query(self):
-        markdown = self.valid_briefing(targeted_ids=("T001",))
-        errors = information._briefing_errors(
-            markdown,
-            True,
-            None,
-            ["T001"],
-            {
-                "T001": {
-                    information.canonical_url("https://example.com/other")
-                }
-            },
-        )
-
-        self.assertTrue(any("对应查询" in error for error in errors))
-
-    def test_targeted_exploration_must_show_its_week_record_basis(self):
-        expected_ref = "R-20260715-001-aaaaaaaaaaaa"
-        markdown = self.valid_briefing(
-            targeted_ids=("T001",),
-            targeted_refs=("R-20260715-002-bbbbbbbbbbbb",),
-        )
-
-        errors = information._briefing_errors(
-            markdown,
-            True,
-            None,
-            ["T001"],
-            None,
-            {"T001": {expected_ref}},
-        )
-
-        self.assertTrue(any("本周原始记录依据" in error for error in errors))
-
-    def test_invalid_briefing_is_revised_with_original_draft_and_reason(self):
-        date = datetime.date(2026, 7, 15)
-        drafts = iter(["缺少章节和链接", self.valid_briefing()])
-
-        def fake_call_ai(
-            prompt,
-            model_config,
-            *,
-            allowed_tools=None,
-            allowed_search_queries=None,
+            side_effect=self._default_model_call,
         ):
-            return self.audited_response(
-                next(drafts), allowed_search_queries
-            )
-
-        with patch.object(information, "call_ai", side_effect=fake_call_ai) as call:
             _, success, path = information.generate_information_briefing(
-                date, {"name": "mock", "search": False}
+                datetime.date(2026, 7, 15),
+                self.model,
             )
 
         self.assertTrue(success)
-        self.assertTrue(path.exists())
-        self.assertEqual(2, call.call_count)
-        original_prompt = call.call_args_list[0].args[0]
-        revision_prompt = call.call_args_list[1].args[0]
-        self.assertTrue(revision_prompt.startswith(original_prompt))
-        self.assertIn("缺少章节和链接", revision_prompt)
-        self.assertIn("缺少必需章节", revision_prompt)
-        self.assertEqual((), call.call_args_list[0].kwargs["allowed_tools"])
-        self.assertEqual((), call.call_args_list[1].kwargs["allowed_tools"])
-        self.assertNotIn("allowed_search_queries", call.call_args_list[0].kwargs)
-        self.assertNotIn("allowed_search_queries", call.call_args_list[1].kwargs)
+        self.assertIn("部分失败 1 项", path.read_text(encoding="utf-8"))
 
-    def test_controller_executes_every_query_before_collector(self):
-        date = datetime.date(2026, 7, 15)
+    def test_all_search_failures_preserve_network_classification(self):
         with patch.object(
             information,
-            "call_ai",
-            return_value=self.audited_response(self.valid_briefing()),
-        ) as collector:
-            _, success, path = information.generate_information_briefing(
-                date, {"name": "mock", "search": False}
+            "search_web_once",
+            return_value=(ToolResult(""), "网络异常: DNS 失败"),
+        ), patch.object(information, "call_ai") as model_call:
+            message, success, path = information.generate_information_briefing(
+                datetime.date(2026, 7, 15),
+                self.model,
             )
 
-        self.assertTrue(success)
-        self.assertIsNotNone(path)
-        self.assertEqual(2, self.search_mock.call_count)
-        collector.assert_called_once()
-        self.assertIn("【中控已审计搜索证据】", collector.call_args.args[0])
+        self.assertFalse(success)
+        self.assertIsNone(path)
+        self.assertIn("网络异常:", message)
+        model_call.assert_not_called()
 
-    def test_collector_is_not_called_when_all_searches_have_no_evidence(self):
-        date = datetime.date(2026, 7, 15)
-        self.search_mock.side_effect = lambda query: (ToolResult("搜索无结果"), "")
-        with patch.object(information, "call_ai") as collector:
+    def test_network_retry_does_not_reuse_failed_empty_search_artifact(self):
+        search_calls = []
+
+        def search(query):
+            search_calls.append(query)
+            if len(search_calls) <= 2:
+                return ToolResult(""), "网络异常: DNS 失败"
+            return self._search_result(query)
+
+        with patch.object(
+            information,
+            "search_web_once",
+            side_effect=search,
+        ), patch.object(
+            information,
+            "call_ai",
+            side_effect=self._default_model_call,
+        ):
+            _, first_success, _ = information.generate_information_briefing(
+                datetime.date(2026, 7, 15),
+                self.model,
+            )
+            _, second_success, _ = information.generate_information_briefing(
+                datetime.date(2026, 7, 15),
+                self.model,
+                trigger="retry",
+            )
+
+        self.assertFalse(first_success)
+        self.assertTrue(second_success)
+        self.assertEqual(4, len(search_calls))
+
+    def test_no_evidence_stops_before_collector(self):
+        with patch.object(
+            information,
+            "search_web_once",
+            return_value=(ToolResult("搜索无结果"), ""),
+        ), patch.object(information, "call_ai") as model_call:
             message, success, path = information.generate_information_briefing(
-                date, {"name": "mock", "search": False}
+                datetime.date(2026, 7, 15),
+                self.model,
             )
 
         self.assertFalse(success)
         self.assertIsNone(path)
         self.assertIn("没有返回可审计的来源证据", message)
-        collector.assert_not_called()
+        model_call.assert_not_called()
 
-    def test_zero_evidence_target_is_dropped_before_collector_generation(self):
-        date = datetime.date(2026, 7, 15)
-        (settings.DIARY_DIR / "2026-07-15.md").write_text(
-            "**09:00:** 想研究一个定向问题。\n", encoding="utf-8"
-        )
-        general_evidence = [
-            {
-                "title": f"来源 {number}",
-                "url": f"https://example.com/{number}",
-                "snippet": "摘要",
-                "published": "2026-07-15",
-            }
-            for number in range(1, 6)
-        ]
+    def test_failed_collector_retry_reuses_planner_and_search_artifacts(self):
+        self._write_record()
+        responses = []
 
-        def search(query):
-            if "全球 已公布" in query or "中国 已发布" in query:
-                return ToolResult("综合搜索结果", 5, general_evidence), ""
-            return ToolResult("搜索无结果"), ""
-
-        collector_calls = []
-
-        def fake_call_ai(prompt, model_config, *, allowed_tools=None, **kwargs):
+        def call(prompt, model_config, **kwargs):
             if prompt.startswith("[程序每日信息选题任务]"):
-                record_ref = information._RECORD_REF_PATTERN.findall(prompt)[0]
-                return (
-                    json.dumps(
-                        {
-                            "queries": [
-                                {
-                                    "query": "无公开资料的定向问题",
-                                    "reason": "核查",
-                                    "record_refs": [record_ref],
-                                }
-                            ]
-                        },
-                        ensure_ascii=False,
-                    ),
-                    True,
-                    0,
-                    {},
-                    0,
-                )
-            collector_calls.append(prompt)
-            return self.audited_response(self.valid_briefing())
+                responses.append("planner")
+                return self._default_model_call(prompt, model_config, **kwargs)
+            collector_count = sum(value == "collector" for value in responses)
+            responses.append("collector")
+            if collector_count < 2:
+                return self._response("不是 JSON")
+            return self._response(
+                json.dumps(self._collector_payload(prompt), ensure_ascii=False)
+            )
 
-        self.search_mock.side_effect = search
-        with patch.object(information, "call_ai", side_effect=fake_call_ai):
+        with patch.object(information, "call_ai", side_effect=call):
+            _, first_success, _ = information.generate_information_briefing(
+                datetime.date(2026, 7, 15),
+                self.model,
+            )
+            first_search_count = self.search_mock.call_count
+            _, second_success, path = information.generate_information_briefing(
+                datetime.date(2026, 7, 15),
+                self.model,
+                trigger="retry",
+            )
+
+        self.assertFalse(first_success)
+        self.assertTrue(second_success)
+        self.assertTrue(path.exists())
+        self.assertEqual(3, first_search_count)
+        self.assertEqual(first_search_count, self.search_mock.call_count)
+        self.assertEqual(["planner", "collector", "collector", "collector"], responses)
+
+    def test_completed_run_and_stage_telemetry_are_auditable(self):
+        with patch.object(
+            information,
+            "call_ai",
+            side_effect=self._default_model_call,
+        ):
             _, success, path = information.generate_information_briefing(
-                date, {"name": "mock", "search": False}
+                datetime.date(2026, 7, 15),
+                self.model,
             )
 
         self.assertTrue(success)
-        self.assertEqual(1, len(collector_calls))
-        self.assertNotIn("无公开资料的定向问题", collector_calls[0])
-        saved = path.read_text(encoding="utf-8")
-        self.assertIn("零证据移除 1 项", saved)
-        self.assertIn("无公开资料的定向问题", saved)
+        database = settings.ANALYSIS_DIR / ".analysis.sqlite3"
+        with closing(sqlite3.connect(database)) as connection:
+            run = connection.execute(
+                "SELECT kind, status, report_path FROM analysis_runs"
+            ).fetchone()
+            artifact_json = connection.execute(
+                """
+                SELECT payload_json FROM agent_artifacts
+                WHERE agent = 'daily_information_collector'
+                """
+            ).fetchone()[0]
+        payload = json.loads(artifact_json)
+        self.assertEqual(("daily_information", "completed", str(path)), run)
+        self.assertEqual(120, payload["_telemetry"]["usage"]["total_tokens"])
+        self.assertEqual(40, payload["_telemetry"]["usage"]["cached_tokens"])
+
+    def test_previous_briefing_index_excludes_followups_target_day_and_old_week(self):
+        directory = settings.ANALYSIS_DIR / "Information"
+        directory.mkdir(parents=True)
+        (directory / "2026-07-12.md").write_text(
+            "## 今日值得关注\n\n### 1. 上周事项\n",
+            encoding="utf-8",
+        )
+        (directory / "2026-07-15.md").write_text(
+            "## 今日值得关注\n\n### 1. 本周已覆盖事项\n\n正文\n\n"
+            "## 可继续追踪\n\n绝不能进入索引的明日问题\n",
+            encoding="utf-8",
+        )
+        (directory / "2026-07-16.md").write_text(
+            "## 今日值得关注\n\n### 1. 当天旧简报\n",
+            encoding="utf-8",
+        )
+
+        index_text, _ = information._prior_week_briefings(
+            datetime.date(2026, 7, 16)
+        )
+
+        self.assertIn("本周已覆盖事项", index_text)
+        self.assertNotIn("绝不能进入索引", index_text)
+        self.assertNotIn("上周事项", index_text)
+        self.assertNotIn("当天旧简报", index_text)
+
+    def test_zero_evidence_target_is_removed_before_collector(self):
+        self._write_record()
+
+        def search(query):
+            if "全球 已公布" in query or "中国 已发布" in query:
+                return self._search_result(query)
+            return ToolResult("搜索无结果"), ""
+
+        collector_prompts = []
+
+        def call(prompt, model_config, **kwargs):
+            if prompt.startswith("[程序每日信息选题任务]"):
+                return self._default_model_call(prompt, model_config, **kwargs)
+            collector_prompts.append(prompt)
+            return self._response(
+                json.dumps(self._collector_payload(prompt), ensure_ascii=False)
+            )
+
+        with patch.object(
+            information,
+            "search_web_once",
+            side_effect=search,
+        ), patch.object(information, "call_ai", side_effect=call):
+            _, success, path = information.generate_information_briefing(
+                datetime.date(2026, 7, 15),
+                self.model,
+            )
+
+        self.assertTrue(success)
+        topics = self._prompt_json(
+            collector_prompts[0],
+            "【本周记录产生的定向选题】",
+            "【本轮标准化证据；只能通过 source_id 引用】",
+        )
+        self.assertEqual([], topics)
+        self.assertIn(
+            "证据不足或不相关跳过 1 项",
+            path.read_text(encoding="utf-8"),
+        )
+
+    def test_planner_query_is_sanitized_before_search_and_collector(self):
+        self._write_record()
+        searched = []
+
+        def search(query):
+            searched.append(query)
+            return self._search_result(query)
+
+        def call(prompt, _model_config, **_kwargs):
+            if prompt.startswith("[程序每日信息选题任务]"):
+                payload = self._planner_payload(
+                    prompt,
+                    "个人知识管理 user@example.com /mnt/private/a.md",
+                )
+                return self._response(json.dumps(payload, ensure_ascii=False))
+            self.assertNotIn("user@example.com", prompt)
+            self.assertNotIn("/mnt/private", prompt)
+            return self._response(
+                json.dumps(self._collector_payload(prompt), ensure_ascii=False)
+            )
+
+        with patch.object(
+            information,
+            "search_web_once",
+            side_effect=search,
+        ), patch.object(information, "call_ai", side_effect=call):
+            _, success, _ = information.generate_information_briefing(
+                datetime.date(2026, 7, 15),
+                self.model,
+            )
+
+        self.assertTrue(success)
+        self.assertIn("[email]", searched[-1])
+        self.assertIn("[local-path]", searched[-1])
 
     def test_briefing_fails_when_web_search_is_not_configured(self):
         settings.CONFIG["third_search"] = {"enabled": False, "api_key": ""}
 
         message, success, path = information.generate_information_briefing(
-            datetime.date(2026, 7, 15), {"name": "mock", "search": False}
+            datetime.date(2026, 7, 15),
+            self.model,
         )
 
         self.assertFalse(success)
@@ -591,10 +800,17 @@ class InformationBriefingTests(unittest.TestCase):
     def test_query_dedup_allows_a_concrete_new_event_in_the_same_field(self):
         result = information._deduplicate_queries(
             [
-                {"query": "个人知识管理最新进展", "reason": "泛化重复"},
                 {
+                    "title": "重复",
+                    "query": "个人知识管理最新进展",
+                    "reason": "泛化重复",
+                    "record_refs": ["R-20260715-001-aaaaaaaaaaaa"],
+                },
+                {
+                    "title": "安全事件",
                     "query": "个人知识管理 Obsidian 插件安全事件影响",
                     "reason": "出现了具体的新事件",
+                    "record_refs": ["R-20260715-001-aaaaaaaaaaaa"],
                 },
             ],
             [{"query": "个人知识管理 方法研究", "reason": "已有主题"}],
@@ -613,21 +829,6 @@ class InformationBriefingTests(unittest.TestCase):
 
         self.assertIn("https://example.com/article", value)
         self.assertNotIn("/private/note.md", value)
-
-    def test_prior_briefings_exclude_target_date_and_previous_week(self):
-        directory = settings.ANALYSIS_DIR / "Information"
-        directory.mkdir(parents=True)
-        (directory / "2026-07-12.md").write_text("上周简报", encoding="utf-8")
-        (directory / "2026-07-15.md").write_text("本周昨日简报", encoding="utf-8")
-        (directory / "2026-07-16.md").write_text("当天旧简报", encoding="utf-8")
-
-        context_text, _ = information._prior_week_briefings(
-            datetime.date(2026, 7, 16)
-        )
-
-        self.assertIn("本周昨日简报", context_text)
-        self.assertNotIn("上周简报", context_text)
-        self.assertNotIn("当天旧简报", context_text)
 
     def test_week_context_uses_raw_records_not_summary_and_resets_on_monday(self):
         sunday = settings.DIARY_DIR / "2026-07-19.md"
@@ -649,14 +850,15 @@ class InformationBriefingTests(unittest.TestCase):
         self.assertNotIn("暂无今日总结", value)
         self.assertNotIn("上周记录", value)
 
-    def test_week_context_keeps_newest_records_when_character_budget_is_small(self):
+    def test_week_context_keeps_newest_records_when_budget_is_small(self):
         monday = settings.DIARY_DIR / "2026-07-13.md"
         tuesday = settings.DIARY_DIR / "2026-07-14.md"
         monday.write_text("**09:00:** 较旧记录-" + "甲" * 80, encoding="utf-8")
         tuesday.write_text("**09:00:** 最新记录-" + "乙" * 80, encoding="utf-8")
 
         value = information._week_record_context(
-            datetime.date(2026, 7, 14), limit=120
+            datetime.date(2026, 7, 14),
+            limit=120,
         )
 
         self.assertIn("最新记录", value)
@@ -669,7 +871,8 @@ class InformationBriefingTests(unittest.TestCase):
         (directory / "2026-07-01.md").write_text("过期简报", encoding="utf-8")
 
         result = context._information_briefings(
-            datetime.date(2026, 7, 13), datetime.date(2026, 7, 19)
+            datetime.date(2026, 7, 13),
+            datetime.date(2026, 7, 19),
         )
 
         self.assertIn("本周简报", result)

@@ -232,12 +232,12 @@ class AnalysisStore:
         *,
         trigger: str | None = None,
     ) -> str:
-        if kind not in {"daily_profile", "weekly", "monthly"}:
+        if kind not in {"daily_profile", "daily_information", "weekly", "monthly"}:
             raise ValueError(f"不支持的分析类型: {kind}")
         if origin not in {"manual", "auto"}:
             raise ValueError(f"不支持的报告来源: {origin}")
-        if kind == "daily_profile" and origin != "auto":
-            raise ValueError("每日人物画像只支持自动来源")
+        if kind in {"daily_profile", "daily_information"} and origin != "auto":
+            raise ValueError("每日人物画像和信息简报只支持自动来源")
         trigger = trigger or ("manual" if origin == "manual" else "scheduled")
         if trigger not in {"manual", "scheduled", "retry"}:
             raise ValueError(f"不支持的触发方式: {trigger}")

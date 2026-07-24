@@ -70,6 +70,33 @@ class AnalysisStoreTests(unittest.TestCase):
                 trigger="retry",
             )
 
+    def test_daily_information_run_is_audited_without_schema_change(self):
+        run_id = self.store.start_run(
+            "daily_information",
+            "2026-07-15",
+            "2026-07-15",
+            "auto",
+            "mock",
+            "input-hash",
+            trigger="scheduled",
+        )
+
+        self.store.save_artifact(
+            run_id,
+            "daily_information_collector",
+            {"highlights": [], "_telemetry": {"usage": {"total_tokens": 10}}},
+        )
+        self.store.complete_run(run_id, Path("Information/2026-07-15.md"))
+
+        self.assertTrue(
+            AnalysisStore.has_completed_run(
+                "daily_information",
+                "2026-07-15",
+                "2026-07-15",
+                path=self.path,
+            )
+        )
+
     def test_source_catalog_keeps_location_hash_and_excerpt(self):
         run_id = self.start_run()
         self.save_source(run_id)

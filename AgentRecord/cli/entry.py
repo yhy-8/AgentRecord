@@ -71,7 +71,7 @@ def _show_automation_status() -> None:
             "network": "网络错误",
             "rate_limit": "接口限流",
             "blocked": "配置/鉴权错误",
-            "content_blocked": "内容/格式连续失败，已暂停自动重试",
+            "content_blocked": "内容/格式失败，已暂停自动重试",
         }
         tasks = "、".join(
             f"{task}（{failure_labels.get(retry_kind.get(task), '内容或格式错误')}）"

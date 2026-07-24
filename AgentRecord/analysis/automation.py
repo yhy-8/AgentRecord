@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 
 _MAX_AUTOMATIC_CONTENT_FAILURES = 2
-_CONTENT_FAILURE_POLICY_VERSION = 2
+_CONTENT_FAILURE_POLICY_VERSION = 3
 _AUTOMATION_TASK_ORDER = (
     "daily_summary",
     "daily_profile",
@@ -352,7 +352,12 @@ def _set_task_error(
                 state.setdefault("failure_counts", {})[task] = failure_count
                 if failure_key:
                     state.setdefault("failure_keys", {})[task] = failure_key
-                if failure_count >= _MAX_AUTOMATIC_CONTENT_FAILURES:
+                maximum_failures = (
+                    1
+                    if task == "daily_information"
+                    else _MAX_AUTOMATIC_CONTENT_FAILURES
+                )
+                if failure_count >= maximum_failures:
                     retry_kind = "content_blocked"
                     state.get("retry_after", {}).pop(task, None)
                     if not state.get("retry_after"):
@@ -704,6 +709,7 @@ def _run_pending_task(
             now,
             state,
             model,
+            trigger=trigger,
             target=target,
             ignore_schedule=retry_trigger,
         )
@@ -847,6 +853,7 @@ def _run_daily_information(
     state: dict,
     model_config: settings.ModelDict,
     *,
+    trigger: str = "scheduled",
     target: dict[str, str] | None = None,
     ignore_schedule: bool = False,
 ) -> None:
@@ -866,7 +873,11 @@ def _run_daily_information(
         return
     try:
         _set_current_task(state, "daily_information", f"正在收集 {date_text} 信息")
-        message, success, _ = generate_information_briefing(date, model_config)
+        message, success, _ = generate_information_briefing(
+            date,
+            model_config,
+            trigger=trigger,
+        )
     except Exception as error:
         message, success = f"接口异常: {error}", False
     if success:
@@ -1030,7 +1041,12 @@ def _retry_one_task(
         )
     elif task == "daily_information":
         _run_daily_information(
-            now, state, model, target=target, ignore_schedule=True
+            now,
+            state,
+            model,
+            trigger="retry",
+            target=target,
+            ignore_schedule=True,
         )
     elif task == "weekly_report":
         _run_weekly_reports(

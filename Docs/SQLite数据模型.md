@@ -6,11 +6,11 @@
 
 当前结构使用精简画像模型，并把 Agent 调用遥测和已过审阶段缓存纳入审计产物：
 
-- 审计每次每日画像、周报和月报运行；
+- 审计每次每日画像、每日信息简报、周报和月报运行；
 - 保存 Agent 完成或失败产物；
 - 保存请求耗时、token/缓存 token 和搜索证据；
 - 仅复用同输入下已完全过审的 Agent 阶段；
-- 将报告中的 `R-*` 映射到日记位置；
+- 将信息简报和报告中的 `R-*` 映射到日记位置；
 - 保存观点、理念、理想、行为模式和关注领域；
 - 保存用户对画像的认可、否决和修正。
 
@@ -29,13 +29,13 @@
 
 ## 3. analysis_runs
 
-一行表示一次每日画像、周报或月报运行。
+一行表示一次每日画像、每日信息简报、周报或月报运行。
 
 | 字段 | 含义 |
 |---|---|
 | `id` | 32 位 UUID 十六进制运行 ID |
-| `kind` | `daily_profile`、`weekly` 或 `monthly` |
-| `period_start/end` | 分析闭区间日期；每日画像两者相同 |
+| `kind` | `daily_profile`、`daily_information`、`weekly` 或 `monthly` |
+| `period_start/end` | 分析闭区间日期；每日画像和信息简报两者相同 |
 | `origin` | `manual` 或 `auto` |
 | `trigger` | `manual`、`scheduled` 或 `retry` |
 | `model_name` | 本次模型显示名 |
@@ -45,7 +45,7 @@
 | `error` | 失败原因 |
 | `created_at/completed_at` | 本地时间戳 |
 
-手动触发只允许 `origin=manual, trigger=manual`。每日画像只允许 `origin=auto`。系统计划任务首次执行使用 `trigger=scheduled`；整点自动重试和 `/retry` 使用 `trigger=retry`。
+手动触发只允许 `origin=manual, trigger=manual`。每日画像和信息简报只允许 `origin=auto`。系统计划任务首次执行使用 `trigger=scheduled`；自动或 `/retry` 重试使用 `trigger=retry`。
 
 每次重跑都插入新行。Markdown 固定路径可以被覆盖，运行 ID 仍保留每次尝试的审计身份。
 
@@ -66,7 +66,7 @@
 
 唯一约束为 `(run_id, agent, revision)`。模型回答格式错误、结构校验失败、Reviewer 输出不完整或审查未通过时，也保存失败产物；同阶段修订产生后续版本。`payload_json._telemetry` 保存请求与搜索遥测，`payload_json._cache` 标记已过审阶段复用。
 
-`research_search` 是中控阶段而非模型 Agent：它保存固定选题、实际执行的查询、`W-*` 证据 ID、URL、标题/摘要和搜索遥测。等价失败运行重试时只有选题完全一致且每个保留主题都有安全有效证据，才能复用该产物。
+`daily_information_search` 和 `research_search` 都是中控阶段而非模型 Agent：前者保存每日固定查询、`I-*` 证据和部分搜索错误，后者保存报告选题、`W-*` 证据及搜索遥测。等价失败运行重试时只有输入、模型、搜索配置和流水线版本一致，且证据仍通过确定性校验，才能复用。
 
 ## 5. source_catalog 与 run_sources
 

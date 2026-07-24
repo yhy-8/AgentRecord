@@ -120,10 +120,15 @@ def _start_input(prompt: str) -> None:
     sys.stdout.flush()
 
 
+def _wrapped_input_rows(prompt: str, characters: list[str], columns: int) -> int:
+    """Return how many rows the live cursor moved below the input origin."""
+    return cell_len(prompt + "".join(characters)) // max(1, columns)
+
+
 def _clear_rendered_input(prompt: str, characters: list[str]) -> None:
     """Clear input relative to its live cursor so console scrolling is harmless."""
     columns = max(1, shutil.get_terminal_size().columns)
-    wrapped_rows = cell_len(prompt + "".join(characters)) // columns
+    wrapped_rows = _wrapped_input_rows(prompt, characters, columns)
     move_up = f"\x1b[{wrapped_rows}A" if wrapped_rows else ""
     sys.stdout.write(f"{move_up}\r\x1b[0J")
 

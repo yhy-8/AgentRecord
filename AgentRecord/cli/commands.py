@@ -244,7 +244,7 @@ def _handle_status() -> None:
                 "network": "网络错误",
                 "rate_limit": "接口限流",
                 "blocked": "配置/鉴权错误",
-                "content_blocked": "内容/格式连续失败",
+                "content_blocked": "内容/格式失败，已暂停自动重试",
             }.get(kind, "非网络错误（内容或格式错误）")
             retry_policy = {
                 "network": "5 分钟后重试",
